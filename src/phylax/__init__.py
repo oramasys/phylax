@@ -5,6 +5,7 @@ from .contracts import (
     ArtifactRef,
     CompileDecision,
     CompileRequest,
+    PhylaxPort,
     RuntimeAdmissionDecision,
     RuntimeAdmissionRequest,
 )
@@ -14,7 +15,7 @@ __all__ = [
     "CompileDecision",
     "CompileRequest",
     "PhylaxAuthorizer",
+    "PhylaxPort",
     "RuntimeAdmissionDecision",
     "RuntimeAdmissionRequest",
 ]
-

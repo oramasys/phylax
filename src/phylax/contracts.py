@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,3 +73,12 @@ class RuntimeAdmissionDecision:
     capability: str
     decided_at: datetime
 
+
+class PhylaxPort(Protocol):
+    """Composition boundary for compile and runtime admission."""
+
+    def compile(self, request: CompileRequest) -> CompileDecision:
+        """Evaluate whether an artifact may enter a runnable graph."""
+
+    def admit(self, request: RuntimeAdmissionRequest) -> RuntimeAdmissionDecision:
+        """Evaluate whether a capability may run for a compiled artifact."""

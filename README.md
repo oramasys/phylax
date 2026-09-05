@@ -20,6 +20,7 @@ The reference implementation provides:
 - a compile decision that yields a scoped admission reference;
 - runtime admission that requires the matching compile decision and digest;
 - a small in-memory decision store suitable for tests and local composition.
+- a `PhylaxPort` protocol for dependency-injected Oramasys lifecycle adapters.
 
 The digest and provenance inputs are evidence supplied by an integration. This
 package does not pretend to verify signatures or build provenance by itself.
@@ -50,4 +51,3 @@ This repository is an early v2 successor scaffold. Perpetua-Tools and
 orama-system remain the dual authorities during migration. No legacy policy or
 security implementation is silently considered migrated by the presence of
 this package.
-
