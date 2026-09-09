@@ -1,27 +1,20 @@
 # Phylax Boundaries
 
-Phylax is the compile-time and runtime security admission authority during
-the v2 migration.
+Phylax is the generic compile-time/runtime security, safety, admission, redaction, and monitorability authority for Oramasys.
 
-| Concern | Owner |
+| Concern | Canonical owner |
 | --- | --- |
-| Artifact digest/provenance evidence and admission decision | Phylax |
-| Endpoint-use authorization | Telos |
-| Arbitrary URL safety, DNS resolution, pinning, redirects | SSRF/transport layer |
-| Provider selection and readiness | provider adapter / Oramasys |
+| Artifact digest/provenance evidence and admission | Phylax |
+| Generic runtime security/safety policy and monitorability enforcement | Phylax |
+| URL parse/canonicalization and endpoint identity | Telos |
+| IP/CIDR/metadata classification and SSRF | Telos |
+| DNS resolution/rebinding and connection-time pinning | Telos |
+| Redirect/proxy/TLS destination safety | Telos |
+| Purpose-scoped endpoint-use authorization | Telos |
+| Provider protocol/readiness/lifecycle | provider owner / Oramasys composition |
 | Hardware capability and placement | Agate |
-| Workflow state, idempotency, and progress | Oramasys |
-| Paid-call reservation and settlement | durable accounting authority |
+| Workflow state, idempotency, routing and progress | Oramasys |
 
-Phylax must fail closed when provenance, digest, compile authorization, or
-capability evidence is missing or mismatched. The scaffold validates evidence
-shape and policy membership; it does not claim to verify signatures, SLSA
-attestations, or build systems without an injected production verifier.
+Endpoint-specific runtime checks remain Telos policy/enforcement; Phylax must not become a second endpoint-security authority. Conversely, Telos must not absorb generic artifact/runtime admission or monitorability concerns merely because an endpoint participates in a workflow.
 
-## Migration posture
-
-Perpetua-Tools and orama-system remain the dual v1 authorities. This package
-is a reference boundary and admission contract, not proof that the legacy
-security implementation has been migrated. Every new consumer needs a tested
-compatibility path and an explicit owner decision.
-
+Phylax fails closed when provenance, digest, compile authorization, capability evidence, or required generic runtime security evidence is missing or mismatched.
