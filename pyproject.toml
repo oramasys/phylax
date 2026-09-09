@@ -6,12 +6,12 @@ build-backend = "hatchling.build"
 name = "oramasys-phylax"
 version = "0.1.0a1"
 description = "Compile-time and runtime security admission authority for Oramasys"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/phylax"]
@@ -19,4 +19,4 @@ packages = ["src/phylax"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["src/tests"]
-
+addopts = "--cov=phylax --cov-report=term-missing --cov-fail-under=80"
