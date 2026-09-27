@@ -7,6 +7,7 @@ Phylax is the compile-time and runtime **generic security/safety admission** aut
 | Artifact digest/provenance evidence and admission | Phylax |
 | Generic runtime security/safety admission and policy packs | Phylax |
 | Generic monitorability/runtime-check substrate | Phylax |
+| Generic execution primitives and event contracts | Core (`oramasys/perpetua-core`) |
 | Endpoint identity and canonicalization | Telos |
 | SSRF, DNS resolution/rebinding defense, address classification | Telos |
 | Connection-time IP/socket pinning | Telos |
