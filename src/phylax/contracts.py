@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Literal, Protocol, TypeAlias
+
+# Source class of the evidence behind a runtime request. Only "observed" evidence can
+# satisfy an Observed requirement; derived or reconstructed evidence never can.
+EvidenceClass: TypeAlias = Literal["observed", "derived", "reconstructed"]
+EVIDENCE_CLASSES: tuple[str, ...] = ("observed", "derived", "reconstructed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,11 +61,14 @@ class RuntimeAdmissionRequest:
     capability: str
     run_id: str
     actor_id: str = "oramasys"
+    evidence_class: EvidenceClass = "observed"
 
     def __post_init__(self) -> None:
         for field_name in ("compile_ref", "artifact_id", "digest_sha256", "capability", "run_id", "actor_id"):
             if not getattr(self, field_name).strip():
                 raise ValueError(f"{field_name} is required")
+        if self.evidence_class not in EVIDENCE_CLASSES:
+            raise ValueError(f"unknown evidence_class: {self.evidence_class!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +80,12 @@ class RuntimeAdmissionDecision:
     artifact_id: str
     capability: str
     decided_at: datetime
+    # R4 T1 lifecycle. A decision authorizes nothing once expired or once the
+    # authority epoch has moved on (revocation); callers re-check before every
+    # execution boundary instead of copying policy.
+    decision_id: str = ""
+    expires_at: datetime | None = None
+    authority_epoch: int = 0
 
 
 class PhylaxPort(Protocol):
@@ -82,3 +96,6 @@ class PhylaxPort(Protocol):
 
     def admit(self, request: RuntimeAdmissionRequest) -> RuntimeAdmissionDecision:
         """Evaluate whether a capability may run for a compiled artifact."""
+
+    def is_current(self, decision: RuntimeAdmissionDecision) -> bool:
+        """True only for an allowed, unexpired decision at the current authority epoch."""
