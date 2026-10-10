@@ -14,11 +14,13 @@ EVIDENCE_CLASSES: tuple[str, ...] = ("observed", "derived", "reconstructed")
 
 @dataclass(frozen=True, slots=True)
 class ArtifactRef:
+    """Reference to an artifact by id, digest and provenance."""
     artifact_id: str
     digest_sha256: str
     provenance_ref: str
 
     def __post_init__(self) -> None:
+        """Validate the fields at construction and fail closed on bad input."""
         if not self.artifact_id.strip():
             raise ValueError("artifact_id is required")
         if len(self.digest_sha256) != 64 or any(
@@ -31,11 +33,13 @@ class ArtifactRef:
 
 @dataclass(frozen=True, slots=True)
 class CompileRequest:
+    """Request to compile an artifact with requested capabilities."""
     artifact: ArtifactRef
     requested_capabilities: frozenset[str]
     actor_id: str = "oramasys"
 
     def __post_init__(self) -> None:
+        """Validate the fields at construction and fail closed on bad input."""
         if not self.actor_id.strip():
             raise ValueError("actor_id is required")
         if any(not capability.strip() for capability in self.requested_capabilities):
@@ -44,6 +48,7 @@ class CompileRequest:
 
 @dataclass(frozen=True, slots=True)
 class CompileDecision:
+    """Result of a compile-time authority check."""
     allowed: bool
     reason_code: str
     policy_version: str
@@ -55,6 +60,7 @@ class CompileDecision:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeAdmissionRequest:
+    """Request to admit a compiled artifact for a run."""
     compile_ref: str
     artifact_id: str
     digest_sha256: str
@@ -66,6 +72,7 @@ class RuntimeAdmissionRequest:
     evidence_class: EvidenceClass | None = None
 
     def __post_init__(self) -> None:
+        """Validate the fields at construction and fail closed on bad input."""
         for field_name in ("compile_ref", "artifact_id", "digest_sha256", "capability", "run_id", "actor_id"):
             if not getattr(self, field_name).strip():
                 raise ValueError(f"{field_name} is required")
@@ -75,6 +82,7 @@ class RuntimeAdmissionRequest:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeAdmissionDecision:
+    """Result of runtime admission with id, expiry and authority epoch."""
     allowed: bool
     reason_code: str
     policy_version: str

@@ -9,14 +9,18 @@ from phylax import ArtifactRef, CompileRequest, PhylaxAuthorizer, RuntimeAdmissi
 
 
 class Clock:
+    """Settable clock for deterministic tests."""
     def __init__(self) -> None:
+        """Initialise the instance and validate its arguments."""
         self.now = datetime(2026, 10, 10, tzinfo=UTC)
 
     def __call__(self) -> datetime:
+        """Return the current value."""
         return self.now
 
 
 def setup(**kwargs):
+    """Test helper: setup."""
     clock = Clock()
     principal_verifier = kwargs.pop("principal_verifier", lambda actor: actor == "oramasys")
     policy = PhylaxAuthorizer(
@@ -33,6 +37,7 @@ def setup(**kwargs):
 
 
 def request(compiled, *, evidence_class="observed"):
+    """Test helper: request."""
     return RuntimeAdmissionRequest(
         compile_ref=compiled.compile_ref,
         artifact_id="graph",
@@ -44,6 +49,7 @@ def request(compiled, *, evidence_class="observed"):
 
 
 def test_decision_carries_id_expiry_and_epoch():
+    """Decision carries id expiry and epoch."""
     policy, compiled, clock = setup(decision_ttl=timedelta(seconds=30))
     decision = policy.admit(request(compiled))
     assert decision.allowed
@@ -54,6 +60,7 @@ def test_decision_carries_id_expiry_and_epoch():
 
 
 def test_decision_is_current_until_expiry():
+    """Decision is current until expiry."""
     policy, compiled, clock = setup(decision_ttl=timedelta(seconds=30))
     decision = policy.admit(request(compiled))
     assert policy.is_current(decision)
@@ -64,6 +71,7 @@ def test_decision_is_current_until_expiry():
 
 
 def test_revocation_bumps_the_epoch_and_stales_old_decisions():
+    """Revocation bumps the epoch and stales old decisions."""
     policy, compiled, _ = setup()
     decision = policy.admit(request(compiled))
     assert policy.revoke() == 2
@@ -72,6 +80,7 @@ def test_revocation_bumps_the_epoch_and_stales_old_decisions():
 
 
 def test_refused_decisions_are_never_current():
+    """Refused decisions are never current."""
     policy, compiled, _ = setup()
     refused = policy.admit(
         RuntimeAdmissionRequest(compiled.compile_ref, "graph", "b" * 64, "graph.execute", "run-1")
@@ -82,6 +91,7 @@ def test_refused_decisions_are_never_current():
 
 def test_nonobserved_source_cannot_admit():
     # Derived/reconstructed evidence must never satisfy an Observed requirement.
+    """Nonobserved source cannot admit."""
     policy, compiled, _ = setup(observed_required={"graph.execute"})
     for evidence in ("derived", "reconstructed"):
         decision = policy.admit(request(compiled, evidence_class=evidence))
@@ -93,6 +103,7 @@ def test_nonobserved_source_cannot_admit():
 def test_missing_hardware_or_principal_refused():
     # No principal-verification evidence available (unverified actor_id,
     # or no verifier configured at all) -> refuse, never default-allow.
+    """Missing hardware or principal refused."""
     clock = Clock()
     # 1. No verifier configured at all -> fail closed
     no_verifier_policy = PhylaxAuthorizer(
@@ -164,6 +175,7 @@ def test_missing_hardware_or_principal_refused():
 def test_duplicate_request_id_cannot_hide_violation():
     # Construct two admission requests with the same unique identifier (compile_ref, capability, run_id)
     # but different other fields, and confirm the second one is rejected or doesn't silently overwrite
+    """Duplicate request id cannot hide violation."""
     policy, compiled, _ = setup(principal_verifier=lambda actor_id: actor_id in {"oramasys", "actor-1"})
     req1 = RuntimeAdmissionRequest(
         compile_ref=compiled.compile_ref,
@@ -196,12 +208,14 @@ def test_duplicate_request_id_cannot_hide_violation():
 
 
 def test_unknown_evidence_class_is_rejected():
+    """Unknown evidence class is rejected."""
     _, compiled, _ = setup()
     with pytest.raises(ValueError):
         request(compiled, evidence_class="vibes")
 
 
 def test_ttl_and_clock_must_be_sane():
+    """Ttl and clock must be sane."""
     with pytest.raises(ValueError):
         PhylaxAuthorizer(trusted_provenance=set(), allowed_capabilities=set(), decision_ttl=timedelta(0))
     naive = PhylaxAuthorizer(trusted_provenance=set(), allowed_capabilities=set(),
@@ -214,6 +228,7 @@ def test_ttl_and_clock_must_be_sane():
 
 
 def test_omitted_evidence_class_never_counts_as_observed():
+    """Omitted evidence class never counts as observed."""
     policy, compiled, _ = setup(observed_required={"graph.execute"})
     unspecified = RuntimeAdmissionRequest(compiled.compile_ref, "graph", "a" * 64, "graph.execute", "run-1")
     assert unspecified.evidence_class is None
@@ -223,6 +238,7 @@ def test_omitted_evidence_class_never_counts_as_observed():
 
 
 def test_omitted_evidence_class_is_fine_when_observed_is_not_required():
+    """Omitted evidence class is fine when observed is not required."""
     policy, compiled, _ = setup()
     assert policy.admit(
         RuntimeAdmissionRequest(compiled.compile_ref, "graph", "a" * 64, "graph.execute", "run-1")
@@ -230,6 +246,7 @@ def test_omitted_evidence_class_is_fine_when_observed_is_not_required():
 
 
 def test_decision_from_another_authorizer_is_not_current():
+    """Decision from another authorizer is not current."""
     first, compiled_a, _ = setup()
     second, _, _ = setup()
     decision = first.admit(request(compiled_a))
@@ -239,6 +256,7 @@ def test_decision_from_another_authorizer_is_not_current():
 
 
 def test_tampered_decision_is_not_current():
+    """Tampered decision is not current."""
     from dataclasses import replace
 
     policy, compiled, _ = setup()
