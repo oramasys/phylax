@@ -61,13 +61,15 @@ class RuntimeAdmissionRequest:
     capability: str
     run_id: str
     actor_id: str = "oramasys"
-    evidence_class: EvidenceClass = "observed"
+    # None means the caller did not classify its evidence. That is never treated as
+    # observed: capabilities that require Observed evidence refuse it.
+    evidence_class: EvidenceClass | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("compile_ref", "artifact_id", "digest_sha256", "capability", "run_id", "actor_id"):
             if not getattr(self, field_name).strip():
                 raise ValueError(f"{field_name} is required")
-        if self.evidence_class not in EVIDENCE_CLASSES:
+        if self.evidence_class is not None and self.evidence_class not in EVIDENCE_CLASSES:
             raise ValueError(f"unknown evidence_class: {self.evidence_class!r}")
 
 

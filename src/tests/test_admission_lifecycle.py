@@ -100,3 +100,40 @@ def test_ttl_and_clock_must_be_sane():
                              clock=lambda: datetime(2026, 1, 1))
     with pytest.raises(ValueError):
         naive.compile(CompileRequest(ArtifactRef("graph", "a" * 64, "x"), frozenset()))
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+def test_omitted_evidence_class_never_counts_as_observed():
+    policy, compiled, _ = setup(observed_required={"graph.execute"})
+    unspecified = RuntimeAdmissionRequest(compiled.compile_ref, "graph", "a" * 64, "graph.execute", "run-1")
+    assert unspecified.evidence_class is None
+    decision = policy.admit(unspecified)
+    assert not decision.allowed
+    assert decision.reason_code == "evidence_not_observed"
+
+
+def test_omitted_evidence_class_is_fine_when_observed_is_not_required():
+    policy, compiled, _ = setup()
+    assert policy.admit(
+        RuntimeAdmissionRequest(compiled.compile_ref, "graph", "a" * 64, "graph.execute", "run-1")
+    ).allowed
+
+
+def test_decision_from_another_authorizer_is_not_current():
+    first, compiled_a, _ = setup()
+    second, _, _ = setup()
+    decision = first.admit(request(compiled_a))
+    assert first.is_current(decision)
+    assert second.authority_epoch == decision.authority_epoch == 1
+    assert not second.is_current(decision)
+
+
+def test_tampered_decision_is_not_current():
+    from dataclasses import replace
+
+    policy, compiled, _ = setup()
+    decision = policy.admit(request(compiled))
+    assert not policy.is_current(replace(decision, capability="graph.admin"))
+    assert not policy.is_current(replace(decision, decision_id="forged"))

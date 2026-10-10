@@ -38,6 +38,10 @@ class PhylaxAuthorizer:
         self._observed_required = frozenset(observed_required)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._epoch = 1
+        # Decisions this instance issued, by id. is_current only vouches for these,
+        # so a decision from another authorizer (same epoch number) or a tampered
+        # copy is never current here.
+        self._issued: dict[str, RuntimeAdmissionDecision] = {}
 
     @property
     def authority_epoch(self) -> int:
@@ -46,9 +50,12 @@ class PhylaxAuthorizer:
     def revoke(self) -> int:
         """Invalidate every outstanding runtime decision; returns the new epoch."""
         self._epoch += 1
+        self._issued.clear()
         return self._epoch
 
     def is_current(self, decision: RuntimeAdmissionDecision) -> bool:
+        if self._issued.get(decision.decision_id) != decision:
+            return False
         return (
             decision.allowed
             and decision.authority_epoch == self._epoch
@@ -103,7 +110,7 @@ class PhylaxAuthorizer:
             reason_code = "allowed"
 
         now = self._now()
-        return RuntimeAdmissionDecision(
+        decision = RuntimeAdmissionDecision(
             allowed=reason_code == "allowed",
             reason_code=reason_code,
             policy_version=self._policy_version,
@@ -115,4 +122,14 @@ class PhylaxAuthorizer:
             expires_at=now + self._ttl,
             authority_epoch=self._epoch,
         )
+        if decision.allowed:
+            self._prune(now)
+            self._issued[decision.decision_id] = decision
+        return decision
+
+    def _prune(self, now: datetime) -> None:
+        expired = [key for key, d in self._issued.items()
+                   if d.expires_at is None or d.expires_at <= now or d.authority_epoch != self._epoch]
+        for key in expired:
+            del self._issued[key]
 
