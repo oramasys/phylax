@@ -90,6 +90,14 @@ class RuntimeAdmissionDecision:
     authority_epoch: int = 0
 
 
+class PrincipalVerifier(Protocol):
+    """Checks whether a principal/actor identity is currently trusted."""
+
+    def __call__(self, actor_id: str) -> bool:
+        """Return True if actor_id is currently trusted/verified, False otherwise."""
+        ...
+
+
 class PhylaxPort(Protocol):
     """Composition boundary for compile and runtime admission."""
 
@@ -101,3 +109,4 @@ class PhylaxPort(Protocol):
 
     def is_current(self, decision: RuntimeAdmissionDecision) -> bool:
         """True only for an allowed, unexpired decision at the current authority epoch."""
+

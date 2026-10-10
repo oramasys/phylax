@@ -5,10 +5,11 @@ def artifact() -> ArtifactRef:
     return ArtifactRef("graph", "a" * 64, "slsa://build/graph")
 
 
-def authorizer() -> PhylaxAuthorizer:
+def authorizer(principal_verifier=None) -> PhylaxAuthorizer:
     return PhylaxAuthorizer(
         trusted_provenance={"slsa://build/graph"},
         allowed_capabilities={"graph.execute"},
+        principal_verifier=principal_verifier or (lambda actor: actor == "oramasys"),
     )
 
 

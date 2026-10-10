@@ -9,6 +9,7 @@ from .contracts import (
     EVIDENCE_CLASSES,
     EvidenceClass,
     PhylaxPort,
+    PrincipalVerifier,
     RuntimeAdmissionDecision,
     RuntimeAdmissionRequest,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "redact_details",
     "PhylaxAuthorizer",
     "PhylaxPort",
+    "PrincipalVerifier",
     "RuntimeAdmissionDecision",
     "RuntimeAdmissionRequest",
 ]

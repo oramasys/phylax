@@ -10,6 +10,7 @@ from .contracts import (
     ArtifactRef,
     CompileDecision,
     CompileRequest,
+    PrincipalVerifier,
     RuntimeAdmissionDecision,
     RuntimeAdmissionRequest,
 )
@@ -21,6 +22,7 @@ class PhylaxAuthorizer:
         *,
         trusted_provenance: set[str] | frozenset[str],
         allowed_capabilities: set[str] | frozenset[str],
+        principal_verifier: PrincipalVerifier | Callable[[str], bool] | None = None,
         policy_version: str = "phylax-policy-v1",
         decision_ttl: timedelta = timedelta(minutes=5),
         observed_required: set[str] | frozenset[str] = frozenset(),
@@ -32,6 +34,7 @@ class PhylaxAuthorizer:
             raise ValueError("decision_ttl must be positive")
         self._trusted_provenance = frozenset(trusted_provenance)
         self._allowed_capabilities = frozenset(allowed_capabilities)
+        self._principal_verifier = principal_verifier
         self._policy_version = policy_version
         self._decisions: dict[str, CompileDecision] = {}
         self._ttl = decision_ttl
@@ -69,9 +72,20 @@ class PhylaxAuthorizer:
             raise ValueError("Phylax clock must return an aware UTC datetime")
         return now.astimezone(UTC)
 
+    def _verify_principal(self, actor_id: str) -> bool:
+        if self._principal_verifier is None:
+            return False
+        try:
+            return bool(self._principal_verifier(actor_id))
+        except Exception:
+            return False
+
     def compile(self, request: CompileRequest) -> CompileDecision:
         missing = request.requested_capabilities - self._allowed_capabilities
-        if request.artifact.provenance_ref not in self._trusted_provenance:
+        if not self._verify_principal(request.actor_id):
+            reason_code = "unverified_principal"
+            allowed = False
+        elif request.artifact.provenance_ref not in self._trusted_provenance:
             reason_code = "untrusted_provenance"
             allowed = False
         elif missing:
@@ -96,7 +110,9 @@ class PhylaxAuthorizer:
 
     def admit(self, request: RuntimeAdmissionRequest) -> RuntimeAdmissionDecision:
         compile_decision = self._decisions.get(request.compile_ref)
-        if compile_decision is None:
+        if not self._verify_principal(request.actor_id):
+            reason_code = "unverified_principal"
+        elif compile_decision is None:
             reason_code = "compile_decision_not_found"
         elif compile_decision.artifact.artifact_id != request.artifact_id:
             reason_code = "artifact_mismatch"
