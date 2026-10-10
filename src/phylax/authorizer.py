@@ -2,36 +2,97 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from secrets import token_urlsafe
 
 from .contracts import (
     ArtifactRef,
     CompileDecision,
     CompileRequest,
+    PrincipalVerifier,
     RuntimeAdmissionDecision,
     RuntimeAdmissionRequest,
 )
 
 
 class PhylaxAuthorizer:
+    """Compile-time and runtime admission authority for graph artifacts."""
     def __init__(
         self,
         *,
         trusted_provenance: set[str] | frozenset[str],
         allowed_capabilities: set[str] | frozenset[str],
+        principal_verifier: PrincipalVerifier | Callable[[str], bool] | None = None,
         policy_version: str = "phylax-policy-v1",
+        decision_ttl: timedelta = timedelta(minutes=5),
+        observed_required: set[str] | frozenset[str] = frozenset(),
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
+        """Initialise the instance and validate its arguments."""
         if not policy_version.strip():
             raise ValueError("policy version is required")
+        if decision_ttl <= timedelta(0):
+            raise ValueError("decision_ttl must be positive")
         self._trusted_provenance = frozenset(trusted_provenance)
         self._allowed_capabilities = frozenset(allowed_capabilities)
+        self._principal_verifier = principal_verifier
         self._policy_version = policy_version
         self._decisions: dict[str, CompileDecision] = {}
+        self._ttl = decision_ttl
+        self._observed_required = frozenset(observed_required)
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._epoch = 1
+        # Decisions this instance issued, by id. is_current only vouches for these,
+        # so a decision from another authorizer (same epoch number) or a tampered
+        # copy is never current here.
+        self._issued: dict[str, RuntimeAdmissionDecision] = {}
+
+    @property
+    def authority_epoch(self) -> int:
+        """Return the current authority epoch; revocation increments it."""
+        return self._epoch
+
+    def revoke(self) -> int:
+        """Invalidate every outstanding runtime decision; returns the new epoch."""
+        self._epoch += 1
+        self._issued.clear()
+        return self._epoch
+
+    def is_current(self, decision: RuntimeAdmissionDecision) -> bool:
+        """Report whether a decision was issued here, is unexpired and matches the epoch."""
+        if self._issued.get(decision.decision_id) != decision:
+            return False
+        return (
+            decision.allowed
+            and decision.authority_epoch == self._epoch
+            and decision.expires_at is not None
+            and self._now() < decision.expires_at
+        )
+
+    def _now(self) -> datetime:
+        """Return the injected clock reading as an aware UTC datetime."""
+        now = self._clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("Phylax clock must return an aware UTC datetime")
+        return now.astimezone(UTC)
+
+    def _verify_principal(self, actor_id: str) -> bool:
+        """Report whether the actor is a trusted principal."""
+        if self._principal_verifier is None:
+            return False
+        try:
+            return bool(self._principal_verifier(actor_id))
+        except Exception:
+            return False
 
     def compile(self, request: CompileRequest) -> CompileDecision:
+        """Decide compile-time authority for an artifact."""
         missing = request.requested_capabilities - self._allowed_capabilities
-        if request.artifact.provenance_ref not in self._trusted_provenance:
+        if not self._verify_principal(request.actor_id):
+            reason_code = "unverified_principal"
+            allowed = False
+        elif request.artifact.provenance_ref not in self._trusted_provenance:
             reason_code = "untrusted_provenance"
             allowed = False
         elif missing:
@@ -48,15 +109,18 @@ class PhylaxAuthorizer:
             compile_ref=token_urlsafe(18),
             artifact=request.artifact,
             approved_capabilities=request.requested_capabilities if allowed else frozenset(),
-            decided_at=datetime.now(UTC),
+            decided_at=self._now(),
         )
         if allowed:
             self._decisions[decision.compile_ref] = decision
         return decision
 
     def admit(self, request: RuntimeAdmissionRequest) -> RuntimeAdmissionDecision:
+        """Decide runtime admission, issuing an expiring epoch-bound decision."""
         compile_decision = self._decisions.get(request.compile_ref)
-        if compile_decision is None:
+        if not self._verify_principal(request.actor_id):
+            reason_code = "unverified_principal"
+        elif compile_decision is None:
             reason_code = "compile_decision_not_found"
         elif compile_decision.artifact.artifact_id != request.artifact_id:
             reason_code = "artifact_mismatch"
@@ -64,16 +128,33 @@ class PhylaxAuthorizer:
             reason_code = "digest_mismatch"
         elif request.capability not in compile_decision.approved_capabilities:
             reason_code = "capability_not_permitted"
+        elif request.capability in self._observed_required and request.evidence_class != "observed":
+            reason_code = "evidence_not_observed"
         else:
             reason_code = "allowed"
 
-        return RuntimeAdmissionDecision(
+        now = self._now()
+        decision = RuntimeAdmissionDecision(
             allowed=reason_code == "allowed",
             reason_code=reason_code,
             policy_version=self._policy_version,
             compile_ref=request.compile_ref,
             artifact_id=request.artifact_id,
             capability=request.capability,
-            decided_at=datetime.now(UTC),
+            decided_at=now,
+            decision_id=token_urlsafe(18),
+            expires_at=now + self._ttl,
+            authority_epoch=self._epoch,
         )
+        if decision.allowed:
+            self._prune(now)
+            self._issued[decision.decision_id] = decision
+        return decision
+
+    def _prune(self, now: datetime) -> None:
+        """Drop issuance records for decisions that have expired."""
+        expired = [key for key, d in self._issued.items()
+                   if d.expires_at is None or d.expires_at <= now or d.authority_epoch != self._epoch]
+        for key in expired:
+            del self._issued[key]
 

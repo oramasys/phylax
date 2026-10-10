@@ -6,7 +6,10 @@ from .contracts import (
     ArtifactRef,
     CompileDecision,
     CompileRequest,
+    EVIDENCE_CLASSES,
+    EvidenceClass,
     PhylaxPort,
+    PrincipalVerifier,
     RuntimeAdmissionDecision,
     RuntimeAdmissionRequest,
 )
@@ -15,9 +18,12 @@ __all__ = [
     "ArtifactRef",
     "CompileDecision",
     "CompileRequest",
+    "EVIDENCE_CLASSES",
+    "EvidenceClass",
     "redact_details",
     "PhylaxAuthorizer",
     "PhylaxPort",
+    "PrincipalVerifier",
     "RuntimeAdmissionDecision",
     "RuntimeAdmissionRequest",
 ]
