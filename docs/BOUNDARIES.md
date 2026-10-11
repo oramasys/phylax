@@ -7,6 +7,7 @@ Phylax is the compile-time and runtime **generic security/safety admission** aut
 | Artifact digest/provenance evidence and admission | Phylax |
 | Generic runtime security/safety admission and policy packs | Phylax |
 | Generic monitorability/runtime-check substrate | Phylax |
+| Strict P5 approval evidence for security-sensitive actions | Phylax |
 | Generic execution primitives and event contracts | Core (`oramasys/perpetua-core`) |
 | Endpoint identity and canonicalization | Telos |
 | SSRF, DNS resolution/rebinding defense, address classification | Telos |
@@ -18,6 +19,12 @@ Phylax is the compile-time and runtime **generic security/safety admission** aut
 | Workflow state, routing, idempotency and progress | Oramasys |
 
 Phylax must fail closed when provenance, digest, compile authorization, or capability evidence is missing or mismatched. Its generic runtime-check mechanism must not absorb domain semantics merely because those checks are security-relevant.
+
+P5 binds a trusted interaction boundary's operator evidence to an immutable
+swarm-launch preview and consumes that evidence once. It does not create
+adjustment grants, decide ledger admission, or replace an adjustment grant's
+independent Ed25519ph signature. A future consumer must provide durable P5
+storage and may not add a legacy boolean-approval bypass.
 
 ## Explicit endpoint exclusion
 

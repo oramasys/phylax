@@ -13,6 +13,8 @@ Phylax owns generic security/safety concerns such as:
 - runtime capability admission;
 - generic integrity, provenance, redaction, and safety policy packs;
 - reusable runtime-check and monitorability mechanisms that are not owned by a more specific domain authority.
+- strict, one-time P5 approval evidence for security-sensitive actions when a
+  trusted interaction boundary supplies operator-decision evidence.
 
 Phylax **does not** own endpoint-specific security. `oramasys/telos` is the sole v2 authority for endpoint identity, URL canonicalization, destination/IP classification, SSRF policy, DNS/rebinding defense, connection-time pinning, redirect/proxy/TLS destination safety, and purpose-scoped endpoint-use authorization.
 
@@ -31,3 +33,17 @@ The project maintains at least **80% test coverage**. If a component defines a s
 ## Migration posture
 
 The v1 repositories remain independent legacy authorities. Phylax is a v2 clean-room successor surface and must not gain runtime dependencies on PT or other v1 implementations. Historical v1 material may be used as evidence and parity input only.
+
+## P5 approval satellite
+
+`P5ApprovalAuthority` is a v2-native, strict approval primitive. It mints a
+server-side preview, binds a separately obtained `operator_evidence_ref` and a
+P5-decided duration to one immutable swarm preview, then verifies and consumes
+the receipt once. The preview includes the operator principal and every
+dispatch-relevant swarm field, so a receipt cannot authorize another launch.
+
+This is integrity and replay protection, not a claim that a client-side boolean
+proves a human acted. Production composition must provide a trusted interaction
+boundary and use the standard-library `SqliteP5ApprovalStore` or a compatible
+durable `P5ApprovalStore`; the in-memory store is a test reference only. P5
+does not issue or verify adjustment grants, and it has no legacy approval bypass.

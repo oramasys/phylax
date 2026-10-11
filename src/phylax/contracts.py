@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias
+
+if TYPE_CHECKING:
+    from .p5_approval import (
+        P5ApprovalDecision,
+        P5ApprovalIntent,
+        P5ApprovalPreview,
+        P5ApprovalReceipt,
+    )
 
 # Source class of the evidence behind a runtime request. Only "observed" evidence can
 # satisfy an Observed requirement; derived or reconstructed evidence never can.
@@ -117,4 +125,27 @@ class PhylaxPort(Protocol):
 
     def is_current(self, decision: RuntimeAdmissionDecision) -> bool:
         """True only for an allowed, unexpired decision at the current authority epoch."""
+
+
+class P5ApprovalPort(Protocol):
+    """Strict, one-time approval boundary for security-sensitive actions.
+
+    Concrete P5 contracts live in ``phylax.p5_approval`` so ordinary
+    compile/admission consumers do not acquire an approval-flow dependency.
+    """
+
+    def issue_preview(self, intent: P5ApprovalIntent) -> P5ApprovalPreview:
+        """Create a preview requiring separately attested operator evidence."""
+
+    def approve(
+        self,
+        preview_id: str,
+        *,
+        operator_evidence_ref: str,
+        approved_duration_seconds: int | None = None,
+    ) -> P5ApprovalReceipt:
+        """Bind trusted operator evidence to one preview."""
+
+    def consume(self, receipt: P5ApprovalReceipt, intent: P5ApprovalIntent) -> P5ApprovalDecision:
+        """Verify and consume a receipt exactly once."""
 
