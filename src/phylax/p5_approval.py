@@ -148,8 +148,10 @@ class P5ApprovalStore(Protocol):
     def approve(self, preview_id: str, receipt: P5ApprovalReceipt, operator_evidence_ref: str, approved_at: datetime) -> bool:
         """Persist the first approval for preview_id and return whether it won."""
 
-    def consume(self, preview_id: str, approval_token: str) -> _StoredPreview | None:
-        """Atomically consume an approved preview only when its token matches."""
+    def consume(
+        self, preview_id: str, approval_token: str, *, now: datetime
+    ) -> _StoredPreview | None:
+        """Atomically consume an unexpired approved preview only when its token matches."""
 
 
 class InMemoryP5ApprovalStore:
@@ -187,12 +189,16 @@ class InMemoryP5ApprovalStore:
             )
             return True
 
-    def consume(self, preview_id: str, approval_token: str) -> _StoredPreview | None:
+    def consume(
+        self, preview_id: str, approval_token: str, *, now: datetime
+    ) -> _StoredPreview | None:
         """Atomically consume a matching approved preview and return its old state."""
         with self._lock:
             current = self._records.get(preview_id)
             if current is None or current.approval_token_digest is None or current.consumed:
                 return None
+            if _utc_timestamp(now) >= _utc_timestamp(current.preview.expires_at):
+                raise ValueError("P5 approval expired")
             if not hmac.compare_digest(current.approval_token_digest, _token_digest(approval_token)):
                 return None
             self._records[preview_id] = _StoredPreview(
@@ -214,26 +220,33 @@ def _token_digest(approval_token: str) -> str:
 class SqliteP5ApprovalStore:
     """Durable SQLite P5 store with transactional, one-time receipt consumption."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, timeout: float = 5.0) -> None:
         """Open or initialise a local SQLite store at the supplied path."""
         if not path.strip():
             raise ValueError("P5 SQLite path is required")
+        if timeout <= 0:
+            raise ValueError("P5 SQLite timeout must be positive")
         self._path = path
-        with self._connection() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS p5_approvals (
-                    preview_id TEXT PRIMARY KEY,
-                    intent_json TEXT NOT NULL,
-                    expires_at INTEGER NOT NULL,
-                    state TEXT NOT NULL,
-                    approval_token_digest TEXT,
-                    approved_duration_seconds INTEGER,
-                    operator_evidence_ref TEXT,
-                    approved_at INTEGER
+        self._connection_timeout = timeout
+        try:
+            with self._connection() as connection:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS p5_approvals (
+                        preview_id TEXT PRIMARY KEY,
+                        intent_json TEXT NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        approval_token_digest TEXT,
+                        approved_duration_seconds INTEGER,
+                        operator_evidence_ref TEXT,
+                        approved_at INTEGER
+                    )
+                    """
                 )
-                """
-            )
+        except sqlite3.OperationalError as exc:
+            raise ValueError("P5 store busy or locked") from exc
 
     def put(self, preview: P5ApprovalPreview) -> None:
         """Persist a pending preview and reject a colliding server-generated id."""
@@ -251,65 +264,79 @@ class SqliteP5ApprovalStore:
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError("P5 preview_id already exists") from exc
+        except sqlite3.OperationalError as exc:
+            raise ValueError("P5 store busy or locked") from exc
 
     def get(self, preview_id: str) -> _StoredPreview | None:
         """Load current approval state without changing it."""
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM p5_approvals WHERE preview_id = ?", (preview_id,)
-            ).fetchone()
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    "SELECT * FROM p5_approvals WHERE preview_id = ?", (preview_id,)
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            raise ValueError("P5 store busy or locked") from exc
         return self._from_row(row) if row is not None else None
 
     def approve(self, preview_id: str, receipt: P5ApprovalReceipt, operator_evidence_ref: str, approved_at: datetime) -> bool:
         """Compare-and-swap pending state into approved state exactly once."""
-        with self._connection() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE p5_approvals
-                SET state = 'approved', approval_token_digest = ?, approved_duration_seconds = ?,
-                    operator_evidence_ref = ?, approved_at = ?
-                WHERE preview_id = ? AND state = 'pending'
-                """,
-                (
-                    _token_digest(receipt.approval_token),
-                    receipt.approved_duration_seconds,
-                    operator_evidence_ref,
-                    _utc_timestamp(approved_at),
-                    preview_id,
-                ),
-            )
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE p5_approvals
+                    SET state = 'approved', approval_token_digest = ?, approved_duration_seconds = ?,
+                        operator_evidence_ref = ?, approved_at = ?
+                    WHERE preview_id = ? AND state = 'pending'
+                    """,
+                    (
+                        _token_digest(receipt.approval_token),
+                        receipt.approved_duration_seconds,
+                        operator_evidence_ref,
+                        _utc_timestamp(approved_at),
+                        preview_id,
+                    ),
+                )
+        except sqlite3.OperationalError as exc:
+            raise ValueError("P5 store busy or locked") from exc
         return cursor.rowcount == 1
 
-    def consume(self, preview_id: str, approval_token: str) -> _StoredPreview | None:
+    def consume(
+        self, preview_id: str, approval_token: str, *, now: datetime
+    ) -> _StoredPreview | None:
         """Atomically consume a matching approved record and return its old state."""
-        with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM p5_approvals WHERE preview_id = ?", (preview_id,)
-            ).fetchone()
-            if (
-                row is None
-                or row[3] != "approved"
-                or not isinstance(row[4], str)
-                or not hmac.compare_digest(row[4], _token_digest(approval_token))
-            ):
-                connection.rollback()
-                return None
-            stored = self._from_row(row)
-            cursor = connection.execute(
-                "UPDATE p5_approvals SET state = 'consumed' WHERE preview_id = ? AND state = 'approved'",
-                (preview_id,),
-            )
-            if cursor.rowcount != 1:
-                connection.rollback()
-                return None
-            connection.commit()
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM p5_approvals WHERE preview_id = ?", (preview_id,)
+                ).fetchone()
+                if row is None or row[3] != "approved" or not isinstance(row[4], str):
+                    connection.rollback()
+                    return None
+                if _utc_timestamp(now) >= int(row[2]):
+                    connection.rollback()
+                    raise ValueError("P5 approval expired")
+                if not hmac.compare_digest(row[4], _token_digest(approval_token)):
+                    connection.rollback()
+                    return None
+                stored = self._from_row(row)
+                cursor = connection.execute(
+                    "UPDATE p5_approvals SET state = 'consumed' WHERE preview_id = ? AND state = 'approved'",
+                    (preview_id,),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return None
+                connection.commit()
+        except sqlite3.OperationalError as exc:
+            raise ValueError("P5 store busy or locked") from exc
         return stored
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         """Yield and always close a connection configured for local writers."""
-        connection = sqlite3.connect(self._path, timeout=5.0, isolation_level=None)
+        connection = sqlite3.connect(self._path, timeout=self._connection_timeout, isolation_level=None)
         try:
             connection.execute("PRAGMA journal_mode = WAL")
             yield connection
@@ -394,11 +421,11 @@ class P5ApprovalAuthority:
         """Verify exact canonical claims and consume a receipt once, fail-closed."""
         payload = self._verified_payload(receipt)
         self._validate_claims(payload, receipt, intent)
-        stored = self._store.consume(receipt.preview_id, receipt.approval_token)
+        stored = self._store.consume(
+            receipt.preview_id, receipt.approval_token, now=self._now()
+        )
         if stored is None or stored.operator_evidence_ref is None or stored.approved_at is None:
             raise ValueError("P5 approval is unknown, invalid, or already consumed")
-        if self._now() >= stored.preview.expires_at:
-            raise ValueError("P5 approval expired")
         return P5ApprovalDecision(intent, stored.operator_evidence_ref, receipt.approved_duration_seconds, stored.approved_at)
 
     def _now(self) -> datetime:

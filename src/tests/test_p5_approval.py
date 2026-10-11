@@ -11,6 +11,7 @@ from phylax.p5_approval import (
     InMemoryP5ApprovalStore,
     P5ApprovalAuthority,
     P5ApprovalIntent,
+    P5ApprovalReceipt,
     SqliteP5ApprovalStore,
 )
 
@@ -46,7 +47,7 @@ def authority(clock: Clock | None = None) -> P5ApprovalAuthority:
     return P5ApprovalAuthority(signing_key=b"test-p5-secret", store=InMemoryP5ApprovalStore(), clock=clock)
 
 
-def approved(policy: P5ApprovalAuthority):
+def approved(policy: P5ApprovalAuthority) -> P5ApprovalReceipt:
     """Issue then bind trusted operator evidence to one preview."""
     preview = policy.issue_preview(intent())
     return policy.approve(preview.preview_id, operator_evidence_ref="audit://operator/decision-1")
@@ -134,6 +135,9 @@ def test_p5_expiry_applies_before_approval_and_before_consumption() -> None:
     clock.now += timedelta(minutes=5)
     with pytest.raises(ValueError, match="expired"):
         policy.consume(receipt, intent())
+    # A retry on an expired receipt still consistently raises expired, not 'already consumed'
+    with pytest.raises(ValueError, match="expired"):
+        policy.consume(receipt, intent())
 
 
 def test_p5_duration_is_p5_output_with_ratified_bounds() -> None:
@@ -206,3 +210,40 @@ def test_sqlite_store_allows_exactly_one_concurrent_consumer(tmp_path: Path) -> 
 
     assert outcomes.count(True) == 1
     assert outcomes.count(False) == 1
+
+
+def test_sqlite_store_busy_timeout_wraps_as_value_error(tmp_path: Path) -> None:
+    """A locked SQLite database fails closed with a consistent ValueError message."""
+    database = tmp_path / "p5-locked.db"
+    store = SqliteP5ApprovalStore(str(database), timeout=0.05)
+    policy = P5ApprovalAuthority(signing_key=b"test-p5-secret", store=store)
+    preview = policy.issue_preview(intent())
+    receipt = policy.approve(preview.preview_id, operator_evidence_ref="audit://op/1")
+
+    # Acquire an exclusive lock on the database from a separate connection
+    import sqlite3
+    con = sqlite3.connect(str(database))
+    con.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(ValueError, match="P5 store busy or locked"):
+            policy.consume(receipt, intent())
+    finally:
+        con.rollback()
+        con.close()
+
+
+def test_sqlite_expired_receipt_is_not_consumed(tmp_path: Path) -> None:
+    """The SQLite CAS leaves an expired approval available for consistent diagnosis."""
+    database = tmp_path / "p5-expired.db"
+    clock = Clock()
+    store = SqliteP5ApprovalStore(str(database))
+    policy = P5ApprovalAuthority(signing_key=b"test-p5-secret", store=store, clock=clock)
+    receipt = approved(policy)
+    clock.now += timedelta(minutes=5)
+
+    with pytest.raises(ValueError, match="P5 approval expired"):
+        policy.consume(receipt, intent())
+
+    stored = store.get(receipt.preview_id)
+    assert stored is not None
+    assert not stored.consumed
