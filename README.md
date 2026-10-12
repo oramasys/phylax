@@ -62,18 +62,31 @@ Policy bounds and retention:
 
 ## Adjustment-grant issuer
 
-`PhylaxGrantAuthority` owns only the issuer side of a one-time adjustment
-grant: it authenticates the requesting principal, creates a server-minted
-grant identifier, binds P5 approval to the exact target tuple, derives the
-human grant duration from P5 rather than a caller argument, and signs the
-canonical body with RFC 8032 Ed25519ph. It also exposes verification and a
-timestamped revocation observation for a future Telos transport adapter.
+`PhylaxGrantAuthority` owns the issuer side of a one-time adjustment grant:
+it authenticates the requesting principal, binds a grant-specific P5 action to
+the exact target tuple, accepts only the duration P5 approves, and signs the
+canonical wire body with RFC 8032 Ed25519ph. Its `verifier_adapter()` exposes
+only `verify(wire)` and `revocation(grant_id)` for dependency-injected
+composition; the result omits issuer key IDs, public keys, P5 receipts, and
+operator-evidence references.
 
 The issuer has no budget, ledger, or consumption authority. Oramasys must
 verify the attestation and atomically consume it against its own ledger. The
 P5 receipt remains local issuance evidence; its raw HMAC token never becomes
-the Ed25519ph grant signature or crosses that boundary. `RotatingIssuerKeyring`
-retains retired public keys for at least 24 hours and through every live grant
-they signed, plus the 60-second skew window. Deployments must provide durable
-key and grant-index storage before treating this in-memory reference lifecycle
-as release-ready.
+the Ed25519ph grant signature or crosses that boundary. `SqliteGrantAuthorityStore`
+durably records the public key registry, exact issued wire forms, revocations,
+key-retention references, and digest-only P5 audit facts. Retired keys remain
+available for at least 24 hours and through every live grant they signed, plus
+the 60-second skew window. `RotatingIssuerKeyring` requires an injected
+`IssuerSeedProvider`; deployments resolve the opaque `seed_ref` through their
+protected secret manager. SQLite stores only that reference and public
+metadata. Startup fails if the supplied seed does not match the active durable
+key record. The shared signature fixture is
+[`docs/vectors/adjustment-grant-v1.json`](docs/vectors/adjustment-grant-v1.json).
+
+The human issuance default is 5,400 seconds; a P5-authorized extension may be
+up to 9,900 seconds and requires fresh P5 approval. The 900-second autonomous
+default belongs to a separate P5 autonomous policy path. That path is not
+implemented here, and autonomous grant issuance remains unavailable until P5
+defines and authenticates it. The grant issuer does not infer a supervision
+tier from a caller-provided duration.

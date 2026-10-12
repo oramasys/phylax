@@ -10,10 +10,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from secrets import token_urlsafe
-from typing import Callable, Final, Literal
+from typing import Callable, Final, Literal, Protocol
 
 from nacl import exceptions as nacl_exceptions
 from nacl.bindings import (
@@ -32,14 +34,76 @@ from .p5_approval import (
     P5ApprovalIntent,
     P5ApprovalReceipt,
 )
+from .grant_store import IssuerKeyRecord, SqliteGrantAuthorityStore
 
 _DOMAIN: Final = b"phylax-adjustment-grant-v1\x00"
 _SCHEMA_VERSION: Final = 1
 _FUTURE_ISSUANCE_SKEW: Final = timedelta(seconds=60)
-_RETIRED_KEY_FLOOR: Final = timedelta(hours=24)
-_RETIRED_KEY_SKEW: Final = timedelta(seconds=60)
 _UNIT_BASES: Final = frozenset({"steps", "elapsed_ms", "cost_microunits", "effect_attempts"})
 _KINDS: Final = frozenset({"settle", "release"})
+_MAX_SAFE_INTEGER: Final = (2**53) - 1
+_GRANT_ACTION: Final = "phylax.adjustment_grant.issue"
+
+
+class GrantRefusalReason(StrEnum):
+    """Closed issuer-verification refusal vocabulary shared with Oramasys."""
+
+    GRANT_MALFORMED = "grant.malformed"
+    GRANT_SCHEMA_UNSUPPORTED = "grant.schema_unsupported"
+    GRANT_KEY_UNKNOWN = "grant.key_unknown"
+    GRANT_SIGNATURE_INVALID = "grant.signature_invalid"
+    GRANT_EXPIRED = "grant.expired"
+    GRANT_FUTURE_DATED = "grant.future_dated"
+    GRANT_REVOKED = "grant.revoked"
+    REVOCATION_STALE = "revocation.stale"
+    VERIFIER_UNAVAILABLE = "verifier.unavailable"
+
+
+class GrantRefusal(Exception):
+    """A verifier refusal with no unstructured or caller-controlled detail."""
+
+    def __init__(self, reason: GrantRefusalReason) -> None:
+        if not isinstance(reason, GrantRefusalReason):
+            raise ValueError("grant refusal reason is not in the closed set")
+        self.reason = reason
+        super().__init__(reason.value)
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedGrant:
+    """Only the grant facts the Oramasys ledger needs to validate and spend."""
+
+    grant_id: str
+    principal: str
+    run_id: str
+    hold_id: str
+    kind: Literal["settle", "release"]
+    units: int
+    units_basis: str
+    ledger_cost_basis: str
+    hold_fence_epoch: int
+    consumer_lease_epoch: int
+    ledger_store_id: str
+    issued_at: datetime
+    expires_at: datetime
+    payload_digest: str
+    verifier_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RevocationObservation:
+    """Durable revocation state with an observation timestamp."""
+
+    grant_id: str
+    revoked: bool
+    observed_at: datetime
+
+
+class IssuerSeedProvider(Protocol):
+    """Composition-owned source for private signing seeds."""
+
+    def load_seed(self, seed_ref: str) -> bytes:
+        """Return secret seed material for one opaque registry reference."""
 
 
 def _require_text(value: str, field_name: str) -> None:
@@ -54,8 +118,26 @@ def _require_digest(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a lower-case SHA-256 digest")
 
 
+def _require_safe_integer(value: object, field_name: str, *, minimum: int = 0) -> None:
+    """Enforce I-JSON's interoperable integer range without accepting bools."""
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= _MAX_SAFE_INTEGER:
+        raise ValueError(f"{field_name} must be an interoperable integer")
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject duplicate JSON keys before a signed payload is interpreted."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
 def _utc_datetime(value: datetime, field_name: str) -> datetime:
     """Require a timezone-aware UTC datetime and normalize its representation."""
+    if not isinstance(value, datetime):
+        raise ValueError(f"{field_name} must be a UTC-aware datetime")
     if value.tzinfo is None or value.utcoffset() != timedelta(0):
         raise ValueError(f"{field_name} must be UTC-aware")
     return value.astimezone(UTC)
@@ -74,6 +156,8 @@ def _b64encode(value: bytes) -> str:
 
 def _b64decode(value: str) -> bytes:
     """Decode strict unpadded base64url text."""
+    if not isinstance(value, str):
+        raise ValueError("issuer_signature is invalid")
     try:
         decoded = base64.urlsafe_b64decode(value.encode("ascii") + b"=" * (-len(value) % 4))
     except (UnicodeEncodeError, ValueError) as exc:
@@ -86,10 +170,8 @@ def _b64decode(value: str) -> bytes:
 def _canonical_bytes(body: dict[str, object]) -> bytes:
     """Serialize the fixed ASCII-keyed v1 body in its JCS-compatible subset.
 
-    The grant schema contains no floats or caller-defined object keys. Python's
-    compact UTF-8 JSON with lexicographic ASCII property ordering is therefore
-    equivalent to RFC 8785 for this fixed field set; construction rejects every
-    value outside that subset before this helper is reached.
+    This fixed schema contains only ASCII property names, strings, and safe
+    integers. Callers reject values outside that interoperable JCS subset.
     """
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
@@ -187,17 +269,17 @@ class AdjustmentGrantRequest:
             "revocation_ref",
         ):
             _require_text(getattr(self, field_name), field_name)
-        if self.kind not in _KINDS:
+        if not isinstance(self.kind, str) or self.kind not in _KINDS:
             raise ValueError("kind must be settle or release")
         if isinstance(self.units, bool) or not isinstance(self.units, int) or self.units <= 0:
             raise ValueError("units must be a positive integer")
-        if self.units_basis not in _UNIT_BASES:
+        _require_safe_integer(self.units, "units", minimum=1)
+        if not isinstance(self.units_basis, str) or self.units_basis not in _UNIT_BASES:
             raise ValueError("units_basis is invalid")
         _require_digest(self.evidence_digest, "evidence_digest")
         for field_name in ("hold_fence_epoch", "consumer_lease_epoch"):
             value = getattr(self, field_name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"{field_name} must be a non-negative integer")
+            _require_safe_integer(value, field_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,7 +309,7 @@ class AdjustmentGrant:
 
     def __post_init__(self) -> None:
         """Verify every structural invariant and the deterministic payload digest."""
-        if self.schema_version != _SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version != _SCHEMA_VERSION:
             raise ValueError("schema_version is unsupported")
         AdjustmentGrantRequest(
             principal=self.principal,
@@ -318,6 +400,77 @@ class AdjustmentGrant:
             issuer_key_id=self.issuer_key_id,
         )
 
+    def to_wire(self) -> bytes:
+        """Serialize the complete signed grant as canonical UTF-8 JSON."""
+        body = json.loads(self.canonical_body())
+        body["payload_digest"] = self.payload_digest
+        body["issuer_signature"] = self.issuer_signature
+        return _canonical_bytes(body)
+
+    @classmethod
+    def from_wire(cls, wire: bytes) -> AdjustmentGrant:
+        """Parse a canonical wire record, rejecting duplicates and extensions."""
+        if not isinstance(wire, bytes) or not wire or len(wire) > 65_536:
+            raise ValueError("grant wire is malformed")
+        try:
+            payload = json.loads(wire.decode("utf-8"), object_pairs_hook=_unique_object)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError("grant wire is malformed") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("grant wire is malformed")
+        expected_fields = {
+            "schema_version", "grant_id", "principal", "run_id", "hold_id", "kind", "units",
+            "units_basis", "ledger_cost_basis", "evidence_digest", "hold_fence_epoch",
+            "consumer_lease_epoch", "ledger_store_id", "issued_at", "expires_at", "issuer_key_id",
+            "issuer_ref", "revocation_ref", "payload_digest", "issuer_signature",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError("grant wire is malformed")
+        if type(payload["schema_version"]) is not int or payload["schema_version"] != _SCHEMA_VERSION:
+            raise NotImplementedError("grant schema is unsupported")
+        if _canonical_bytes(payload) != wire:
+            raise ValueError("grant wire is not canonical")
+        try:
+            request = AdjustmentGrantRequest(
+                principal=payload["principal"],
+                run_id=payload["run_id"],
+                hold_id=payload["hold_id"],
+                kind=payload["kind"],
+                units=payload["units"],
+                units_basis=payload["units_basis"],
+                ledger_cost_basis=payload["ledger_cost_basis"],
+                evidence_digest=payload["evidence_digest"],
+                hold_fence_epoch=payload["hold_fence_epoch"],
+                consumer_lease_epoch=payload["consumer_lease_epoch"],
+                ledger_store_id=payload["ledger_store_id"],
+                issuer_ref=payload["issuer_ref"],
+                revocation_ref=payload["revocation_ref"],
+            )
+            return cls.from_request(
+                request,
+                grant_id=payload["grant_id"],
+                issued_at=_parse_timestamp(payload["issued_at"], "issued_at"),
+                expires_at=_parse_timestamp(payload["expires_at"], "expires_at"),
+                issuer_key_id=payload["issuer_key_id"],
+                payload_digest=payload["payload_digest"],
+                issuer_signature=payload["issuer_signature"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("grant wire is malformed") from exc
+
+
+def _parse_timestamp(value: object, field_name: str) -> datetime:
+    """Parse only the ratified six-digit UTC timestamp spelling."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} is malformed")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} is malformed") from exc
+    if _timestamp(parsed, field_name) != value:
+        raise ValueError(f"{field_name} is malformed")
+    return parsed
+
 
 @dataclass(frozen=True, slots=True)
 class P5IssuanceAudit:
@@ -326,131 +479,130 @@ class P5IssuanceAudit:
     grant_id: str
     approval_id: str
     approval_token_digest: str
-    operator_evidence_ref: str
+    operator_evidence_digest: str
     approved_duration_seconds: int
     approved_at: datetime
 
 
-@dataclass(frozen=True, slots=True)
-class RevocationStatus:
-    """Issuer-owned revocation observation for a specific grant."""
-
-    grant_id: str
-    revoked: bool
-    observed_at: datetime
-
-
 @dataclass(slots=True)
 class _IssuerKey:
-    """Private in-memory signing material plus monotonic retirement metadata."""
+    """Active signing seed held only for the current process."""
 
     key_id: str
     seed: bytes
-    public_key: bytes
-    retired_at: datetime | None = None
-    retain_until: datetime | None = None
-    latest_live_expiry: datetime | None = None
+    seed_ref: str
 
 
 class RotatingIssuerKeyring:
-    """Minimal key lifecycle that never shortens a retired key's retention floor."""
+    """SQLite-backed public key registry with externally provisioned signing seeds."""
 
-    def __init__(self, *, key_id: str, seed: bytes) -> None:
-        """Create the initial active Ed25519ph signing generation from a seed."""
-        self._keys: dict[str, _IssuerKey] = {}
-        self._active_key_id = ""
-        self.rotate(key_id=key_id, seed=seed, now=datetime.now(UTC), initial=True)
+    def __init__(
+        self,
+        *,
+        key_id: str,
+        seed_ref: str,
+        seed_provider: IssuerSeedProvider,
+        store: SqliteGrantAuthorityStore,
+    ) -> None:
+        """Load a secret through the injected provider and initialize durable metadata."""
+        _require_text(key_id, "issuer_key_id")
+        _require_text(seed_ref, "seed_ref")
+        seed = seed_provider.load_seed(seed_ref)
+        if not isinstance(seed, bytes) or len(seed) != crypto_sign_SEEDBYTES:
+            raise ValueError("issuer signing seed has an invalid length")
+        self._store = store
+        self._seed_provider = seed_provider
+        public_key, _secret_key = crypto_sign_seed_keypair(seed)
+        active = store.active_key()
+        if active is None:
+            if store.keys():
+                raise ValueError("issuer key registry has no active key")
+            store.register_initial_key(
+                IssuerKeyRecord(key_id, public_key, seed_ref, "active", None, None, None)
+            )
+        else:
+            if active.key_id != key_id or active.public_key != public_key or active.seed_ref != seed_ref:
+                raise ValueError("provisioned issuer key does not match the durable active key")
+        self._active = _IssuerKey(key_id, seed, seed_ref)
+
+    @property
+    def store(self) -> SqliteGrantAuthorityStore:
+        """Expose the durable registry shared by issuance and verification."""
+        return self._store
 
     @property
     def active_key_id(self) -> str:
         """Return the only key eligible to issue new grants."""
-        return self._active_key_id
+        return self._active.key_id
 
     def active_public_key(self) -> bytes:
         """Return the public key corresponding to the active signing generation."""
-        return self._keys[self._active_key_id].public_key
+        record = self._store.key(self._active.key_id)
+        if record is None or record.status != "active":
+            raise ValueError("active issuer key is unavailable")
+        return record.public_key
 
-    def rotate(self, *, key_id: str, seed: bytes, now: datetime, initial: bool = False) -> None:
+    def rotate(self, *, key_id: str, seed_ref: str, now: datetime) -> None:
         """Retire the former generation and activate a new unique signing key."""
         _require_text(key_id, "issuer_key_id")
+        _require_text(seed_ref, "seed_ref")
         now = _utc_datetime(now, "rotation time")
-        if len(seed) != crypto_sign_SEEDBYTES:
+        seed = self._seed_provider.load_seed(seed_ref)
+        if not isinstance(seed, bytes) or len(seed) != crypto_sign_SEEDBYTES:
             raise ValueError("issuer signing seed has an invalid length")
-        if key_id in self._keys:
-            raise ValueError("issuer_key_id already exists")
-        if not initial:
-            prior = self._keys[self._active_key_id]
-            prior.retired_at = now
-            required_until = now + _RETIRED_KEY_FLOOR
-            if prior.latest_live_expiry is not None:
-                required_until = max(required_until, prior.latest_live_expiry + _RETIRED_KEY_SKEW)
-            prior.retain_until = max(prior.retain_until or required_until, required_until)
         public_key, _ = crypto_sign_seed_keypair(seed)
-        self._keys[key_id] = _IssuerKey(key_id=key_id, seed=seed, public_key=public_key)
-        self._active_key_id = key_id
+        self._store.rotate_key(
+            IssuerKeyRecord(key_id, public_key, seed_ref, "active", None, None, None),
+            now=now,
+        )
+        self._active = _IssuerKey(key_id, seed, seed_ref)
 
     def sign(self, body: bytes) -> tuple[str, str]:
         """Sign one canonical body with the current active Ed25519ph key."""
-        active = self._keys[self._active_key_id]
-        _public_key, signature = _sign(active.seed, body)
-        return active.key_id, _b64encode(signature)
+        _public_key, signature = _sign(self._active.seed, body)
+        return self._active.key_id, _b64encode(signature)
 
-    def verify(self, grant: AdjustmentGrant) -> bool:
+    def verify(self, grant: AdjustmentGrant, *, now: datetime) -> bool:
         """Verify a signed grant against its exact key id without trial verification."""
-        key = self._keys.get(grant.issuer_key_id)
-        if key is None:
+        key = self._store.key(grant.issuer_key_id)
+        if key is None or key.status == "revoked":
+            return False
+        if key.status == "retired" and key.retain_until is not None and now > key.retain_until:
             return False
         return _verify(key.public_key, grant.canonical_body(), _b64decode(grant.issuer_signature))
 
-    def record_issued(self, grant: AdjustmentGrant) -> None:
-        """Extend the issuing key's live-grant index without ever shortening retention."""
-        key = self._keys.get(grant.issuer_key_id)
-        if key is None:
-            raise ValueError("issuer_key_id is unknown")
-        key.latest_live_expiry = max(key.latest_live_expiry or grant.expires_at, grant.expires_at)
-        if key.retired_at is not None:
-            required_until = max(
-                key.retired_at + _RETIRED_KEY_FLOOR,
-                key.latest_live_expiry + _RETIRED_KEY_SKEW,
-            )
-            key.retain_until = max(key.retain_until or required_until, required_until)
-
     def prune(self, *, now: datetime) -> tuple[str, ...]:
-        """Remove only retired generations past their immutable retention and live expiry."""
-        now = _utc_datetime(now, "prune time")
-        removed: list[str] = []
-        for key_id, key in tuple(self._keys.items()):
-            if key_id == self._active_key_id or key.retain_until is None:
-                continue
-            if key.latest_live_expiry is not None and now <= key.latest_live_expiry:
-                continue
-            if now > key.retain_until:
-                del self._keys[key_id]
-                removed.append(key_id)
-        return tuple(removed)
+        """Prune expired durable grant references before eligible retired keys."""
+        return self._store.prune(now=_utc_datetime(now, "prune time"))
 
     def retention_for(self, key_id: str) -> datetime | None:
         """Expose retention metadata for operational qualification and tests."""
-        key = self._keys.get(key_id)
+        key = self._store.key(key_id)
         return None if key is None else key.retain_until
+
+    def revoke_key(self, key_id: str) -> None:
+        """Fail closed on a compromised retired key identifier."""
+        self._store.revoke_key(key_id)
 
 
 class PhylaxGrantAuthority:
-    """P5-backed issuer and verifier for immutable adjustment grants."""
+    """Durable P5-backed issuer and verifier for immutable adjustment grants."""
 
     def __init__(
         self,
         *,
         keyring: RotatingIssuerKeyring,
         p5_approval: P5ApprovalAuthority,
+        verifier_id: str = "phylax-primary",
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         """Compose only the trusted P5 authority and active issuer-key lifecycle."""
         self._keyring = keyring
         self._p5_approval = p5_approval
+        self._store = keyring.store
+        _require_text(verifier_id, "verifier_id")
+        self._verifier_id = verifier_id
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._revoked: set[str] = set()
-        self._issuance_audit: dict[str, P5IssuanceAudit] = {}
 
     def issue(
         self,
@@ -458,6 +610,7 @@ class PhylaxGrantAuthority:
         *,
         authenticated_principal: str,
         operator_evidence_ref: str,
+        approved_duration_seconds: int | None = None,
     ) -> AdjustmentGrant:
         """Mint one human-approved grant; duration is P5 output, never caller input."""
         _require_text(authenticated_principal, "authenticated_principal")
@@ -469,6 +622,7 @@ class PhylaxGrantAuthority:
         receipt = self._p5_approval.approve(
             preview.preview_id,
             operator_evidence_ref=operator_evidence_ref,
+            approved_duration_seconds=approved_duration_seconds,
         )
         approval = self._p5_approval.consume(receipt, approval_intent)
         issued_at = self._now()
@@ -494,35 +648,88 @@ class PhylaxGrantAuthority:
             payload_digest=payload_digest,
             issuer_signature=issuer_signature,
         )
-        self._keyring.record_issued(grant)
-        self._issuance_audit[grant_id] = self._audit(grant_id, receipt, approval)
+        self._store.record_issued(grant, self._audit(grant_id, receipt, approval))
         return grant
 
-    def verify(self, grant: AdjustmentGrant) -> None:
-        """Verify signature, revocation, future skew, and live expiry fail-closed."""
-        now = self._now()
-        if grant.issued_at > now + _FUTURE_ISSUANCE_SKEW:
-            raise ValueError("grant issued_at exceeds future skew tolerance")
-        if now >= grant.expires_at:
-            raise ValueError("grant is expired")
-        if grant.grant_id in self._revoked:
-            raise ValueError("grant is revoked")
-        if not self._keyring.verify(grant):
-            raise ValueError("grant issuer signature is invalid")
+    def verify(self, wire: bytes) -> VerifiedGrant:
+        """Verify durable issuance, signature, time and revocation before projection."""
+        try:
+            grant = AdjustmentGrant.from_wire(wire)
+            try:
+                now = self._now()
+            except (TypeError, ValueError) as exc:
+                raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
+            key = self._store.key(grant.issuer_key_id)
+            if key is None or key.status == "revoked":
+                raise GrantRefusal(GrantRefusalReason.GRANT_KEY_UNKNOWN)
+            if key.status == "retired" and key.retain_until is not None and now > key.retain_until:
+                raise GrantRefusal(GrantRefusalReason.GRANT_KEY_UNKNOWN)
+            if not self._keyring.verify(grant, now=now):
+                raise GrantRefusal(GrantRefusalReason.GRANT_SIGNATURE_INVALID)
+            if grant.issued_at > now + _FUTURE_ISSUANCE_SKEW:
+                raise GrantRefusal(GrantRefusalReason.GRANT_FUTURE_DATED)
+            if now >= grant.expires_at:
+                raise GrantRefusal(GrantRefusalReason.GRANT_EXPIRED)
+            if not self._store.is_issued(grant.grant_id, grant.payload_digest, wire):
+                raise GrantRefusal(GrantRefusalReason.GRANT_MALFORMED)
+            if self._store.is_revoked(grant.grant_id):
+                raise GrantRefusal(GrantRefusalReason.GRANT_REVOKED)
+            return VerifiedGrant(
+                grant_id=grant.grant_id,
+                principal=grant.principal,
+                run_id=grant.run_id,
+                hold_id=grant.hold_id,
+                kind=grant.kind,
+                units=grant.units,
+                units_basis=grant.units_basis,
+                ledger_cost_basis=grant.ledger_cost_basis,
+                hold_fence_epoch=grant.hold_fence_epoch,
+                consumer_lease_epoch=grant.consumer_lease_epoch,
+                ledger_store_id=grant.ledger_store_id,
+                issued_at=grant.issued_at,
+                expires_at=grant.expires_at,
+                payload_digest=grant.payload_digest,
+                verifier_id=self._verifier_id,
+            )
+        except GrantRefusal:
+            raise
+        except NotImplementedError as exc:
+            raise GrantRefusal(GrantRefusalReason.GRANT_SCHEMA_UNSUPPORTED) from exc
+        except (sqlite3.Error, OSError) as exc:
+            raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise GrantRefusal(GrantRefusalReason.GRANT_MALFORMED) from exc
 
     def revoke(self, grant_id: str) -> None:
-        """Mark a server-issued grant revoked; consumers obtain this through Telos later."""
+        """Durably revoke a grant; a restart cannot make it valid again."""
         _require_text(grant_id, "grant_id")
-        self._revoked.add(grant_id)
+        self._store.revoke(grant_id, revoked_at=self._now())
 
-    def revocation_status(self, grant_id: str) -> RevocationStatus:
-        """Return a timestamped local revocation observation for the grant id."""
+    def revoke_key(self, key_id: str) -> None:
+        """Disable a retired key; rotate the active key before revoking it."""
+        _require_text(key_id, "issuer_key_id")
+        self._store.revoke_key(key_id)
+
+    def revocation(self, grant_id: str) -> RevocationObservation:
+        """Return a durable, timestamped revocation observation for transport."""
         _require_text(grant_id, "grant_id")
-        return RevocationStatus(grant_id, grant_id in self._revoked, self._now())
+        try:
+            return RevocationObservation(grant_id, self._store.is_revoked(grant_id), self._now())
+        except (sqlite3.Error, OSError) as exc:
+            raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
+
+    def revocation_status(self, grant_id: str) -> RevocationObservation:
+        """Compatibility spelling for the issuer-side transport operation."""
+        return self.revocation(grant_id)
+
+    def verifier_adapter(self) -> PhylaxAdjustmentGrantVerifier:
+        """Return the narrow verify/revocation surface for composition wiring."""
+        return PhylaxAdjustmentGrantVerifier(self)
 
     def issuance_audit(self, grant_id: str) -> P5IssuanceAudit | None:
         """Return the opaque P5 issuance evidence without exposing raw receipt tokens."""
-        return self._issuance_audit.get(grant_id)
+        record = self._store.issuance_audit(grant_id)
+        return None if record is None else P5IssuanceAudit(**record)
 
     def _approval_intent(self, request: AdjustmentGrantRequest, grant_id: str) -> P5ApprovalIntent:
         """Bind P5 approval to the exact server-minted grant target tuple."""
@@ -550,6 +757,7 @@ class PhylaxGrantAuthority:
                     }
                 ],
             },
+            action=_GRANT_ACTION,
         )
 
     def _audit(
@@ -563,7 +771,9 @@ class PhylaxGrantAuthority:
             grant_id=grant_id,
             approval_id=receipt.preview_id,
             approval_token_digest=hashlib.sha256(receipt.approval_token.encode("utf-8")).hexdigest(),
-            operator_evidence_ref=approval.operator_evidence_ref,
+            operator_evidence_digest=hashlib.sha256(
+                approval.operator_evidence_ref.encode("utf-8")
+            ).hexdigest(),
             approved_duration_seconds=approval.approved_duration_seconds,
             approved_at=approval.approved_at,
         )
@@ -571,3 +781,19 @@ class PhylaxGrantAuthority:
     def _now(self) -> datetime:
         """Return the injected authority clock normalized to UTC."""
         return _utc_datetime(self._clock(), "authority clock")
+
+
+class PhylaxAdjustmentGrantVerifier:
+    """Structural adapter exposing no signing or grant-management operations."""
+
+    def __init__(self, authority: PhylaxGrantAuthority) -> None:
+        """Bind verification to the durable Phylax authority instance."""
+        self._authority = authority
+
+    def verify(self, wire: bytes) -> VerifiedGrant:
+        """Return the minimal verified projection for the consumer port."""
+        return self._authority.verify(wire)
+
+    def revocation(self, grant_id: str) -> RevocationObservation:
+        """Return durable revocation state with its observation time."""
+        return self._authority.revocation(grant_id)

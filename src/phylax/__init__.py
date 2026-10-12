@@ -3,16 +3,23 @@
 from .adjustment_grant import (
     AdjustmentGrant,
     AdjustmentGrantRequest,
+    GrantRefusal,
+    GrantRefusalReason,
+    IssuerSeedProvider,
+    PhylaxAdjustmentGrantVerifier,
     P5IssuanceAudit,
     PhylaxGrantAuthority,
-    RevocationStatus,
+    RevocationObservation,
     RotatingIssuerKeyring,
+    VerifiedGrant,
 )
+from .grant_store import IssuerKeyRecord, SqliteGrantAuthorityStore
 from .redaction import redact_details
 from .authorizer import PhylaxAuthorizer
 from .contracts import (
     ArtifactRef,
     AdjustmentGrantPort,
+    AdjustmentGrantVerifier,
     CompileDecision,
     CompileRequest,
     EVIDENCE_CLASSES,
@@ -37,6 +44,7 @@ from .p5_approval import (
 __all__ = [
     "AdjustmentGrant",
     "AdjustmentGrantPort",
+    "AdjustmentGrantVerifier",
     "AdjustmentGrantRequest",
     "ArtifactRef",
     "CompileDecision",
@@ -55,11 +63,18 @@ __all__ = [
     "redact_details",
     "PhylaxAuthorizer",
     "PhylaxGrantAuthority",
+    "PhylaxAdjustmentGrantVerifier",
+    "GrantRefusal",
+    "GrantRefusalReason",
+    "IssuerSeedProvider",
+    "IssuerKeyRecord",
     "PhylaxPort",
     "PrincipalVerifier",
     "RuntimeAdmissionDecision",
     "RuntimeAdmissionRequest",
     "P5IssuanceAudit",
-    "RevocationStatus",
+    "RevocationObservation",
     "RotatingIssuerKeyring",
+    "SqliteGrantAuthorityStore",
+    "VerifiedGrant",
 ]

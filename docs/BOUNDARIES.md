@@ -35,6 +35,14 @@ remaining balance, consume a grant, settle, or release a hold. Those are
 Oramasys ledger transactions; remote consumer access uses Telos rather than an
 ad hoc client.
 
+The issuer keeps durable public-key metadata, issued wire records, revocations,
+and digest-only issuance audits in `SqliteGrantAuthorityStore`. Signing seeds
+come from an injected protected secret source and never enter the database.
+Oramasys receives a verifier by injection and sees only `VerifiedGrant` facts;
+its composition defaults to deny-all. The 900-second autonomous duration is
+reserved for a separately authenticated P5 policy path, which is not yet
+implemented; the current grant issuer is P5 human-gated only.
+
 ## Explicit endpoint exclusion
 
 The following are **not Phylax responsibilities** and must not be reimplemented here:
