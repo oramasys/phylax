@@ -82,6 +82,25 @@ def test_p5_rejects_payload_drift_even_with_a_valid_token() -> None:
         )
 
 
+def test_p5_binds_protected_action_separately_from_the_preview() -> None:
+    """The default swarm action remains stable and grant actions cannot cross-use receipts."""
+    policy = authority()
+    grant_action = P5ApprovalIntent.from_preview(
+        "control-plane",
+        intent().preview_payload(),
+        action="phylax.adjustment_grant.issue",
+    )
+    assert intent().claims()["action"] == "swarm.launch"
+    assert grant_action.claims()["action"] == "phylax.adjustment_grant.issue"
+    receipt = policy.approve(
+        policy.issue_preview(intent()).preview_id,
+        operator_evidence_ref="audit://operator/decision-1",
+    )
+
+    with pytest.raises(ValueError, match="intent mismatch"):
+        policy.consume(receipt, grant_action)
+
+
 def test_p5_rejects_tampered_token_without_consuming_the_valid_receipt() -> None:
     """Bad MAC text fails closed and leaves the valid receipt usable."""
     policy = authority()
@@ -187,6 +206,22 @@ def test_sqlite_store_survives_reopen_and_rejects_replay(tmp_path: Path) -> None
     )
     with pytest.raises(ValueError, match="already consumed"):
         after_consume.consume(receipt, intent())
+
+
+def test_sqlite_store_preserves_non_default_action_across_reopen(tmp_path: Path) -> None:
+    """A persisted grant-specific P5 action survives reload and receipt consumption."""
+    database = tmp_path / "p5-action.db"
+    grant_intent = P5ApprovalIntent.from_preview(
+        "control-plane",
+        intent().preview_payload(),
+        action="phylax.adjustment_grant.issue",
+    )
+    first = P5ApprovalAuthority(signing_key=b"test-p5-secret", store=SqliteP5ApprovalStore(str(database)))
+    preview = first.issue_preview(grant_intent)
+    receipt = first.approve(preview.preview_id, operator_evidence_ref="audit://operator/decision-1")
+    reloaded = P5ApprovalAuthority(signing_key=b"test-p5-secret", store=SqliteP5ApprovalStore(str(database)))
+
+    assert reloaded.consume(receipt, grant_intent).intent.action == "phylax.adjustment_grant.issue"
 
 
 def test_sqlite_store_allows_exactly_one_concurrent_consumer(tmp_path: Path) -> None:

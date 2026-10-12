@@ -61,15 +61,18 @@ def _b64decode(value: str) -> bytes:
 
 @dataclass(frozen=True, slots=True)
 class P5ApprovalIntent:
-    """Immutable swarm-launch preview that needs a fresh operator decision."""
+    """Immutable protected-action preview that needs a fresh operator decision."""
 
     operator_principal: str
     canonical_preview_json: str
+    action: str = "swarm.launch"
 
     def __post_init__(self) -> None:
         """Reject empty or malformed intent fields before approval is possible."""
         if not self.operator_principal.strip():
             raise ValueError("operator_principal is required")
+        if not isinstance(self.action, str) or not self.action.strip():
+            raise ValueError("action is required")
         try:
             preview = json.loads(self.canonical_preview_json)
         except (TypeError, ValueError) as exc:
@@ -83,9 +86,15 @@ class P5ApprovalIntent:
             raise ValueError("swarm preview assignments must be a list")
 
     @classmethod
-    def from_preview(cls, operator_principal: str, preview: dict[str, object]) -> P5ApprovalIntent:
-        """Freeze a caller preview into the only accepted canonical representation."""
-        return cls(operator_principal, _canonical_bytes(preview).decode("utf-8"))
+    def from_preview(
+        cls,
+        operator_principal: str,
+        preview: dict[str, object],
+        *,
+        action: str = "swarm.launch",
+    ) -> P5ApprovalIntent:
+        """Freeze a caller preview and protected action into canonical intent."""
+        return cls(operator_principal, _canonical_bytes(preview).decode("utf-8"), action)
 
     def preview_digest(self) -> str:
         """Return the digest of every dispatch-relevant swarm preview field."""
@@ -98,7 +107,7 @@ class P5ApprovalIntent:
     def claims(self) -> dict[str, str | int]:
         """Return signed envelope claims without exposing the stored preview."""
         return {
-            "action": "swarm.launch",
+            "action": self.action,
             "operator_principal": self.operator_principal,
             "preview_digest": self.preview_digest(),
             "version": 1,
@@ -299,6 +308,7 @@ class SqliteP5ApprovalStore:
             {
                 "operator_principal": preview.intent.operator_principal,
                 "canonical_preview_json": preview.intent.canonical_preview_json,
+                "action": preview.intent.action,
             }
         ).decode("utf-8")
         try:
@@ -427,6 +437,7 @@ class SqliteP5ApprovalStore:
             intent = P5ApprovalIntent(
                 operator_principal=intent_data["operator_principal"],
                 canonical_preview_json=intent_data["canonical_preview_json"],
+                action=intent_data.get("action", "swarm.launch"),
             )
             preview = P5ApprovalPreview(
                 preview_id=str(row[0]),
