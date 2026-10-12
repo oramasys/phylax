@@ -247,3 +247,109 @@ def test_sqlite_expired_receipt_is_not_consumed(tmp_path: Path) -> None:
     stored = store.get(receipt.preview_id)
     assert stored is not None
     assert not stored.consumed
+
+
+class SequenceClock:
+    """Return scripted instants, then repeat the last one, to model time passing under a lock."""
+
+    def __init__(self, *instants: datetime) -> None:
+        """Store the scripted instants."""
+        self._instants = list(instants)
+
+    def __call__(self) -> datetime:
+        """Return the next scripted instant."""
+        return self._instants.pop(0) if len(self._instants) > 1 else self._instants[0]
+
+
+@pytest.fixture(params=["memory", "sqlite"])
+def store_factory(request, tmp_path: Path):
+    """Build either P5 store flavour so lock-time behaviour is proven on both."""
+    if request.param == "memory":
+        return lambda: InMemoryP5ApprovalStore()
+    return lambda: SqliteP5ApprovalStore(str(tmp_path / "p5-param.db"))
+
+
+def test_p5_ceiling_cannot_be_raised_above_the_hard_limit() -> None:
+    """Callers may lower the issuance ceiling but never raise it past 9,900 seconds."""
+    with pytest.raises(ValueError, match="must not exceed 9900"):
+        P5ApprovalAuthority(
+            signing_key=b"test-p5-secret",
+            store=InMemoryP5ApprovalStore(),
+            max_issuance_duration_seconds=20_000,
+        )
+    lowered = P5ApprovalAuthority(
+        signing_key=b"test-p5-secret",
+        store=InMemoryP5ApprovalStore(),
+        default_human_duration_seconds=600,
+        max_issuance_duration_seconds=900,
+    )
+    preview = lowered.issue_preview(intent())
+    with pytest.raises(ValueError, match="fresh P5 HITL approval"):
+        lowered.approve(preview.preview_id, operator_evidence_ref="audit://op/1", approved_duration_seconds=901)
+
+
+@pytest.mark.parametrize("bad", [5.5, True, 0, -1])
+def test_p5_durations_must_be_positive_integers(bad: object) -> None:
+    """Fractional, boolean, and non-positive durations never reach a signed token."""
+    policy = authority()
+    preview = policy.issue_preview(intent())
+    with pytest.raises(ValueError, match="positive integer"):
+        policy.approve(preview.preview_id, operator_evidence_ref="audit://op/1", approved_duration_seconds=bad)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="positive integer"):
+        P5ApprovalAuthority(
+            signing_key=b"test-p5-secret", store=InMemoryP5ApprovalStore(), default_human_duration_seconds=bad  # type: ignore[arg-type]
+        )
+
+
+def test_p5_approve_rechecks_expiry_after_the_store_lock(store_factory) -> None:
+    """A preview that expires while waiting for the store lock cannot yield a receipt."""
+    start = datetime(2026, 10, 12, tzinfo=UTC)
+    clock = SequenceClock(start, start, start, start + timedelta(minutes=10))
+    policy = P5ApprovalAuthority(signing_key=b"test-p5-secret", store=store_factory(), clock=clock)
+    preview = policy.issue_preview(intent())
+
+    with pytest.raises(ValueError, match="P5 preview expired"):
+        policy.approve(preview.preview_id, operator_evidence_ref="audit://op/1")
+
+
+def test_p5_consume_reads_the_clock_after_the_store_lock(store_factory) -> None:
+    """Expiry that lands while consume waits for the lock is enforced, not skipped."""
+    start = datetime(2026, 10, 12, tzinfo=UTC)
+    clock = Clock()
+    policy = P5ApprovalAuthority(signing_key=b"test-p5-secret", store=store_factory(), clock=clock)
+    receipt = approved(policy)
+    clock.now = start + timedelta(minutes=5)
+
+    with pytest.raises(ValueError, match="P5 approval expired"):
+        policy.consume(receipt, intent())
+
+
+def test_sqlite_store_rejects_in_memory_database() -> None:
+    """:memory: would silently lose the table between connections, so it is refused."""
+    with pytest.raises(ValueError, match="durable file path"):
+        SqliteP5ApprovalStore(":memory:")
+
+
+def test_p5_purge_removes_only_records_expired_beyond_retention(store_factory) -> None:
+    """Thirty-day retention drops stale previews and keeps recent ones intact."""
+    clock = Clock()
+    policy = P5ApprovalAuthority(signing_key=b"test-p5-secret", store=store_factory(), clock=clock)
+    old = approved(policy)
+    clock.now += timedelta(days=29)
+    recent = policy.issue_preview(
+        P5ApprovalIntent.from_preview("control-plane", {**intent().preview_payload(), "objective": "later"})
+    )
+    assert policy.purge_expired() == 0
+
+    clock.now += timedelta(days=2)
+    assert policy.purge_expired() == 1
+    with pytest.raises(ValueError, match="unknown, invalid, or already consumed"):
+        policy.consume(old, intent())
+    assert policy.purge_expired() == 0
+    assert recent.preview_id
+
+
+def test_p5_purge_rejects_negative_retention() -> None:
+    """A negative retention would delete live previews and is refused."""
+    with pytest.raises(ValueError, match="must not be negative"):
+        authority().purge_expired(retention=timedelta(seconds=-1))

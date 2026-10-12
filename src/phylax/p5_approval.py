@@ -24,6 +24,7 @@ _DOMAIN = b"phylax-p5-swarm-approval-v1\x00"
 _DEFAULT_PREVIEW_TTL = timedelta(minutes=5)
 _DEFAULT_HUMAN_DURATION_SECONDS = 5_400
 _MAX_ISSUANCE_DURATION_SECONDS = 9_900
+_DEFAULT_PREVIEW_RETENTION = timedelta(days=30)
 
 
 def _utc_timestamp(value: datetime) -> int:
@@ -31,6 +32,13 @@ def _utc_timestamp(value: datetime) -> int:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("P5 clock must return an aware UTC datetime")
     return int(value.astimezone(UTC).timestamp())
+
+
+def _require_positive_int(value: object, name: str) -> int:
+    """Return value when it is a positive integer; booleans and floats are rejected."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 def _canonical_bytes(payload: dict[str, object]) -> bytes:
@@ -145,13 +153,24 @@ class P5ApprovalStore(Protocol):
     def get(self, preview_id: str) -> _StoredPreview | None:
         """Return current state for a preview without mutating it."""
 
-    def approve(self, preview_id: str, receipt: P5ApprovalReceipt, operator_evidence_ref: str, approved_at: datetime) -> bool:
-        """Persist the first approval for preview_id and return whether it won."""
+    def approve(
+        self,
+        preview_id: str,
+        receipt: P5ApprovalReceipt,
+        operator_evidence_ref: str,
+        approved_at: datetime,
+        *,
+        clock: Callable[[], datetime],
+    ) -> bool:
+        """Persist the first approval for an unexpired preview; clock is read under the store lock."""
 
     def consume(
-        self, preview_id: str, approval_token: str, *, now: datetime
+        self, preview_id: str, approval_token: str, *, clock: Callable[[], datetime]
     ) -> _StoredPreview | None:
-        """Atomically consume an unexpired approved preview only when its token matches."""
+        """Atomically consume an unexpired approved preview; clock is read under the store lock."""
+
+    def purge_expired(self, *, expired_before: datetime) -> int:
+        """Delete records whose preview expired before the cutoff and return the count."""
 
 
 class InMemoryP5ApprovalStore:
@@ -174,12 +193,22 @@ class InMemoryP5ApprovalStore:
         with self._lock:
             return self._records.get(preview_id)
 
-    def approve(self, preview_id: str, receipt: P5ApprovalReceipt, operator_evidence_ref: str, approved_at: datetime) -> bool:
+    def approve(
+        self,
+        preview_id: str,
+        receipt: P5ApprovalReceipt,
+        operator_evidence_ref: str,
+        approved_at: datetime,
+        *,
+        clock: Callable[[], datetime],
+    ) -> bool:
         """Persist an approval exactly once unless it was already consumed."""
         with self._lock:
             current = self._records.get(preview_id)
             if current is None or current.approval_token_digest is not None or current.consumed:
                 return False
+            if _utc_timestamp(clock()) >= _utc_timestamp(current.preview.expires_at):
+                raise ValueError("P5 preview expired")
             self._records[preview_id] = _StoredPreview(
                 preview=current.preview,
                 approval_token_digest=_token_digest(receipt.approval_token),
@@ -190,14 +219,14 @@ class InMemoryP5ApprovalStore:
             return True
 
     def consume(
-        self, preview_id: str, approval_token: str, *, now: datetime
+        self, preview_id: str, approval_token: str, *, clock: Callable[[], datetime]
     ) -> _StoredPreview | None:
         """Atomically consume a matching approved preview and return its old state."""
         with self._lock:
             current = self._records.get(preview_id)
             if current is None or current.approval_token_digest is None or current.consumed:
                 return None
-            if _utc_timestamp(now) >= _utc_timestamp(current.preview.expires_at):
+            if _utc_timestamp(clock()) >= _utc_timestamp(current.preview.expires_at):
                 raise ValueError("P5 approval expired")
             if not hmac.compare_digest(current.approval_token_digest, _token_digest(approval_token)):
                 return None
@@ -212,6 +241,20 @@ class InMemoryP5ApprovalStore:
             return current
 
 
+    def purge_expired(self, *, expired_before: datetime) -> int:
+        """Delete records whose preview expired before the cutoff."""
+        cutoff = _utc_timestamp(expired_before)
+        with self._lock:
+            stale = [
+                preview_id
+                for preview_id, record in self._records.items()
+                if _utc_timestamp(record.preview.expires_at) < cutoff
+            ]
+            for preview_id in stale:
+                del self._records[preview_id]
+            return len(stale)
+
+
 def _token_digest(approval_token: str) -> str:
     """Return a non-reversible lookup value for persisted receipt tokens."""
     return hashlib.sha256(approval_token.encode("utf-8")).hexdigest()
@@ -224,6 +267,8 @@ class SqliteP5ApprovalStore:
         """Open or initialise a local SQLite store at the supplied path."""
         if not path.strip():
             raise ValueError("P5 SQLite path is required")
+        if path.strip() == ":memory:":
+            raise ValueError("P5 SQLite store requires a durable file path; use InMemoryP5ApprovalStore")
         if timeout <= 0:
             raise ValueError("P5 SQLite timeout must be positive")
         self._path = path
@@ -278,10 +323,29 @@ class SqliteP5ApprovalStore:
             raise ValueError("P5 store busy or locked") from exc
         return self._from_row(row) if row is not None else None
 
-    def approve(self, preview_id: str, receipt: P5ApprovalReceipt, operator_evidence_ref: str, approved_at: datetime) -> bool:
-        """Compare-and-swap pending state into approved state exactly once."""
+    def approve(
+        self,
+        preview_id: str,
+        receipt: P5ApprovalReceipt,
+        operator_evidence_ref: str,
+        approved_at: datetime,
+        *,
+        clock: Callable[[], datetime],
+    ) -> bool:
+        """Compare-and-swap pending state into approved state exactly once, unexpired."""
         try:
             with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT expires_at FROM p5_approvals WHERE preview_id = ? AND state = 'pending'",
+                    (preview_id,),
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    return False
+                if _utc_timestamp(clock()) >= int(row[0]):
+                    connection.rollback()
+                    raise ValueError("P5 preview expired")
                 cursor = connection.execute(
                     """
                     UPDATE p5_approvals
@@ -297,12 +361,13 @@ class SqliteP5ApprovalStore:
                         preview_id,
                     ),
                 )
+                connection.commit()
         except sqlite3.OperationalError as exc:
             raise ValueError("P5 store busy or locked") from exc
         return cursor.rowcount == 1
 
     def consume(
-        self, preview_id: str, approval_token: str, *, now: datetime
+        self, preview_id: str, approval_token: str, *, clock: Callable[[], datetime]
     ) -> _StoredPreview | None:
         """Atomically consume a matching approved record and return its old state."""
         try:
@@ -314,7 +379,7 @@ class SqliteP5ApprovalStore:
                 if row is None or row[3] != "approved" or not isinstance(row[4], str):
                     connection.rollback()
                     return None
-                if _utc_timestamp(now) >= int(row[2]):
+                if _utc_timestamp(clock()) >= int(row[2]):
                     connection.rollback()
                     raise ValueError("P5 approval expired")
                 if not hmac.compare_digest(row[4], _token_digest(approval_token)):
@@ -332,6 +397,18 @@ class SqliteP5ApprovalStore:
         except sqlite3.OperationalError as exc:
             raise ValueError("P5 store busy or locked") from exc
         return stored
+
+    def purge_expired(self, *, expired_before: datetime) -> int:
+        """Delete records whose preview expired before the cutoff and return the count."""
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(
+                    "DELETE FROM p5_approvals WHERE expires_at < ?",
+                    (_utc_timestamp(expired_before),),
+                )
+        except sqlite3.OperationalError as exc:
+            raise ValueError("P5 store busy or locked") from exc
+        return cursor.rowcount
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -377,7 +454,11 @@ class P5ApprovalAuthority:
             raise ValueError("P5 signing_key is required")
         if preview_ttl <= timedelta(0):
             raise ValueError("P5 preview_ttl must be positive")
-        if not 0 < default_human_duration_seconds <= max_issuance_duration_seconds:
+        _require_positive_int(max_issuance_duration_seconds, "P5 issuance ceiling")
+        _require_positive_int(default_human_duration_seconds, "P5 default duration")
+        if max_issuance_duration_seconds > _MAX_ISSUANCE_DURATION_SECONDS:
+            raise ValueError("P5 issuance ceiling must not exceed 9900 seconds; callers may lower it, never raise it")
+        if default_human_duration_seconds > max_issuance_duration_seconds:
             raise ValueError("P5 default duration must be within the issuance ceiling")
         self._signing_key = signing_key
         self._store = store
@@ -398,8 +479,12 @@ class P5ApprovalAuthority:
         if not operator_evidence_ref.strip():
             raise ValueError("operator_evidence_ref is required")
         duration = self._default_duration if approved_duration_seconds is None else approved_duration_seconds
-        if not 0 < duration <= self._max_duration:
-            raise ValueError("approved_duration_seconds exceeds the P5 issuance ceiling")
+        _require_positive_int(duration, "approved_duration_seconds")
+        if duration > self._max_duration:
+            raise ValueError(
+                "approved_duration_seconds exceeds the P5 issuance ceiling; "
+                "a longer-lived decision requires a fresh P5 HITL approval"
+            )
         stored = self._require_live_preview(preview_id)
         now = self._now()
         payload = {
@@ -413,7 +498,9 @@ class P5ApprovalAuthority:
         body = _canonical_bytes(payload)
         token = f"{_b64encode(body)}.{_b64encode(hmac.new(self._signing_key, _DOMAIN + body, hashlib.sha256).digest())}"
         receipt = P5ApprovalReceipt(token, stored.preview.preview_id, stored.preview.expires_at, duration)
-        if not self._store.approve(stored.preview.preview_id, receipt, operator_evidence_ref, now):
+        if not self._store.approve(
+            stored.preview.preview_id, receipt, operator_evidence_ref, now, clock=self._now
+        ):
             raise ValueError("P5 preview is already approved or consumed")
         return receipt
 
@@ -422,11 +509,21 @@ class P5ApprovalAuthority:
         payload = self._verified_payload(receipt)
         self._validate_claims(payload, receipt, intent)
         stored = self._store.consume(
-            receipt.preview_id, receipt.approval_token, now=self._now()
+            receipt.preview_id, receipt.approval_token, clock=self._now
         )
         if stored is None or stored.operator_evidence_ref is None or stored.approved_at is None:
             raise ValueError("P5 approval is unknown, invalid, or already consumed")
         return P5ApprovalDecision(intent, stored.operator_evidence_ref, receipt.approved_duration_seconds, stored.approved_at)
+
+    def purge_expired(self, *, retention: timedelta = _DEFAULT_PREVIEW_RETENTION) -> int:
+        """Delete previews that expired more than retention ago; callers schedule this.
+
+        An expired preview can never authorize anything, so dropping it cannot
+        weaken replay protection; retention only preserves a diagnostic window.
+        """
+        if retention < timedelta(0):
+            raise ValueError("P5 retention must not be negative")
+        return self._store.purge_expired(expired_before=self._now() - retention)
 
     def _now(self) -> datetime:
         """Return injected time normalized to UTC."""
