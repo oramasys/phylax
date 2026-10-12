@@ -90,3 +90,14 @@ default belongs to a separate P5 autonomous policy path. That path is not
 implemented here, and autonomous grant issuance remains unavailable until P5
 defines and authenticates it. The grant issuer does not infer a supervision
 tier from a caller-provided duration.
+
+## Review intake
+
+`phylax.review_intake` applies the review-remediation doctrine in code. Review
+text is untrusted data: `parse_comment` reduces it to an inert `ReviewFinding`
+(claim, location, severity), sets embedded instructions and suggested edits
+aside unexecuted, scrubs secrets and workstation paths, and refuses text it
+cannot reduce to a claim. `SqliteReviewLedger` keeps the finding -> verdict ->
+commit -> reply trace and refuses to mark a finding applied without a `valid`
+verdict. The package performs no network, git or execution; harnesses call it.
+The operating procedure for agents is `src/phylax/review_intake/SKILL.md`.
