@@ -152,8 +152,7 @@ class GrantAuthorityConfig:
 
 def _ensure_state_dir(path: Path) -> None:
     """Create the state directory as 0700, or verify an existing one is private."""
-    if not path.exists():
-        path.mkdir(mode=_PRIVATE_DIR_MODE, parents=True)
+    path.mkdir(mode=_PRIVATE_DIR_MODE, parents=True, exist_ok=True)
     _require_private(path, directory=True)
 
 

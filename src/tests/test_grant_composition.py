@@ -159,6 +159,20 @@ def test_a_seed_that_does_not_match_the_durable_key_refuses_to_start(tmp_path: P
         open_grant_authority(config(tmp_path, seeds))
 
 
+def test_a_state_directory_created_by_a_concurrent_worker_is_accepted(
+    tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Losing the creation race to another worker is not a startup failure."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    real_exists = Path.exists
+    monkeypatch.setattr(
+        Path, "exists", lambda self: False if self == state else real_exists(self)
+    )
+    authority = open_grant_authority(config(tmp_path, seeds))
+    assert authority.verifier_adapter() is not None
+
+
 def test_a_loose_state_directory_is_refused(tmp_path: Path, seeds: Path) -> None:
     """Durable state in a shared directory is not accepted."""
     state = tmp_path / "state"
