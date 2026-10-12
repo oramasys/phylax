@@ -32,6 +32,7 @@ from .p5_approval import P5ApprovalAuthority, SqliteP5ApprovalStore
 _REF_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _PRIVATE_DIR_MODE: Final = 0o700
 _MAX_SEED_FILE_BYTES: Final = 128
+_SEED_HEX_RE: Final = re.compile(rb"[0-9A-Fa-f]{%d}" % (crypto_sign_SEEDBYTES * 2))
 
 
 class CompositionError(ValueError):
@@ -115,14 +116,13 @@ class FileSeedProvider:
                     raw = stream.read(_MAX_SEED_FILE_BYTES + 1)
         if len(raw) > _MAX_SEED_FILE_BYTES:
             raise CompositionError(f"{seed_ref} exceeds the seed file size limit")
-        try:
-            text = raw.decode("ascii").strip()
-            seed = bytes.fromhex(text)
-        except ValueError as exc:
-            raise CompositionError(f"{seed_ref} must contain hex") from exc
-        if len(seed) != crypto_sign_SEEDBYTES:
+        text = raw.strip()
+        if _SEED_HEX_RE.fullmatch(text) is None:
+            # Strict: no inner whitespace, prefixes or odd lengths are tolerated.
+            if re.fullmatch(rb"[0-9A-Fa-f]*", text) is None:
+                raise CompositionError(f"{seed_ref} must contain hex")
             raise CompositionError(f"{seed_ref} must hold exactly {crypto_sign_SEEDBYTES} bytes")
-        return seed
+        return bytes.fromhex(text.decode("ascii"))
 
 
 @dataclass(frozen=True, slots=True)

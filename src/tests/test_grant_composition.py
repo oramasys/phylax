@@ -75,6 +75,9 @@ def test_a_private_hex_seed_is_loaded(seeds: Path) -> None:
         ("loose", SEED_HEX, 0o644, "group or others"),
         ("short", "11" * 16, 0o600, "exactly 32"),
         ("notahex", "zz" * 32, 0o600, "hex"),
+        ("spaced", " ".join(["11"] * 32), 0o600, "hex"),
+        ("prefixed", "0x" + "11" * 31, 0o600, "hex"),
+        ("oddlength", "1" * 63, 0o600, "exactly 32"),
     ],
 )
 def test_unsafe_seed_files_are_refused(seeds: Path, name: str, content: str, mode: int, match: str) -> None:
@@ -204,6 +207,7 @@ def test_seed_read_uses_the_file_that_was_validated(
     swapped = False
 
     def replace_after_check(path: Path, **kwargs: object) -> os.stat_result:
+        """Run the real check, then swap the seed for a symlink, once, as an attacker would."""
         nonlocal swapped
         result = original(path, **kwargs)
         if path.name == "issuer-1" and not swapped:
