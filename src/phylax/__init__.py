@@ -13,6 +13,12 @@ from .adjustment_grant import (
     RotatingIssuerKeyring,
     VerifiedGrant,
 )
+from .grant_composition import (
+    CompositionError,
+    FileSeedProvider,
+    GrantAuthorityConfig,
+    open_grant_authority,
+)
 from .grant_store import IssuerKeyRecord, SqliteGrantAuthorityStore
 from .redaction import redact_details
 from .authorizer import PhylaxAuthorizer
@@ -42,6 +48,10 @@ from .p5_approval import (
 )
 
 __all__ = [
+    "CompositionError",
+    "FileSeedProvider",
+    "GrantAuthorityConfig",
+    "open_grant_authority",
     "AdjustmentGrant",
     "AdjustmentGrantPort",
     "AdjustmentGrantVerifier",
