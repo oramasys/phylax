@@ -47,3 +47,15 @@ proves a human acted. Production composition must provide a trusted interaction
 boundary and use the standard-library `SqliteP5ApprovalStore` or a compatible
 durable `P5ApprovalStore`; the in-memory store is a test reference only. P5
 does not issue or verify adjustment grants, and it has no legacy approval bypass.
+
+Policy bounds and retention:
+
+- The issuance ceiling is a hard 9,900 seconds. Callers may configure a lower
+  ceiling, never a higher one. A longer-lived decision is only possible through
+  a fresh P5 HITL approval; the authority never extends or re-signs in place.
+- Expiry is evaluated under the store lock (`approve` and `consume`), so a
+  request that waited on the lock past expiry is refused.
+- Previews are retained after expiry only as a diagnostic window. Callers
+  schedule `P5ApprovalAuthority.purge_expired()`, which drops records that
+  expired more than 30 days ago by default; an expired record can never
+  authorize, so purging does not weaken replay protection.
