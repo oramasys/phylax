@@ -243,9 +243,12 @@ class SqliteGrantAuthorityStore:
             key = connection.execute(
                 "SELECT status FROM issuer_keys WHERE key_id = ?", (key_id,)
             ).fetchone()
-            if key is None or key["status"] != "active":
+            # A key retired by a concurrent rotation is still retained, so a grant
+            # it signed moments ago remains verifiable; only a revoked or unknown
+            # key refuses the record.
+            if key is None or key["status"] not in {"active", "retired"}:
                 connection.rollback()
-                raise ValueError("issuer key is not active")
+                raise ValueError("issuer key is not available")
             connection.execute(
                 "INSERT INTO issued_grants(grant_id,key_id,payload_digest,expires_at,grant_wire) VALUES(?,?,?,?,?)",
                 (grant_id, key_id, payload_digest, _stamp(expires_at), wire),
@@ -254,6 +257,13 @@ class SqliteGrantAuthorityStore:
                 "UPDATE issuer_keys SET latest_live_expiry = CASE WHEN latest_live_expiry IS NULL OR latest_live_expiry < ? THEN ? ELSE latest_live_expiry END WHERE key_id = ?",
                 (_stamp(expires_at), _stamp(expires_at), key_id),
             )
+            if key["status"] == "retired":
+                # Retention only ever grows: the live grant must stay verifiable.
+                needed = _stamp(expires_at + timedelta(seconds=60))
+                connection.execute(
+                    "UPDATE issuer_keys SET retain_until = CASE WHEN retain_until IS NULL OR retain_until < ? THEN ? ELSE retain_until END WHERE key_id = ?",
+                    (needed, needed, key_id),
+                )
             connection.execute(
                 "INSERT INTO issuance_audit(grant_id,approval_id,approval_token_digest,operator_evidence_digest,approved_duration_seconds,approved_at) VALUES(?,?,?,?,?,?)",
                 (

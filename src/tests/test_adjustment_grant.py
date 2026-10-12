@@ -458,3 +458,78 @@ def test_zero_epoch_is_refused_because_no_lease_can_consume_it(field_name: str) 
     """Ledger leases start at epoch 1; a grant naming epoch 0 is unspendable."""
     with pytest.raises(ValueError, match="interoperable integer"):
         request(**{field_name: 0})
+
+
+def test_issuance_follows_a_rotation_made_by_another_authority(tmp_path: Path) -> None:
+    """A worker that missed a rotation adopts the durable active key before issuing."""
+    clock = Clock()
+    first, _, _ = authority(clock, tmp_path / "shared.db")
+    second, _, _ = authority(clock, tmp_path / "shared.db")
+    first._keyring.rotate(key_id="issuer-2", seed_ref="secret-ref:issuer-2", now=clock.now)
+
+    grant = issue(second)  # second still cached issuer-1 at construction
+
+    assert grant.issuer_key_id == "issuer-2"
+    second.verify(grant.to_wire())
+    first.verify(grant.to_wire())
+
+
+def test_rotation_between_signing_and_recording_does_not_strand_the_approval(tmp_path: Path) -> None:
+    """A key retired after signing still records the grant and extends its retention."""
+    clock = Clock()
+    policy, _, store = authority(clock, tmp_path / "shared.db")
+    original = store.record_issued
+
+    def rotate_then_record(grant, audit):
+        policy._keyring.rotate(key_id="issuer-2", seed_ref="secret-ref:issuer-2", now=clock.now)
+        return original(grant, audit)
+
+    store.record_issued = rotate_then_record  # type: ignore[method-assign]
+    grant = issue(policy)
+
+    assert grant.issuer_key_id == "issuer-1"
+    policy.verify(grant.to_wire())
+    retired = store.key("issuer-1")
+    assert retired is not None and retired.status == "retired"
+    assert retired.retain_until >= grant.expires_at + timedelta(seconds=60)
+
+
+def test_request_text_is_capped_so_an_issued_grant_always_parses() -> None:
+    """The cap is shared by issuance and parsing: no grant is signed then refused."""
+    request(run_id="r" * 1_024)
+    with pytest.raises(ValueError, match="exceeds"):
+        request(run_id="r" * 1_025)
+
+
+def test_worst_case_escaped_request_still_fits_the_wire_limit(tmp_path: Path) -> None:
+    """Control characters expand six-fold in JSON; the cap still leaves headroom."""
+    clock = Clock()
+    policy, _, _ = authority(clock, tmp_path / "p.db")
+    heavy = "\x01" * 1_024
+    grant = policy.issue(
+        request(principal=heavy, run_id=heavy, hold_id=heavy, ledger_cost_basis=heavy,
+                ledger_store_id=heavy, issuer_ref=heavy, revocation_ref=heavy),
+        authenticated_principal=heavy,
+        operator_evidence_ref="trusted-ui://approval/1",
+    )
+    assert len(grant.to_wire()) < 65_536
+    policy.verify(grant.to_wire())
+
+
+def test_deeply_nested_wire_is_a_malformed_refusal_not_a_recursion_error(tmp_path: Path) -> None:
+    """Nested JSON below the size limit still maps into the closed vocabulary."""
+    policy, _, _ = authority(Clock(), tmp_path / "p.db")
+    nested = b"[" * 20_000 + b"]" * 20_000
+    with pytest.raises(GrantRefusal) as refused:
+        policy.verify(nested)
+    assert refused.value.reason is GrantRefusalReason.GRANT_MALFORMED
+
+
+@pytest.mark.parametrize("bad_clock", [lambda: datetime(2026, 1, 1), lambda: "not-a-time"])
+def test_revocation_reports_clock_faults_as_verifier_unavailable(tmp_path: Path, bad_clock) -> None:
+    """Both adapter methods share one refusal contract for a faulty clock."""
+    policy, _, _ = authority(Clock(), tmp_path / "p.db")
+    policy._clock = bad_clock
+    with pytest.raises(GrantRefusal) as refused:
+        policy.revocation("grant-1")
+    assert refused.value.reason is GrantRefusalReason.VERIFIER_UNAVAILABLE

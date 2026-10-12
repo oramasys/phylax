@@ -42,6 +42,9 @@ _FUTURE_ISSUANCE_SKEW: Final = timedelta(seconds=60)
 _UNIT_BASES: Final = frozenset({"steps", "elapsed_ms", "cost_microunits", "effect_attempts"})
 _KINDS: Final = frozenset({"settle", "release"})
 _MAX_SAFE_INTEGER: Final = (2**53) - 1
+# Seven request strings at this cap, even fully JSON-escaped, stay far below the
+# 65,536-byte wire limit, so a grant that can be issued can always be parsed.
+_MAX_TEXT_BYTES: Final = 1_024
 _GRANT_ACTION: Final = "phylax.adjustment_grant.issue"
 
 
@@ -269,6 +272,8 @@ class AdjustmentGrantRequest:
             "revocation_ref",
         ):
             _require_text(getattr(self, field_name), field_name)
+            if len(getattr(self, field_name).encode("utf-8")) > _MAX_TEXT_BYTES:
+                raise ValueError(f"{field_name} exceeds {_MAX_TEXT_BYTES} bytes")
         if not isinstance(self.kind, str) or self.kind not in _KINDS:
             raise ValueError("kind must be settle or release")
         if isinstance(self.units, bool) or not isinstance(self.units, int) or self.units <= 0:
@@ -415,7 +420,7 @@ class AdjustmentGrant:
             raise ValueError("grant wire is malformed")
         try:
             payload = json.loads(wire.decode("utf-8"), object_pairs_hook=_unique_object)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ValueError("grant wire is malformed") from exc
         if not isinstance(payload, dict):
             raise ValueError("grant wire is malformed")
@@ -429,7 +434,11 @@ class AdjustmentGrant:
             raise ValueError("grant wire is malformed")
         if type(payload["schema_version"]) is not int or payload["schema_version"] != _SCHEMA_VERSION:
             raise NotImplementedError("grant schema is unsupported")
-        if _canonical_bytes(payload) != wire:
+        try:
+            canonical = _canonical_bytes(payload)
+        except RecursionError as exc:
+            raise ValueError("grant wire is malformed") from exc
+        if canonical != wire:
             raise ValueError("grant wire is not canonical")
         try:
             request = AdjustmentGrantRequest(
@@ -558,6 +567,26 @@ class RotatingIssuerKeyring:
         )
         self._active = _IssuerKey(key_id, seed, seed_ref)
 
+    def ensure_current(self) -> None:
+        """Adopt the durable active key when another authority rotated it.
+
+        Several authorities may share one registry. Each reads the registry's
+        active key before spending an approval, so a worker never signs with a
+        generation another worker has already retired.
+        """
+        record = self._store.active_key()
+        if record is None:
+            raise ValueError("issuer key registry has no active key")
+        if record.key_id == self._active.key_id:
+            return
+        seed = self._seed_provider.load_seed(record.seed_ref)
+        if not isinstance(seed, bytes) or len(seed) != crypto_sign_SEEDBYTES:
+            raise ValueError("issuer signing seed has an invalid length")
+        public_key, _ = crypto_sign_seed_keypair(seed)
+        if public_key != record.public_key:
+            raise ValueError("provisioned issuer key does not match the durable active key")
+        self._active = _IssuerKey(record.key_id, seed, record.seed_ref)
+
     def sign(self, body: bytes) -> tuple[str, str]:
         """Sign one canonical body with the current active Ed25519ph key."""
         _public_key, signature = _sign(self._active.seed, body)
@@ -617,6 +646,9 @@ class PhylaxGrantAuthority:
         _require_text(authenticated_principal, "authenticated_principal")
         if authenticated_principal != request.principal:
             raise ValueError("authenticated principal does not match grant principal")
+        # Refresh the signing key from durable state BEFORE the single-use
+        # approval is spent, so a concurrent rotation cannot strand it.
+        self._keyring.ensure_current()
         grant_id = token_urlsafe(24)
         approval_intent = self._approval_intent(request, grant_id)
         preview = self._p5_approval.issue_preview(approval_intent)
@@ -698,7 +730,7 @@ class PhylaxGrantAuthority:
             raise GrantRefusal(GrantRefusalReason.GRANT_SCHEMA_UNSUPPORTED) from exc
         except (sqlite3.Error, OSError) as exc:
             raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
-        except (TypeError, ValueError, UnicodeError) as exc:
+        except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
             raise GrantRefusal(GrantRefusalReason.GRANT_MALFORMED) from exc
 
     def revoke(self, grant_id: str) -> None:
@@ -716,7 +748,7 @@ class PhylaxGrantAuthority:
         _require_text(grant_id, "grant_id")
         try:
             return RevocationObservation(grant_id, self._store.is_revoked(grant_id), self._now())
-        except (sqlite3.Error, OSError) as exc:
+        except (sqlite3.Error, OSError, TypeError, ValueError, AttributeError) as exc:
             raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
 
     def revocation_status(self, grant_id: str) -> RevocationObservation:
