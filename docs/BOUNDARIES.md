@@ -8,6 +8,7 @@ Phylax is the compile-time and runtime **generic security/safety admission** aut
 | Generic runtime security/safety admission and policy packs | Phylax |
 | Generic monitorability/runtime-check substrate | Phylax |
 | Strict P5 approval evidence for security-sensitive actions | Phylax |
+| Adjustment-grant issue, signature verification, revocation observation, and issuer-key lifecycle | Phylax |
 | Generic execution primitives and event contracts | Core (`oramasys/perpetua-core`) |
 | Endpoint identity and canonicalization | Telos |
 | SSRF, DNS resolution/rebinding defense, address classification | Telos |
@@ -25,6 +26,22 @@ swarm-launch preview and consumes that evidence once. It does not create
 adjustment grants, decide ledger admission, or replace an adjustment grant's
 independent Ed25519ph signature. A future consumer must provide durable P5
 storage and may not add a legacy boolean-approval bypass.
+
+Phylax issues an adjustment grant only after P5 binds the server-minted grant
+target tuple to trusted operator evidence. The grant's RFC 8032 Ed25519ph
+signature is independent of P5's HMAC receipt. Phylax may verify that issuer
+attestation and report revocation observations, but it must never calculate
+remaining balance, consume a grant, settle, or release a hold. Those are
+Oramasys ledger transactions; remote consumer access uses Telos rather than an
+ad hoc client.
+
+The issuer keeps durable public-key metadata, issued wire records, revocations,
+and digest-only issuance audits in `SqliteGrantAuthorityStore`. Signing seeds
+come from an injected protected secret source and never enter the database.
+Oramasys receives a verifier by injection and sees only `VerifiedGrant` facts;
+its composition defaults to deny-all. The 900-second autonomous duration is
+reserved for a separately authenticated P5 policy path, which is not yet
+implemented; the current grant issuer is P5 human-gated only.
 
 ## Explicit endpoint exclusion
 

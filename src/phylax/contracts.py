@@ -7,6 +7,12 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias
 
 if TYPE_CHECKING:
+    from .adjustment_grant import (
+        AdjustmentGrant,
+        AdjustmentGrantRequest,
+        RevocationObservation,
+        VerifiedGrant,
+    )
     from .p5_approval import (
         P5ApprovalDecision,
         P5ApprovalIntent,
@@ -148,4 +154,34 @@ class P5ApprovalPort(Protocol):
 
     def consume(self, receipt: P5ApprovalReceipt, intent: P5ApprovalIntent) -> P5ApprovalDecision:
         """Verify and consume a receipt exactly once."""
+
+
+class AdjustmentGrantPort(Protocol):
+    """Issuer-side authority boundary; ledger consumption remains outside Phylax."""
+
+    def issue(
+        self,
+        request: AdjustmentGrantRequest,
+        *,
+        authenticated_principal: str,
+        operator_evidence_ref: str,
+        approved_duration_seconds: int | None = None,
+    ) -> AdjustmentGrant:
+        """Issue one P5-backed, principal-bound adjustment grant."""
+
+    def verify(self, wire: bytes) -> VerifiedGrant:
+        """Return only ledger-relevant facts for a valid signed grant."""
+
+    def revocation(self, grant_id: str) -> RevocationObservation:
+        """Return an issuer-side revocation observation for transport to consumers."""
+
+
+class AdjustmentGrantVerifier(Protocol):
+    """Consumer-owned verification port implemented through injection."""
+
+    def verify(self, wire: bytes) -> VerifiedGrant:
+        """Verify wire data and return only the facts Oramasys is allowed to see."""
+
+    def revocation(self, grant_id: str) -> RevocationObservation:
+        """Return a timestamped observation; consumers enforce its freshness bound."""
 

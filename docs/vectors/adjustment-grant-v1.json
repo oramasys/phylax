@@ -1,0 +1,27 @@
+{
+  "canonical_bytes": "{\"consumer_lease_epoch\":7,\"evidence_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"expires_at\":\"2026-10-12T13:30:00.000000Z\",\"grant_id\":\"grant-vector-0001\",\"hold_fence_epoch\":4,\"hold_id\":\"vector-hold-001\",\"issued_at\":\"2026-10-12T12:00:00.000000Z\",\"issuer_key_id\":\"phylax-vector-key-1\",\"issuer_ref\":\"phylax-vector\",\"kind\":\"settle\",\"ledger_cost_basis\":\"legacy_step_only\",\"ledger_store_id\":\"vector-ledger\",\"principal\":\"vector-principal\",\"revocation_ref\":\"phylax://revocations/v1\",\"run_id\":\"vector-run-001\",\"schema_version\":1,\"units\":3,\"units_basis\":\"steps\"}",
+  "expires_at": "2026-10-12T13:30:00.000000Z",
+  "grant_id": "grant-vector-0001",
+  "issued_at": "2026-10-12T12:00:00.000000Z",
+  "issuer_key_id": "phylax-vector-key-1",
+  "payload_digest": "91259202f4dabe4e6e21cef1499d5dd103af078f3749dabde8d71e7a4bcfc9c8",
+  "public_key": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+  "request": {
+    "consumer_lease_epoch": 7,
+    "evidence_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "hold_fence_epoch": 4,
+    "hold_id": "vector-hold-001",
+    "issuer_ref": "phylax-vector",
+    "kind": "settle",
+    "ledger_cost_basis": "legacy_step_only",
+    "ledger_store_id": "vector-ledger",
+    "principal": "vector-principal",
+    "revocation_ref": "phylax://revocations/v1",
+    "run_id": "vector-run-001",
+    "units": 3,
+    "units_basis": "steps"
+  },
+  "schema": "phylax.adjustment-grant.conformance.v1",
+  "signature": "5_sYxK5k6bBrb6f1uVUINxheJJBfPCXSixQMFxT-bCvcMnK2folfHnGvglIFOhGTLSbDgBySFfL5wOE4AeJ3Ag",
+  "wire": "{\"consumer_lease_epoch\":7,\"evidence_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"expires_at\":\"2026-10-12T13:30:00.000000Z\",\"grant_id\":\"grant-vector-0001\",\"hold_fence_epoch\":4,\"hold_id\":\"vector-hold-001\",\"issued_at\":\"2026-10-12T12:00:00.000000Z\",\"issuer_key_id\":\"phylax-vector-key-1\",\"issuer_ref\":\"phylax-vector\",\"issuer_signature\":\"5_sYxK5k6bBrb6f1uVUINxheJJBfPCXSixQMFxT-bCvcMnK2folfHnGvglIFOhGTLSbDgBySFfL5wOE4AeJ3Ag\",\"kind\":\"settle\",\"ledger_cost_basis\":\"legacy_step_only\",\"ledger_store_id\":\"vector-ledger\",\"payload_digest\":\"91259202f4dabe4e6e21cef1499d5dd103af078f3749dabde8d71e7a4bcfc9c8\",\"principal\":\"vector-principal\",\"revocation_ref\":\"phylax://revocations/v1\",\"run_id\":\"vector-run-001\",\"schema_version\":1,\"units\":3,\"units_basis\":\"steps\"}"
+}

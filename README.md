@@ -59,3 +59,34 @@ Policy bounds and retention:
   schedule `P5ApprovalAuthority.purge_expired()`, which drops records that
   expired more than 30 days ago by default; an expired record can never
   authorize, so purging does not weaken replay protection.
+
+## Adjustment-grant issuer
+
+`PhylaxGrantAuthority` owns the issuer side of a one-time adjustment grant:
+it authenticates the requesting principal, binds a grant-specific P5 action to
+the exact target tuple, accepts only the duration P5 approves, and signs the
+canonical wire body with RFC 8032 Ed25519ph. Its `verifier_adapter()` exposes
+only `verify(wire)` and `revocation(grant_id)` for dependency-injected
+composition; the result omits issuer key IDs, public keys, P5 receipts, and
+operator-evidence references.
+
+The issuer has no budget, ledger, or consumption authority. Oramasys must
+verify the attestation and atomically consume it against its own ledger. The
+P5 receipt remains local issuance evidence; its raw HMAC token never becomes
+the Ed25519ph grant signature or crosses that boundary. `SqliteGrantAuthorityStore`
+durably records the public key registry, exact issued wire forms, revocations,
+key-retention references, and digest-only P5 audit facts. Retired keys remain
+available for at least 24 hours and through every live grant they signed, plus
+the 60-second skew window. `RotatingIssuerKeyring` requires an injected
+`IssuerSeedProvider`; deployments resolve the opaque `seed_ref` through their
+protected secret manager. SQLite stores only that reference and public
+metadata. Startup fails if the supplied seed does not match the active durable
+key record. The shared signature fixture is
+[`docs/vectors/adjustment-grant-v1.json`](docs/vectors/adjustment-grant-v1.json).
+
+The human issuance default is 5,400 seconds; a P5-authorized extension may be
+up to 9,900 seconds and requires fresh P5 approval. The 900-second autonomous
+default belongs to a separate P5 autonomous policy path. That path is not
+implemented here, and autonomous grant issuance remains unavailable until P5
+defines and authenticates it. The grant issuer does not infer a supervision
+tier from a caller-provided duration.
