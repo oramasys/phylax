@@ -27,6 +27,7 @@ from phylax.adjustment_grant import (
     _verify,
     _verify_message,
 )
+from phylax.grant_store import IssuerKeyRecord
 from phylax.p5_approval import InMemoryP5ApprovalStore, P5ApprovalAuthority
 
 
@@ -472,6 +473,44 @@ def test_issuance_follows_a_rotation_made_by_another_authority(tmp_path: Path) -
     assert grant.issuer_key_id == "issuer-2"
     second.verify(grant.to_wire())
     first.verify(grant.to_wire())
+
+
+def test_initial_key_registration_is_idempotent_only_for_a_pristine_registry(
+    tmp_path: Path,
+) -> None:
+    """Only the exact lone initial record may be registered more than once."""
+    store = SqliteGrantAuthorityStore(tmp_path / "keys.db")
+    initial = IssuerKeyRecord(
+        "issuer-1", b"1" * 32, "secret-ref:issuer-1", "active", None, None, None
+    )
+    replacement = IssuerKeyRecord(
+        "issuer-2", b"2" * 32, "secret-ref:issuer-2", "active", None, None, None
+    )
+    store.register_initial_key(initial)
+    store.register_initial_key(initial)
+
+    with pytest.raises(ValueError, match="already initialized"):
+        store.register_initial_key(replacement)
+
+    store.rotate_key(replacement, now=Clock().now)
+    with pytest.raises(ValueError, match="already initialized"):
+        store.register_initial_key(replacement)
+
+    now = Clock().now
+    revoked_store = SqliteGrantAuthorityStore(tmp_path / "revoked.db")
+    revoked = IssuerKeyRecord(
+        "issuer-1", b"1" * 32, "secret-ref:issuer-1", "revoked",
+        now, now + timedelta(minutes=1), None,
+    )
+    revoked_store.register_initial_key(revoked)
+    with pytest.raises(ValueError, match="already initialized"):
+        revoked_store.register_initial_key(revoked)
+
+    historical_store = SqliteGrantAuthorityStore(tmp_path / "historical.db")
+    historical = replace(initial, latest_live_expiry=now + timedelta(minutes=1))
+    historical_store.register_initial_key(historical)
+    with pytest.raises(ValueError, match="already initialized"):
+        historical_store.register_initial_key(historical)
 
 
 def test_rotation_between_signing_and_recording_does_not_strand_the_approval(tmp_path: Path) -> None:
