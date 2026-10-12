@@ -31,6 +31,20 @@ class ReviewIntakeError(ValueError):
     """Raised when review text or a ledger operation is refused (fail closed)."""
 
 
+_SOURCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+
+
+def validate_source(value: object) -> str:
+    """Require a short safe label (for example ``coderabbit``) and return it.
+
+    The source is persisted and shown to later readers, so free text, control
+    characters and markup are refused rather than normalized.
+    """
+    if not isinstance(value, str) or _SOURCE_RE.fullmatch(value) is None:
+        raise ReviewIntakeError("source must be a short label of letters, digits and _.:-")
+    return value
+
+
 def is_commit_sha(value: object) -> bool:
     """Report whether ``value`` is a lower-case abbreviated or full commit SHA."""
     return isinstance(value, str) and _COMMIT_RE.fullmatch(value) is not None
@@ -70,8 +84,7 @@ class ReviewFinding:
         """Validate shape and bounds; the claim must say something."""
         if not _FINDING_ID_RE.fullmatch(self.finding_id):
             raise ReviewIntakeError("finding_id must be a 32-character hex digest")
-        if not self.source.strip() or len(self.source) > 120:
-            raise ReviewIntakeError("source is required and must be short")
+        validate_source(self.source)
         if not self.claim.strip():
             raise ReviewIntakeError("finding has no claim")
         if len(self.claim) > MAX_CLAIM_CHARS or len(self.suggested_change) > MAX_SUGGESTION_CHARS:

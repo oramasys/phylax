@@ -22,6 +22,7 @@ from .model import (
     ReviewFinding,
     ReviewIntakeError,
     Severity,
+    validate_source,
 )
 
 MAX_INPUT_CHARS: Final = 262_144
@@ -45,7 +46,28 @@ _SEVERITY_WORDS: Final = (
     (re.compile(r"(?i)\b(p2|medium|moderate)\b"), "medium"),
     (re.compile(r"(?i)\b(p3|minor|low|trivial|nitpick)\b"), "low"),
 )
-_PATH_RE = re.compile(r"(?:/Users|/home)/[^/\s\"'`]+")
+_MUTATING_COMMAND = re.compile(
+    r"""(?ix)
+    \b(?:
+        git\s+(?:push|reset|clean|checkout|rebase|commit|merge|tag|stash|restore|branch\s+-d)
+      | rm\s+-\w*[rf]
+      | sudo | curl | wget | chmod | chown | mkfs | dd\s+if=
+      | gh\s+(?:pr|api|repo|release|issue)
+      | pip3?\s+install | npm\s+(?:install|publish|run) | yarn\s+(?:add|publish)
+      | kubectl | docker\s+(?:run|rm|push|exec)
+      | (?:bash|sh|zsh)\s+-c | eval | exec
+    )\b
+    """
+)
+# Home, temp and volume roots of the machines this stack runs on. A review quoting
+# one of these is describing a workstation, which must not enter tracked records.
+_PATH_RE = re.compile(
+    r"""(?x)
+    (?:/Users|/home|/root|/Volumes|/mnt|/var/folders|/var/tmp|/opt/homebrew
+      |/private/(?:tmp|var|etc)|/tmp)(?:/[^\s"'`)\]]*)?
+    | [A-Za-z]:\\(?:Users|Documents\sand\sSettings)\\[^\s"'`]*
+    """
+)
 _SECRET_RES = (
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
@@ -80,7 +102,7 @@ def normalize_text(text: str) -> str:
 
 def scrub(text: str) -> str:
     """Redact token-shaped secrets and absolute workstation paths in prose."""
-    cleaned = _PATH_RE.sub("<user-path>", text)
+    cleaned = _PATH_RE.sub("<local-path>", text)
     for pattern in _SECRET_RES:
         cleaned = pattern.sub(_REDACTED, cleaned)
     return cleaned
@@ -111,6 +133,7 @@ def parse_comment(
     ``path`` and ``line`` come from the review API, not from the text, and are
     validated as untrusted. Raises ``ReviewIntakeError`` when no claim remains.
     """
+    validate_source(source)
     text = normalize_text(body)
     text = _HTML_COMMENT.sub("", text)
 
@@ -151,7 +174,7 @@ def parse_comment(
         # claim with it, and a real claim cannot hide an injected clause.
         clean: list[str] = []
         for sentence in re.split(r"(?<=[.!?])\s+", stripped):
-            if sentence and _IMPERATIVE.search(sentence):
+            if sentence and (_IMPERATIVE.search(sentence) or _MUTATING_COMMAND.search(sentence)):
                 quarantined.append(sentence)
             elif sentence:
                 clean.append(sentence)
