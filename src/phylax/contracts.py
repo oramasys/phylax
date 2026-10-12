@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias
 
 if TYPE_CHECKING:
+    from .adjustment_grant import AdjustmentGrant, AdjustmentGrantRequest, RevocationStatus
     from .p5_approval import (
         P5ApprovalDecision,
         P5ApprovalIntent,
@@ -148,4 +149,23 @@ class P5ApprovalPort(Protocol):
 
     def consume(self, receipt: P5ApprovalReceipt, intent: P5ApprovalIntent) -> P5ApprovalDecision:
         """Verify and consume a receipt exactly once."""
+
+
+class AdjustmentGrantPort(Protocol):
+    """Issuer-side authority boundary; ledger consumption remains outside Phylax."""
+
+    def issue(
+        self,
+        request: AdjustmentGrantRequest,
+        *,
+        authenticated_principal: str,
+        operator_evidence_ref: str,
+    ) -> AdjustmentGrant:
+        """Issue one P5-backed, principal-bound adjustment grant."""
+
+    def verify(self, grant: AdjustmentGrant) -> None:
+        """Fail closed unless the signed grant is live, valid, and unrevoked."""
+
+    def revocation_status(self, grant_id: str) -> RevocationStatus:
+        """Return an issuer-side revocation observation for transport to consumers."""
 

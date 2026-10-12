@@ -59,3 +59,21 @@ Policy bounds and retention:
   schedule `P5ApprovalAuthority.purge_expired()`, which drops records that
   expired more than 30 days ago by default; an expired record can never
   authorize, so purging does not weaken replay protection.
+
+## Adjustment-grant issuer
+
+`PhylaxGrantAuthority` owns only the issuer side of a one-time adjustment
+grant: it authenticates the requesting principal, creates a server-minted
+grant identifier, binds P5 approval to the exact target tuple, derives the
+human grant duration from P5 rather than a caller argument, and signs the
+canonical body with RFC 8032 Ed25519ph. It also exposes verification and a
+timestamped revocation observation for a future Telos transport adapter.
+
+The issuer has no budget, ledger, or consumption authority. Oramasys must
+verify the attestation and atomically consume it against its own ledger. The
+P5 receipt remains local issuance evidence; its raw HMAC token never becomes
+the Ed25519ph grant signature or crosses that boundary. `RotatingIssuerKeyring`
+retains retired public keys for at least 24 hours and through every live grant
+they signed, plus the 60-second skew window. Deployments must provide durable
+key and grant-index storage before treating this in-memory reference lifecycle
+as release-ready.

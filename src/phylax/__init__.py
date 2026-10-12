@@ -1,9 +1,18 @@
 """Phylax compile-time and runtime security admission."""
 
+from .adjustment_grant import (
+    AdjustmentGrant,
+    AdjustmentGrantRequest,
+    P5IssuanceAudit,
+    PhylaxGrantAuthority,
+    RevocationStatus,
+    RotatingIssuerKeyring,
+)
 from .redaction import redact_details
 from .authorizer import PhylaxAuthorizer
 from .contracts import (
     ArtifactRef,
+    AdjustmentGrantPort,
     CompileDecision,
     CompileRequest,
     EVIDENCE_CLASSES,
@@ -26,6 +35,9 @@ from .p5_approval import (
 )
 
 __all__ = [
+    "AdjustmentGrant",
+    "AdjustmentGrantPort",
+    "AdjustmentGrantRequest",
     "ArtifactRef",
     "CompileDecision",
     "CompileRequest",
@@ -42,8 +54,12 @@ __all__ = [
     "SqliteP5ApprovalStore",
     "redact_details",
     "PhylaxAuthorizer",
+    "PhylaxGrantAuthority",
     "PhylaxPort",
     "PrincipalVerifier",
     "RuntimeAdmissionDecision",
     "RuntimeAdmissionRequest",
+    "P5IssuanceAudit",
+    "RevocationStatus",
+    "RotatingIssuerKeyring",
 ]
