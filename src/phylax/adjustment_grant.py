@@ -279,7 +279,8 @@ class AdjustmentGrantRequest:
         _require_digest(self.evidence_digest, "evidence_digest")
         for field_name in ("hold_fence_epoch", "consumer_lease_epoch"):
             value = getattr(self, field_name)
-            _require_safe_integer(value, field_name)
+            # Ledger leases start at epoch 1, so a zero epoch can never be consumed.
+            _require_safe_integer(value, field_name, minimum=1)
 
 
 @dataclass(frozen=True, slots=True)

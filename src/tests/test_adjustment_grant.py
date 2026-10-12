@@ -58,7 +58,7 @@ def request(**overrides: object) -> AdjustmentGrantRequest:
         "kind": "settle",
         "units": 3,
         "units_basis": "steps",
-        "ledger_cost_basis": "legacy-step-only-v1",
+        "ledger_cost_basis": "legacy_step_only",
         "evidence_digest": "a" * 64,
         "hold_fence_epoch": 4,
         "consumer_lease_epoch": 7,
@@ -451,3 +451,10 @@ def test_ed25519ph_matches_rfc8032_vector_and_chunk_boundaries() -> None:
     assert public_key == expected_public_key
     assert signature == expected_signature
     assert _verify_message(public_key, signature, b"a", b"b", b"c")
+
+
+@pytest.mark.parametrize("field_name", ["hold_fence_epoch", "consumer_lease_epoch"])
+def test_zero_epoch_is_refused_because_no_lease_can_consume_it(field_name: str) -> None:
+    """Ledger leases start at epoch 1; a grant naming epoch 0 is unspendable."""
+    with pytest.raises(ValueError, match="interoperable integer"):
+        request(**{field_name: 0})
