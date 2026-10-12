@@ -114,3 +114,15 @@ Seeds are 32 bytes in hex, one per file, referenced by file name only; symlinks,
 loose modes, and a seed that does not match the durable active key all refuse to
 start. Not provided: the 900-second autonomous tier, which stays deferred until a
 separately authenticated P5 policy exists, so only the human-approved path issues.
+
+Secret reads are bounded and use the same open descriptor that is checked for
+ownership, type, and private permissions. Each load revalidates the seed root;
+final-component symlinks are refused for both the root and the seed file.
+Authority databases are created with mode 0600 before SQLite opens them. Existing
+databases and SQLite sidecars must be private regular files, and the owner must
+keep the state directory under trusted control during operation. Startup refuses
+unsafe existing permissions rather than silently changing them.
+
+Deployment readiness requires a trusted human interaction boundary that supplies
+the P5 operator evidence, provisioned secrets, and the consumer composition root.
+An issued or merged library alone does not establish that a deployment is ready.

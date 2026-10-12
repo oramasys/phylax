@@ -177,3 +177,108 @@ def test_clock_is_injectable(tmp_path: Path, seeds: Path) -> None:
         operator_evidence_ref="trusted-ui://approval/1",
     )
     assert grant.issued_at == fixed
+
+
+def test_seed_read_uses_the_file_that_was_validated(
+    seeds: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replacing the path after validation must not replace the bytes read."""
+    from phylax import grant_composition
+
+    outside = seed_file(tmp_path, "replacement", "33" * 32)
+    original = grant_composition._require_private
+    swapped = False
+
+    def replace_after_check(path: Path, **kwargs: object) -> os.stat_result:
+        nonlocal swapped
+        result = original(path, **kwargs)
+        if path.name == "issuer-1" and not swapped:
+            swapped = True
+            path.unlink()
+            path.symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(grant_composition, "_require_private", replace_after_check)
+    assert FileSeedProvider(seeds).load_seed("issuer-1") == bytes.fromhex(SEED_HEX)
+
+
+def test_replacing_the_seed_directory_with_a_symlink_is_refused(
+    seeds: Path, tmp_path: Path
+) -> None:
+    """Every load reopens and validates the root without following a symlink."""
+    provider = FileSeedProvider(seeds)
+    replacement = tmp_path / "replacement-directory"
+    replacement.mkdir(mode=0o700)
+    seed_file(replacement, "issuer-1", "33" * 32)
+    seeds.rename(tmp_path / "original-directory")
+    seeds.symlink_to(replacement, target_is_directory=True)
+    with pytest.raises(CompositionError):
+        provider.load_seed("issuer-1")
+
+
+@pytest.mark.parametrize("content", ["11" * 100_000, "\xff" * 64])
+def test_seed_input_is_bounded_and_decoding_errors_are_normalized(
+    seeds: Path, content: str
+) -> None:
+    """Invalid secret files refuse with the configuration error contract."""
+    (seeds / "issuer-1").write_bytes(content.encode("latin-1"))
+    with pytest.raises(CompositionError):
+        FileSeedProvider(seeds).load_seed("issuer-1")
+
+
+@pytest.mark.parametrize("name", ["grants.sqlite3", "p5-approvals.sqlite3"])
+def test_authority_refuses_symlinked_databases(
+    tmp_path: Path, seeds: Path, name: str
+) -> None:
+    """A private parent must not authorize following a database symlink."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    target = seed_file(tmp_path, "outside-database", "sentinel")
+    (state / name).symlink_to(target)
+    with pytest.raises(CompositionError):
+        open_grant_authority(config(tmp_path, seeds))
+    assert target.read_text(encoding="ascii") == "sentinel\n"
+
+
+def test_databases_are_private_from_creation(tmp_path: Path, seeds: Path) -> None:
+    """A permissive process umask must not make authority state readable."""
+    previous = os.umask(0)
+    try:
+        open_grant_authority(config(tmp_path, seeds))
+    finally:
+        os.umask(previous)
+    for name in ("grants.sqlite3", "p5-approvals.sqlite3"):
+        assert (tmp_path / "state" / name).stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("name", ["grants.sqlite3", "p5-approvals.sqlite3"])
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_sqlite_sidecar_symlinks_are_refused(
+    tmp_path: Path, seeds: Path, name: str, suffix: str
+) -> None:
+    """Sidecar files have the same trust boundary as the database itself."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    outside = seed_file(tmp_path, "outside-sidecar", "sentinel")
+    (state / (name + suffix)).symlink_to(outside)
+    with pytest.raises(CompositionError):
+        open_grant_authority(config(tmp_path, seeds))
+    assert outside.read_text(encoding="ascii") == "sentinel\n"
+
+
+def test_existing_loose_database_is_refused(tmp_path: Path, seeds: Path) -> None:
+    """Startup reports unsafe permissions without silently changing them."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    database = state / "grants.sqlite3"
+    database.touch(mode=0o644)
+    database.chmod(0o644)
+    with pytest.raises(CompositionError, match="group or others"):
+        open_grant_authority(config(tmp_path, seeds))
+
+
+@pytest.mark.parametrize("name", ["seed_ref", "p5_secret_ref", "key_id", "verifier_id"])
+def test_non_text_configuration_is_refused(tmp_path: Path, seeds: Path, name: str) -> None:
+    """Runtime configuration mistakes retain the closed configuration error type."""
+    with pytest.raises(CompositionError):
+        config(tmp_path, seeds, **{name: None})
