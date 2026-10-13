@@ -1,0 +1,2 @@
+# Raw hostile-text fixtures hold invisible/bidi bytes on purpose; never render or diff them.
+src/tests/fixtures/*.raw.txt binary
