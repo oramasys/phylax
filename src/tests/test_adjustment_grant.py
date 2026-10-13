@@ -520,23 +520,25 @@ def test_initial_key_registration_is_idempotent_only_for_a_pristine_registry(
         historical_store.register_initial_key(historical)
 
 
-class _StaleRegistryReads(SqliteGrantAuthorityStore):
-    """Store whose outside-transaction reads observe a registry another worker then fills."""
+class _RivalCommitsFirst(SqliteGrantAuthorityStore):
+    """Store whose first-key decision runs only after a rival worker has committed."""
 
     def __init__(self, path: Path, rival: SqliteGrantAuthorityStore, record: IssuerKeyRecord) -> None:
-        """Remember the rival worker and the key it will commit between read and write."""
+        """Remember the rival worker and the key it commits before this worker decides."""
         super().__init__(path)
         self._rival = rival
         self._record = record
+        self.rival_committed = False
 
-    def active_key(self) -> IssuerKeyRecord | None:
-        """Report the empty registry, then let the rival worker commit the same key."""
+    def ensure_active_key(self, record: IssuerKeyRecord) -> None:
+        """Let the rival commit the same key, then run the real transactional decision."""
         self._rival.register_initial_key(self._record)
-        return None
+        self.rival_committed = True
+        super().ensure_active_key(record)
 
 
 def test_concurrent_first_key_startup_adopts_the_rival_commit(tmp_path: Path) -> None:
-    """Worker B sees an empty registry, worker A commits, and B must adopt A's key."""
+    """Worker B starts after worker A committed the key and must adopt it, not insert or refuse."""
     database = tmp_path / "keys.db"
     seed_provider = SeedMap()
     public_key, _ = crypto_sign_seed_keypair(seed_provider.load_seed("secret-ref:issuer-1"))
@@ -544,7 +546,7 @@ def test_concurrent_first_key_startup_adopts_the_rival_commit(tmp_path: Path) ->
         "issuer-1", public_key, "secret-ref:issuer-1", "active", None, None, None
     )
     rival = SqliteGrantAuthorityStore(database)
-    racing = _StaleRegistryReads(database, rival, record)
+    racing = _RivalCommitsFirst(database, rival, record)
 
     keyring = RotatingIssuerKeyring(
         key_id="issuer-1",
@@ -553,8 +555,9 @@ def test_concurrent_first_key_startup_adopts_the_rival_commit(tmp_path: Path) ->
         store=racing,
     )
 
+    assert racing.rival_committed
     assert keyring.active_key_id == "issuer-1"
-    assert len(rival.keys()) == 1
+    assert rival.keys() == (record,)
 
 
 def test_first_key_startup_still_rejects_a_registry_without_an_active_key(tmp_path: Path) -> None:
