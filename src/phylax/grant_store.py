@@ -76,6 +76,7 @@ class SqliteGrantAuthorityStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
+        """Open one configured connection with row access and enforced foreign keys."""
         connection = sqlite3.connect(self.path, timeout=self._timeout, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -208,6 +209,35 @@ class SqliteGrantAuthorityStore:
                     return
                 connection.rollback()
                 raise ValueError("issuer key registry is already initialized")
+            self._insert_key(connection, record)
+            connection.commit()
+
+    def ensure_active_key(self, record: IssuerKeyRecord) -> None:
+        """Atomically initialize the registry or confirm the durable active key matches.
+
+        The empty-registry decision and the insert share one write transaction, so a
+        worker that raced another worker to first-key initialization adopts the
+        committed key instead of refusing it. A registry that is nonempty but has no
+        active key, or whose active key differs, is still rejected.
+        """
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                "SELECT * FROM issuer_keys WHERE status = 'active'"
+            ).fetchone()
+            if active is not None:
+                existing = self._key_record(active)
+                connection.rollback()
+                if (
+                    existing.key_id != record.key_id
+                    or existing.public_key != record.public_key
+                    or existing.seed_ref != record.seed_ref
+                ):
+                    raise ValueError("provisioned issuer key does not match the durable active key")
+                return
+            if connection.execute("SELECT 1 FROM issuer_keys LIMIT 1").fetchone() is not None:
+                connection.rollback()
+                raise ValueError("issuer key registry has no active key")
             self._insert_key(connection, record)
             connection.commit()
 
@@ -379,6 +409,7 @@ class SqliteGrantAuthorityStore:
 
     @staticmethod
     def _insert_key(connection: sqlite3.Connection, record: IssuerKeyRecord) -> None:
+        """Insert one issuer key record on an already-open write transaction."""
         connection.execute(
             "INSERT INTO issuer_keys(key_id,public_key,seed_ref,status,retired_at,retain_until,latest_live_expiry) VALUES(?,?,?,?,?,?,?)",
             (

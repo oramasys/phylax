@@ -523,16 +523,9 @@ class RotatingIssuerKeyring:
         self._store = store
         self._seed_provider = seed_provider
         public_key, _secret_key = crypto_sign_seed_keypair(seed)
-        active = store.active_key()
-        if active is None:
-            if store.keys():
-                raise ValueError("issuer key registry has no active key")
-            store.register_initial_key(
-                IssuerKeyRecord(key_id, public_key, seed_ref, "active", None, None, None)
-            )
-        else:
-            if active.key_id != key_id or active.public_key != public_key or active.seed_ref != seed_ref:
-                raise ValueError("provisioned issuer key does not match the durable active key")
+        store.ensure_active_key(
+            IssuerKeyRecord(key_id, public_key, seed_ref, "active", None, None, None)
+        )
         self._active = _IssuerKey(key_id, seed, seed_ref)
 
     @property

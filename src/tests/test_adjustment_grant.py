@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 import unicodedata
 
+from nacl.bindings import crypto_sign_seed_keypair
 import pytest
 
 from phylax.adjustment_grant import (
@@ -47,6 +48,7 @@ class SeedMap:
     """Test-only protected-source stand-in keyed by opaque references."""
 
     def load_seed(self, seed_ref: str) -> bytes:
+        """Return the fixed test seed for a known reference."""
         return {"secret-ref:issuer-1": b"a" * 32, "secret-ref:issuer-2": b"b" * 32}[seed_ref]
 
 
@@ -243,6 +245,7 @@ def test_request_rejects_ambiguous_units_and_digest() -> None:
 
 
 def test_p5_action_is_bound_and_grant_duration_is_selected_at_approval(tmp_path: Path) -> None:
+    """P5 approval binds the action and fixes the grant duration at approval time."""
     clock = Clock()
     policy, p5_store, _grant_store = authority(clock, tmp_path / "grants.db")
 
@@ -258,6 +261,7 @@ def test_p5_action_is_bound_and_grant_duration_is_selected_at_approval(tmp_path:
 
 
 def test_durable_grant_state_survives_authority_restart(tmp_path: Path) -> None:
+    """Durable grant state survives restarting the authority."""
     clock = Clock()
     database = tmp_path / "grants.db"
     policy, _p5_store, store = authority(clock, database)
@@ -289,6 +293,7 @@ def test_durable_grant_state_survives_authority_restart(tmp_path: Path) -> None:
 
 
 def test_verifier_returns_only_consumer_facts_and_closed_refusal(tmp_path: Path) -> None:
+    """The verifier exposes only consumer facts and a closed refusal vocabulary."""
     clock = Clock()
     policy, _p5_store, _grant_store = authority(clock, tmp_path / "grants.db")
     grant = issue(policy)
@@ -383,11 +388,13 @@ def test_verifier_fails_closed_when_durable_state_is_unavailable(tmp_path: Path)
 
 
 def test_sqlite_grant_store_rejects_ephemeral_database() -> None:
+    """An in-memory database is rejected because grant state must be durable."""
     with pytest.raises(ValueError, match="durable file path"):
         SqliteGrantAuthorityStore(":memory:")
 
 
 def test_sqlite_grant_store_rejects_incompatible_existing_schema(tmp_path: Path) -> None:
+    """An existing database with an incompatible schema is rejected."""
     database = tmp_path / "incompatible.db"
     connection = sqlite3.connect(database)
     try:
@@ -513,6 +520,60 @@ def test_initial_key_registration_is_idempotent_only_for_a_pristine_registry(
         historical_store.register_initial_key(historical)
 
 
+class _StaleRegistryReads(SqliteGrantAuthorityStore):
+    """Store whose outside-transaction reads observe a registry another worker then fills."""
+
+    def __init__(self, path: Path, rival: SqliteGrantAuthorityStore, record: IssuerKeyRecord) -> None:
+        """Remember the rival worker and the key it will commit between read and write."""
+        super().__init__(path)
+        self._rival = rival
+        self._record = record
+
+    def active_key(self) -> IssuerKeyRecord | None:
+        """Report the empty registry, then let the rival worker commit the same key."""
+        self._rival.register_initial_key(self._record)
+        return None
+
+
+def test_concurrent_first_key_startup_adopts_the_rival_commit(tmp_path: Path) -> None:
+    """Worker B sees an empty registry, worker A commits, and B must adopt A's key."""
+    database = tmp_path / "keys.db"
+    seed_provider = SeedMap()
+    public_key, _ = crypto_sign_seed_keypair(seed_provider.load_seed("secret-ref:issuer-1"))
+    record = IssuerKeyRecord(
+        "issuer-1", public_key, "secret-ref:issuer-1", "active", None, None, None
+    )
+    rival = SqliteGrantAuthorityStore(database)
+    racing = _StaleRegistryReads(database, rival, record)
+
+    keyring = RotatingIssuerKeyring(
+        key_id="issuer-1",
+        seed_ref="secret-ref:issuer-1",
+        seed_provider=seed_provider,
+        store=racing,
+    )
+
+    assert keyring.active_key_id == "issuer-1"
+    assert len(rival.keys()) == 1
+
+
+def test_first_key_startup_still_rejects_a_registry_without_an_active_key(tmp_path: Path) -> None:
+    """Adoption never papers over a revoked-only or conflicting registry."""
+    store = SqliteGrantAuthorityStore(tmp_path / "keys.db")
+    now = Clock().now
+    store.register_initial_key(
+        IssuerKeyRecord(
+            "issuer-1", b"1" * 32, "secret-ref:issuer-1", "revoked",
+            now, now + timedelta(minutes=1), None,
+        )
+    )
+    with pytest.raises(ValueError, match="no active key"):
+        RotatingIssuerKeyring(
+            key_id="issuer-1", seed_ref="secret-ref:issuer-1",
+            seed_provider=SeedMap(), store=store,
+        )
+
+
 def test_rotation_between_signing_and_recording_does_not_strand_the_approval(tmp_path: Path) -> None:
     """A key retired after signing still records the grant and extends its retention."""
     clock = Clock()
@@ -520,6 +581,7 @@ def test_rotation_between_signing_and_recording_does_not_strand_the_approval(tmp
     original = store.record_issued
 
     def rotate_then_record(grant, audit):
+        """Rotate the key between signing and recording, then record the grant."""
         policy._keyring.rotate(key_id="issuer-2", seed_ref="secret-ref:issuer-2", now=clock.now)
         return original(grant, audit)
 

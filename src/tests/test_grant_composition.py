@@ -202,23 +202,15 @@ def test_two_workers_can_bootstrap_the_same_authority_concurrently(
     SqliteGrantAuthorityStore(grants)
     SqliteP5ApprovalStore(str(approvals))
 
-    active_barrier = threading.Barrier(2, timeout=5)
-    keys_barrier = threading.Barrier(2, timeout=5)
-    real_active_key = SqliteGrantAuthorityStore.active_key
-    real_keys = SqliteGrantAuthorityStore.keys
+    entry_barrier = threading.Barrier(2, timeout=5)
+    real_ensure = SqliteGrantAuthorityStore.ensure_active_key
 
-    def synchronized_active_key(store: SqliteGrantAuthorityStore):
-        active = real_active_key(store)
-        active_barrier.wait()
-        return active
+    def synchronized_ensure(store: SqliteGrantAuthorityStore, record):
+        """Hold both workers at the registry decision so neither has committed yet."""
+        entry_barrier.wait()
+        return real_ensure(store, record)
 
-    def synchronized_keys(store: SqliteGrantAuthorityStore):
-        keys = real_keys(store)
-        keys_barrier.wait()
-        return keys
-
-    monkeypatch.setattr(SqliteGrantAuthorityStore, "active_key", synchronized_active_key)
-    monkeypatch.setattr(SqliteGrantAuthorityStore, "keys", synchronized_keys)
+    monkeypatch.setattr(SqliteGrantAuthorityStore, "ensure_active_key", synchronized_ensure)
     deployment = config(tmp_path, seeds)
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(open_grant_authority, deployment) for _ in range(2)]
