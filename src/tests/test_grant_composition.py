@@ -219,6 +219,26 @@ def test_two_workers_can_bootstrap_the_same_authority_concurrently(
     assert all(authority.verifier_adapter() is not None for authority in authorities)
 
 
+def test_two_workers_can_bootstrap_from_an_empty_state_directory(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """Two workers starting with no state directory or databases both succeed."""
+    assert not (tmp_path / "state").exists()
+    start = threading.Barrier(2, timeout=5)
+    deployment = config(tmp_path, seeds)
+
+    def worker():
+        """Open the authority once both workers are released together."""
+        start.wait()
+        return open_grant_authority(deployment)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(worker) for _ in range(2)]
+        authorities = [future.result(timeout=10) for future in futures]
+
+    assert all(authority.verifier_adapter() is not None for authority in authorities)
+
+
 def test_a_different_key_cannot_adopt_an_initialized_registry(
     tmp_path: Path, seeds: Path
 ) -> None:
