@@ -66,6 +66,7 @@ class GrantRefusal(Exception):
     """A verifier refusal with no unstructured or caller-controlled detail."""
 
     def __init__(self, reason: GrantRefusalReason) -> None:
+        """Store the closed-set refusal reason, rejecting anything outside it."""
         if not isinstance(reason, GrantRefusalReason):
             raise ValueError("grant refusal reason is not in the closed set")
         self.reason = reason
