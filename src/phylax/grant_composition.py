@@ -63,6 +63,23 @@ def _require_private(
     return status
 
 
+def _open_creating(name: str, flags: int, dir_fd: int) -> int:
+    """Open or create ``name`` under ``dir_fd``, tolerating a rival creating it first.
+
+    Darwin fails the loser of two concurrent ``openat(O_CREAT)`` calls on the same
+    new name with a spurious ``ENOENT`` although the directory exists (reproduced
+    with bare ``O_RDWR|O_CREAT``; absolute paths and Linux are unaffected). The
+    only live-directory cause is a rival's in-flight create, so retry exactly once
+    without ``O_CREAT`` to open what it made. The caller's ownership and mode
+    checks still run on the returned descriptor, and a directory that really is
+    gone fails the retry too and is refused as missing.
+    """
+    try:
+        return os.open(name, flags, 0o600, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return os.open(name, flags & ~os.O_CREAT, 0o600, dir_fd=dir_fd)
+
+
 @contextmanager
 def _open_private(
     path: Path, *, directory: bool = False, dir_fd: int | None = None,
@@ -78,7 +95,10 @@ def _open_private(
     if create:
         flags |= os.O_CREAT
     try:
-        descriptor = os.open(path.name if dir_fd is not None else path, flags, 0o600, dir_fd=dir_fd)
+        if create and dir_fd is not None:
+            descriptor = _open_creating(path.name, flags, dir_fd)
+        else:
+            descriptor = os.open(path.name if dir_fd is not None else path, flags, 0o600, dir_fd=dir_fd)
     except FileNotFoundError as exc:
         raise CompositionError(f"{path.name} does not exist") from exc
     except OSError as exc:

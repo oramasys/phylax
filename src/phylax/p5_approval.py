@@ -20,6 +20,8 @@ from secrets import token_urlsafe
 from threading import Lock
 from typing import Callable, Iterator, Protocol
 
+from .sqlite_wal import enable_wal
+
 _DOMAIN = b"phylax-p5-swarm-approval-v1\x00"
 _DEFAULT_PREVIEW_TTL = timedelta(minutes=5)
 _DEFAULT_HUMAN_DURATION_SECONDS = 5_400
@@ -145,6 +147,8 @@ class P5ApprovalDecision:
 
 @dataclass(frozen=True, slots=True)
 class _StoredPreview:
+    """Persisted preview plus its approval-token digest and approved duration."""
+
     preview: P5ApprovalPreview
     approval_token_digest: str | None = None
     approved_duration_seconds: int | None = None
@@ -284,7 +288,7 @@ class SqliteP5ApprovalStore:
         self._connection_timeout = timeout
         try:
             with self._connection() as connection:
-                connection.execute("PRAGMA journal_mode = WAL")
+                enable_wal(connection, timeout=self._connection_timeout)
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS p5_approvals (
@@ -425,7 +429,7 @@ class SqliteP5ApprovalStore:
         """Yield and always close a connection configured for local writers."""
         connection = sqlite3.connect(self._path, timeout=self._connection_timeout, isolation_level=None)
         try:
-            connection.execute("PRAGMA journal_mode = WAL")
+            enable_wal(connection, timeout=self._connection_timeout)
             yield connection
         finally:
             connection.close()

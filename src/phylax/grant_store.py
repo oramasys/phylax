@@ -10,6 +10,8 @@ import sqlite3
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator
 
+from .sqlite_wal import enable_wal
+
 if TYPE_CHECKING:
     from .adjustment_grant import AdjustmentGrant, P5IssuanceAudit
 
@@ -76,6 +78,7 @@ class SqliteGrantAuthorityStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
+        """Open one configured connection with row access and enforced foreign keys."""
         connection = sqlite3.connect(self.path, timeout=self._timeout, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -97,7 +100,7 @@ class SqliteGrantAuthorityStore:
     def _initialize(self) -> None:
         """Create durable tables once; repeated construction is safe."""
         with self._connection() as connection:
-            connection.execute("PRAGMA journal_mode = WAL")
+            enable_wal(connection, timeout=self._timeout)
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version > 1:
                 raise RuntimeError("grant authority store schema is newer than this Phylax build")
@@ -190,24 +193,53 @@ class SqliteGrantAuthorityStore:
         return None if row is None else self._key_record(row)
 
     def register_initial_key(self, record: IssuerKeyRecord) -> None:
-        """Persist, or identically adopt, the pristine initial public key."""
+        """Insert the first key into an empty registry, or refuse.
+
+        Strictly insert-only: it never adopts an existing row, even an identical
+        one. Reconciling a provisioned key with durable state, including a rival
+        worker's concurrent first commit, is ``ensure_active_key``'s single policy.
+        """
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            rows = connection.execute("SELECT * FROM issuer_keys ORDER BY key_id").fetchall()
-            if rows:
-                existing = self._key_record(rows[0]) if len(rows) == 1 else None
-                if (
-                    existing == record
-                    and existing is not None
-                    and existing.status == "active"
-                    and existing.retired_at is None
-                    and existing.retain_until is None
-                    and existing.latest_live_expiry is None
-                ):
-                    connection.commit()
-                    return
+            if connection.execute("SELECT 1 FROM issuer_keys LIMIT 1").fetchone() is not None:
                 connection.rollback()
                 raise ValueError("issuer key registry is already initialized")
+            self._insert_key(connection, record)
+            connection.commit()
+
+    def ensure_active_key(self, record: IssuerKeyRecord) -> None:
+        """Atomically initialize the registry or confirm the durable active key matches.
+
+        The empty-registry decision and the insert share one write transaction, so a
+        worker that raced another worker to first-key initialization adopts the
+        committed key instead of refusing it. A registry that is nonempty but has no
+        active key, or whose active key differs, is still rejected.
+
+        This runs on every start, not only the first. Identity (key id, public key,
+        seed reference) is therefore the whole gate: recording a grant legitimately
+        sets ``latest_live_expiry`` on the active key, so demanding a pristine row
+        would refuse to restart a service that has issued anything. ``one_active_
+        issuer_key`` guarantees a single active row, and only retired keys carry
+        ``retired_at`` or ``retain_until``.
+        """
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                "SELECT * FROM issuer_keys WHERE status = 'active'"
+            ).fetchone()
+            if active is not None:
+                existing = self._key_record(active)
+                connection.rollback()
+                if (
+                    existing.key_id != record.key_id
+                    or existing.public_key != record.public_key
+                    or existing.seed_ref != record.seed_ref
+                ):
+                    raise ValueError("provisioned issuer key does not match the durable active key")
+                return
+            if connection.execute("SELECT 1 FROM issuer_keys LIMIT 1").fetchone() is not None:
+                connection.rollback()
+                raise ValueError("issuer key registry has no active key")
             self._insert_key(connection, record)
             connection.commit()
 
@@ -379,6 +411,7 @@ class SqliteGrantAuthorityStore:
 
     @staticmethod
     def _insert_key(connection: sqlite3.Connection, record: IssuerKeyRecord) -> None:
+        """Insert one issuer key record on an already-open write transaction."""
         connection.execute(
             "INSERT INTO issuer_keys(key_id,public_key,seed_ref,status,retired_at,retain_until,latest_live_expiry) VALUES(?,?,?,?,?,?,?)",
             (
