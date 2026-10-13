@@ -34,6 +34,18 @@ The project maintains at least **80% test coverage**. If a component defines a s
 
 The v1 repositories remain independent legacy authorities. Phylax is a v2 clean-room successor surface and must not gain runtime dependencies on PT or other v1 implementations. Historical v1 material may be used as evidence and parity input only.
 
+## Review intake
+
+`phylax.review_intake` applies the review-remediation doctrine in code. Review
+text is untrusted data: `parse_comment` reduces it to an inert `ReviewFinding`
+(claim, location, severity), sets embedded instructions and suggested edits
+aside unexecuted, scrubs secrets and workstation paths, and refuses text it
+cannot reduce to a claim. `SqliteReviewLedger` keeps the finding -> verdict ->
+commit -> reply trace and refuses to mark a finding applied without a `valid`
+verdict. Applications and replies belong to the verdict they resolved, so a superseded
+verdict reopens the finding. The package performs no network, git or execution; harnesses call it.
+The operating procedure for agents is `src/phylax/review_intake/SKILL.md`.
+
 ## P5 approval satellite
 
 `P5ApprovalAuthority` is a v2-native, strict approval primitive. It mints a
