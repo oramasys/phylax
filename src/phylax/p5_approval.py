@@ -146,8 +146,9 @@ class P5ApprovalDecision:
 
 
 @dataclass(frozen=True, slots=True)
-    """Persisted preview plus its approval-token digest and approved duration."""
 class _StoredPreview:
+    """Persisted preview plus its approval-token digest and approved duration."""
+
     preview: P5ApprovalPreview
     approval_token_digest: str | None = None
     approved_duration_seconds: int | None = None
