@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,6 +17,8 @@ from phylax.grant_composition import (
     GrantAuthorityConfig,
     open_grant_authority,
 )
+from phylax.grant_store import SqliteGrantAuthorityStore
+from phylax.p5_approval import SqliteP5ApprovalStore
 
 SEED_HEX = "11" * 32
 P5_HEX = "22" * 32
@@ -174,6 +178,68 @@ def test_a_state_directory_created_by_a_concurrent_worker_is_accepted(
     )
     authority = open_grant_authority(config(tmp_path, seeds))
     assert authority.verifier_adapter() is not None
+
+
+def test_an_existing_state_file_is_refused_as_a_composition_error(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """A non-directory state path retains the closed configuration error contract."""
+    (tmp_path / "state").write_text("not a directory", encoding="ascii")
+    with pytest.raises(CompositionError, match="must be a directory"):
+        open_grant_authority(config(tmp_path, seeds))
+
+
+def test_two_workers_can_bootstrap_the_same_authority_concurrently(
+    tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identical first-time workers may both adopt the one durable initial key."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    grants = state / "grants.sqlite3"
+    approvals = state / "p5-approvals.sqlite3"
+    grants.touch(mode=0o600)
+    approvals.touch(mode=0o600)
+    SqliteGrantAuthorityStore(grants)
+    SqliteP5ApprovalStore(str(approvals))
+
+    active_barrier = threading.Barrier(2, timeout=5)
+    keys_barrier = threading.Barrier(2, timeout=5)
+    real_active_key = SqliteGrantAuthorityStore.active_key
+    real_keys = SqliteGrantAuthorityStore.keys
+
+    def synchronized_active_key(store: SqliteGrantAuthorityStore):
+        active = real_active_key(store)
+        active_barrier.wait()
+        return active
+
+    def synchronized_keys(store: SqliteGrantAuthorityStore):
+        keys = real_keys(store)
+        keys_barrier.wait()
+        return keys
+
+    monkeypatch.setattr(SqliteGrantAuthorityStore, "active_key", synchronized_active_key)
+    monkeypatch.setattr(SqliteGrantAuthorityStore, "keys", synchronized_keys)
+    deployment = config(tmp_path, seeds)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(open_grant_authority, deployment) for _ in range(2)]
+        authorities = [future.result(timeout=10) for future in futures]
+
+    assert all(authority.verifier_adapter() is not None for authority in authorities)
+
+
+def test_a_different_key_cannot_adopt_an_initialized_registry(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """Idempotent bootstrap never replaces the durable initial key."""
+    open_grant_authority(config(tmp_path, seeds))
+    seed_file(seeds, "issuer-2", "33" * 32)
+
+    with pytest.raises(ValueError, match="does not match"):
+        open_grant_authority(
+            config(tmp_path, seeds, key_id="issuer-2", seed_ref="issuer-2")
+        )
+
+    assert open_grant_authority(config(tmp_path, seeds)).verifier_adapter() is not None
 
 
 def test_a_loose_state_directory_is_refused(tmp_path: Path, seeds: Path) -> None:

@@ -190,10 +190,22 @@ class SqliteGrantAuthorityStore:
         return None if row is None else self._key_record(row)
 
     def register_initial_key(self, record: IssuerKeyRecord) -> None:
-        """Persist the first public key and its external seed reference."""
+        """Persist, or identically adopt, the pristine initial public key."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute("SELECT 1 FROM issuer_keys LIMIT 1").fetchone() is not None:
+            rows = connection.execute("SELECT * FROM issuer_keys ORDER BY key_id").fetchall()
+            if rows:
+                existing = self._key_record(rows[0]) if len(rows) == 1 else None
+                if (
+                    existing == record
+                    and existing is not None
+                    and existing.status == "active"
+                    and existing.retired_at is None
+                    and existing.retain_until is None
+                    and existing.latest_live_expiry is None
+                ):
+                    connection.commit()
+                    return
                 connection.rollback()
                 raise ValueError("issuer key registry is already initialized")
             self._insert_key(connection, record)
