@@ -18,6 +18,7 @@ VerdictKind = Literal["valid", "invalid", "already_fixed", "needs_decision"]
 SEVERITIES: Final = frozenset({"critical", "high", "medium", "low", "info", "unspecified"})
 VERDICT_KINDS: Final = frozenset({"valid", "invalid", "already_fixed", "needs_decision"})
 
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _FINDING_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
@@ -25,6 +26,15 @@ MAX_CLAIM_CHARS: Final = 2_000
 MAX_SUGGESTION_CHARS: Final = 4_000
 MAX_INSTRUCTION_CHARS: Final = 500
 MAX_INSTRUCTIONS: Final = 20
+
+
+def claim_key(claim: str) -> str:
+    """Return the canonical comparison form of a claim: lower-case, single-spaced.
+
+    The finding id and the ledger's collision check both use this one function,
+    so two claims that share an id are, by construction, the same claim.
+    """
+    return " ".join(claim.lower().split())
 
 
 class ReviewIntakeError(ValueError):
@@ -58,10 +68,14 @@ class FindingLocation:
     line: int | None = None
 
     def __post_init__(self) -> None:
-        """Reject absolute, parent-relative or oversized paths and bad line numbers."""
+        """Reject absolute, drive-qualified, control-character or traversing paths and bad lines."""
         if self.path is not None:
             if not self.path or len(self.path) > 512 or self.path.startswith(("/", "~")):
                 raise ReviewIntakeError("location path must be a short repository-relative path")
+            if _DRIVE_RE.match(self.path):
+                raise ReviewIntakeError("location path must not be drive-qualified")
+            if any(ord(char) < 32 or ord(char) == 127 for char in self.path):
+                raise ReviewIntakeError("location path must not contain control characters")
             if ".." in self.path.split("/") or "\\" in self.path:
                 raise ReviewIntakeError("location path must not traverse directories")
         if self.line is not None and (isinstance(self.line, bool) or not isinstance(self.line, int) or self.line < 1):

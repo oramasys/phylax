@@ -22,6 +22,7 @@ from .model import (
     ReviewFinding,
     ReviewIntakeError,
     Severity,
+    claim_key,
     validate_source,
 )
 
@@ -77,6 +78,8 @@ _SECRET_RES = (
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
 )
 _REDACTED: Final = "[REDACTED]"
+_CODE_OMITTED: Final = "[code omitted]"
+_MARKUP = re.compile(r"(\*\*|__|`|^#+[ \t]*|^>[ \t]*)", re.MULTILINE)
 
 
 def normalize_text(text: str) -> str:
@@ -90,6 +93,9 @@ def normalize_text(text: str) -> str:
     if len(text) > MAX_INPUT_CHARS:
         raise ReviewIntakeError("review text exceeds the intake bound")
     kept = []
+    # Line endings first: dropping a bare CR as a control character would glue
+    # the two lines it separated into one word.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     for char in unicodedata.normalize("NFC", text):
         category = unicodedata.category(char)
         if category in {"Cf", "Cs", "Co", "Cn"}:
@@ -97,7 +103,7 @@ def normalize_text(text: str) -> str:
         if category == "Cc" and char not in "\n\t":
             continue
         kept.append(char)
-    return "".join(kept).replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(kept)
 
 
 def scrub(text: str) -> str:
@@ -119,6 +125,25 @@ def _severity(text: str) -> Severity:
 def _collapse(text: str) -> str:
     """Collapse whitespace runs and trim."""
     return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+", " ", text)).strip()
+
+
+def _is_instruction(sentence: str) -> bool:
+    """Report whether a sentence is instruction-shaped or a mutating command."""
+    return bool(_IMPERATIVE.search(sentence) or _MUTATING_COMMAND.search(sentence))
+
+
+def _judge(text: str, quarantined: list[str]) -> str:
+    """Keep claim sentences, setting instruction-shaped ones aside unexecuted."""
+    lines: list[str] = []
+    for raw_line in text.split("\n"):
+        clean = []
+        for sentence in re.split(r"(?<=[.!?])\s+", raw_line.strip()):
+            if sentence and _is_instruction(sentence):
+                quarantined.append(sentence)
+            elif sentence:
+                clean.append(sentence)
+        lines.append(" ".join(clean))
+    return "\n".join(lines)
 
 
 def parse_comment(
@@ -151,7 +176,7 @@ def parse_comment(
             quarantined.append(inner)
         elif lang in {"bash", "sh", "shell", "zsh", "console", "powershell"}:
             quarantined.append(inner)
-        return "\n[code omitted]\n"
+        return f"\n{_CODE_OMITTED}\n"
 
     text = _FENCE.sub(take_fence, text)
     text = _HTML_TAG.sub("", text)
@@ -167,7 +192,7 @@ def parse_comment(
         if skip_section and stripped.startswith(("---", "**", "#")):
             skip_section = False
         if skip_section:
-            if stripped and stripped != "[code omitted]":
+            if stripped and stripped != _CODE_OMITTED:
                 quarantined.append(stripped)
             continue
         # Judge sentence by sentence so one injected clause cannot take a real
@@ -181,23 +206,27 @@ def parse_comment(
         if clean:
             kept.append(" ".join(clean))
 
-    # Scrub before any reformatting so a token cannot be disguised by markup, and
-    # keep single underscores: they are identifiers (adjustment_grant), not emphasis.
-    claim = _collapse(
-        re.sub(r"(\*\*|__|`|^#+[ \t]*|^>[ \t]*)", "", scrub("\n".join(kept)), flags=re.MULTILINE)
-    )[:MAX_CLAIM_CHARS]
-    if not claim:
+    # Scrub before reformatting, then judge and scrub again after: removing markup
+    # can rejoin a token or command that was split by it (``g**it``, ``ghp_AB**CD``).
+    # Single underscores stay: they are identifiers (adjustment_grant), not emphasis.
+    flattened = _MARKUP.sub("", scrub("\n".join(kept)))
+    claim_full = _collapse(scrub(_judge(flattened, quarantined)))
+    if not claim_full.replace(_CODE_OMITTED, "").strip():
         raise ReviewIntakeError("finding has no claim")
+    # Identity covers the whole claim; only the stored display text is bounded, and
+    # an ellipsis marks the cut so the part that distinguishes findings is never
+    # silently dropped from the id.
+    claim = claim_full if len(claim_full) <= MAX_CLAIM_CHARS else claim_full[: MAX_CLAIM_CHARS - 1].rstrip() + "\u2026"
 
     location = FindingLocation(path=path, line=line)
     suggestion = scrub(_collapse("\n".join(suggestions)))[:MAX_SUGGESTION_CHARS]
     instructions = tuple(
-        scrub(_collapse(item))[:MAX_INSTRUCTION_CHARS]
+        scrub(_collapse(_MARKUP.sub("", item)))[:MAX_INSTRUCTION_CHARS]
         for item in quarantined
         if item.strip()
     )[:MAX_INSTRUCTIONS]
     digest = hashlib.sha256(
-        "\0".join((source, path or "", str(line or ""), " ".join(claim.lower().split()))).encode("utf-8")
+        "\0".join((source, path or "", str(line or ""), claim_key(claim_full))).encode("utf-8")
     ).hexdigest()[:32]
     return ReviewFinding(
         finding_id=digest,
