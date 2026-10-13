@@ -10,6 +10,8 @@ import sqlite3
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator
 
+from .sqlite_wal import enable_wal
+
 if TYPE_CHECKING:
     from .adjustment_grant import AdjustmentGrant, P5IssuanceAudit
 
@@ -98,7 +100,7 @@ class SqliteGrantAuthorityStore:
     def _initialize(self) -> None:
         """Create durable tables once; repeated construction is safe."""
         with self._connection() as connection:
-            connection.execute("PRAGMA journal_mode = WAL")
+            enable_wal(connection, timeout=self._timeout)
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version > 1:
                 raise RuntimeError("grant authority store schema is newer than this Phylax build")
