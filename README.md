@@ -90,3 +90,39 @@ default belongs to a separate P5 autonomous policy path. That path is not
 implemented here, and autonomous grant issuance remains unavailable until P5
 defines and authenticates it. The grant issuer does not infer a supervision
 tier from a caller-provided duration.
+
+## Enabling adjustment grants
+
+Merging the issuer does not turn the feature on. A grant is spent only when a
+deployment (1) provisions an issuer seed and a P5 secret, (2) opens the authority,
+and (3) injects its `verifier_adapter()` into the Oramasys consumer. This module
+covers (1) and (2); step (3) belongs to the deployment's composition root.
+
+```python
+from pathlib import Path
+from phylax import GrantAuthorityConfig, open_grant_authority
+
+authority = open_grant_authority(GrantAuthorityConfig(
+    state_dir=Path("/var/lib/oramasys/phylax"),   # created 0700, durable stores
+    seed_root=Path("/etc/oramasys/phylax-seeds"),  # 0700 directory of 0600 hex files
+    key_id="issuer-1", seed_ref="issuer-1", p5_secret_ref="p5-secret",
+))
+verifier = authority.verifier_adapter()  # hand this to the Oramasys composition root
+```
+
+Seeds are 32 bytes in hex, one per file, referenced by file name only; symlinks,
+loose modes, and a seed that does not match the durable active key all refuse to
+start. Not provided: the 900-second autonomous tier, which stays deferred until a
+separately authenticated P5 policy exists, so only the human-approved path issues.
+
+Secret reads are bounded and use the same open descriptor that is checked for
+ownership, type, and private permissions. Each load revalidates the seed root;
+final-component symlinks are refused for both the root and the seed file.
+Authority databases are created with mode 0600 before SQLite opens them. Existing
+databases and SQLite sidecars must be private regular files, and the owner must
+keep the state directory under trusted control during operation. Startup refuses
+unsafe existing permissions rather than silently changing them.
+
+Deployment readiness requires a trusted human interaction boundary that supplies
+the P5 operator evidence, provisioned secrets, and the consumer composition root.
+An issued or merged library alone does not establish that a deployment is ready.
