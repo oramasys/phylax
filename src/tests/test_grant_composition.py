@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import os
+import stat
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from phylax import grant_composition
 from phylax.adjustment_grant import AdjustmentGrantRequest, GrantRefusal
 from phylax.grant_composition import (
     CompositionError,
@@ -378,3 +381,84 @@ def test_non_text_configuration_is_refused(tmp_path: Path, seeds: Path, name: st
     """Runtime configuration mistakes retain the closed configuration error type."""
     with pytest.raises(CompositionError):
         config(tmp_path, seeds, **{name: None})
+
+
+class _RivalCreatesFirst:
+    """``os.open`` stand-in reproducing Darwin's spurious ENOENT for a create loser.
+
+    The first O_CREAT open of the target creates the file as a rival would, then
+    fails the way the kernel does for the loser of a concurrent same-name create.
+    """
+
+    def __init__(self, real_open, target: str, mode: int) -> None:
+        """Remember the real ``os.open``, the contested name and the rival's file mode."""
+        self.real_open = real_open
+        self.target = target
+        self.mode = mode
+        self.calls: list[int] = []
+
+    def __call__(self, path, flags, mode=0o777, *, dir_fd=None):
+        """Create the rival's file once, fail the first create, then pass through."""
+        if path != self.target or dir_fd is None:
+            return self.real_open(path, flags, mode, dir_fd=dir_fd)
+        self.calls.append(flags)
+        if len(self.calls) == 1:
+            descriptor = self.real_open(path, flags, 0o600, dir_fd=dir_fd)
+            os.fchmod(descriptor, self.mode)
+            os.close(descriptor)
+            raise FileNotFoundError(errno.ENOENT, "spurious ENOENT for a create loser")
+        return self.real_open(path, flags, mode, dir_fd=dir_fd)
+
+
+def test_a_create_loser_opens_the_rivals_file_instead_of_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spurious ENOENT on a contested create is retried once, without creating."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    rival = _RivalCreatesFirst(os.open, "grants.sqlite3", 0o600)
+    monkeypatch.setattr(grant_composition.os, "open", rival)
+
+    grant_composition._prepare_state_files(state)
+
+    assert len(rival.calls) == 2
+    assert rival.calls[0] & os.O_CREAT
+    assert not rival.calls[1] & os.O_CREAT
+    assert stat.S_IMODE((state / "grants.sqlite3").stat().st_mode) == 0o600
+
+
+def test_a_create_loser_still_refuses_an_unsafe_file_the_rival_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry path keeps the ownership and mode checks of the normal path."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        grant_composition.os, "open", _RivalCreatesFirst(os.open, "grants.sqlite3", 0o644)
+    )
+
+    with pytest.raises(CompositionError, match="group or others"):
+        grant_composition._prepare_state_files(state)
+
+
+def test_a_vanished_directory_is_refused_after_one_retry_not_looped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persistent ENOENT is a missing directory, so the retry is bounded at one."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    attempts: list[int] = []
+    real_open = os.open
+
+    def always_missing(path, flags, mode=0o777, *, dir_fd=None):
+        """Fail every file open under the directory descriptor."""
+        if dir_fd is None:
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        attempts.append(flags)
+        raise FileNotFoundError(errno.ENOENT, "gone")
+
+    monkeypatch.setattr(grant_composition.os, "open", always_missing)
+
+    with pytest.raises(CompositionError, match="does not exist"):
+        grant_composition._prepare_state_files(state)
+    assert len(attempts) == 2

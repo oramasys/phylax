@@ -193,22 +193,15 @@ class SqliteGrantAuthorityStore:
         return None if row is None else self._key_record(row)
 
     def register_initial_key(self, record: IssuerKeyRecord) -> None:
-        """Persist, or identically adopt, the pristine initial public key."""
+        """Insert the first key into an empty registry, or refuse.
+
+        Strictly insert-only: it never adopts an existing row, even an identical
+        one. Reconciling a provisioned key with durable state, including a rival
+        worker's concurrent first commit, is ``ensure_active_key``'s single policy.
+        """
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            rows = connection.execute("SELECT * FROM issuer_keys ORDER BY key_id").fetchall()
-            if rows:
-                existing = self._key_record(rows[0]) if len(rows) == 1 else None
-                if (
-                    existing == record
-                    and existing is not None
-                    and existing.status == "active"
-                    and existing.retired_at is None
-                    and existing.retain_until is None
-                    and existing.latest_live_expiry is None
-                ):
-                    connection.commit()
-                    return
+            if connection.execute("SELECT 1 FROM issuer_keys LIMIT 1").fetchone() is not None:
                 connection.rollback()
                 raise ValueError("issuer key registry is already initialized")
             self._insert_key(connection, record)
@@ -221,6 +214,13 @@ class SqliteGrantAuthorityStore:
         worker that raced another worker to first-key initialization adopts the
         committed key instead of refusing it. A registry that is nonempty but has no
         active key, or whose active key differs, is still rejected.
+
+        This runs on every start, not only the first. Identity (key id, public key,
+        seed reference) is therefore the whole gate: recording a grant legitimately
+        sets ``latest_live_expiry`` on the active key, so demanding a pristine row
+        would refuse to restart a service that has issued anything. ``one_active_
+        issuer_key`` guarantees a single active row, and only retired keys carry
+        ``retired_at`` or ``retain_until``.
         """
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")

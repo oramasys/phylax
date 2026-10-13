@@ -482,10 +482,8 @@ def test_issuance_follows_a_rotation_made_by_another_authority(tmp_path: Path) -
     first.verify(grant.to_wire())
 
 
-def test_initial_key_registration_is_idempotent_only_for_a_pristine_registry(
-    tmp_path: Path,
-) -> None:
-    """Only the exact lone initial record may be registered more than once."""
+def test_initial_key_registration_is_strict_insert_only(tmp_path: Path) -> None:
+    """Registering the first key never adopts: any existing row refuses, even an identical one."""
     store = SqliteGrantAuthorityStore(tmp_path / "keys.db")
     initial = IssuerKeyRecord(
         "issuer-1", b"1" * 32, "secret-ref:issuer-1", "active", None, None, None
@@ -494,8 +492,9 @@ def test_initial_key_registration_is_idempotent_only_for_a_pristine_registry(
         "issuer-2", b"2" * 32, "secret-ref:issuer-2", "active", None, None, None
     )
     store.register_initial_key(initial)
-    store.register_initial_key(initial)
 
+    with pytest.raises(ValueError, match="already initialized"):
+        store.register_initial_key(initial)
     with pytest.raises(ValueError, match="already initialized"):
         store.register_initial_key(replacement)
 
@@ -513,11 +512,28 @@ def test_initial_key_registration_is_idempotent_only_for_a_pristine_registry(
     with pytest.raises(ValueError, match="already initialized"):
         revoked_store.register_initial_key(revoked)
 
-    historical_store = SqliteGrantAuthorityStore(tmp_path / "historical.db")
-    historical = replace(initial, latest_live_expiry=now + timedelta(minutes=1))
-    historical_store.register_initial_key(historical)
-    with pytest.raises(ValueError, match="already initialized"):
-        historical_store.register_initial_key(historical)
+
+def test_ensure_active_key_adopts_by_identity_so_a_used_key_restarts(tmp_path: Path) -> None:
+    """A key that has since issued grants carries lifecycle metadata and must still be adopted.
+
+    ``ensure_active_key`` runs on every start, not only the first, and recording a
+    grant legitimately sets ``latest_live_expiry`` on the active key. Requiring the
+    stored row to equal a pristine record would make a service refuse to restart
+    after its first grant, so identity (id, public key, seed reference) is the gate.
+    """
+    store = SqliteGrantAuthorityStore(tmp_path / "keys.db")
+    now = Clock().now
+    used = IssuerKeyRecord(
+        "issuer-1", b"1" * 32, "secret-ref:issuer-1", "active",
+        None, None, now + timedelta(minutes=5),
+    )
+    store.register_initial_key(used)
+    pristine = replace(used, latest_live_expiry=None)
+
+    store.ensure_active_key(pristine)
+
+    assert store.keys() == (used,)
+    assert store.active_key() == used
 
 
 class _RivalCommitsFirst(SqliteGrantAuthorityStore):
