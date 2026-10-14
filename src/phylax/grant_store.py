@@ -442,7 +442,16 @@ class SqliteGrantAuthorityStore:
 
 
 class SqliteGrantVerificationStore:
-    """Read grant verification facts from an existing SQLite database only."""
+    """Read grant verification facts from an existing SQLite database only.
+
+    Residual limit (not a full guarantee): the file's type, owner, mode and inode are
+    checked with ``lstat`` and again around each connect, but SQLite still opens the
+    database by path. A process that can write to the containing directory could swap the
+    file in the instant between a check and the open; these checks narrow that window and
+    do not close it. They are sound only while the state directory is private to one user.
+    The tests show the checks fire when a swap is visible, not that the instant swap is
+    impossible. Closing it needs the already-validated connection to be retained.
+    """
 
     def __init__(self, path: str | Path, *, timeout: float = 5.0) -> None:
         """Bind to an existing database using SQLite's read-only URI mode."""
