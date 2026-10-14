@@ -504,6 +504,18 @@ def _open_regular_files() -> dict[int, tuple[os.stat_result, str | None]] | None
     return held
 
 
+def _snapshot_contains_validated_descriptor(
+    snapshot: dict[int, tuple[os.stat_result, str | None]] | None,
+    descriptor: int,
+    identity: tuple[int, int],
+) -> bool:
+    """Return whether a snapshot includes the still-held validated file."""
+    if snapshot is None:
+        return False
+    observed = snapshot.get(descriptor)
+    return observed is not None and (observed[0].st_dev, observed[0].st_ino) == identity
+
+
 def _new_descriptors(
     before: dict[int, tuple[os.stat_result, str | None]],
     after: dict[int, tuple[os.stat_result, str | None]],
@@ -585,9 +597,10 @@ class SqliteGrantVerificationStore:
     read fail closed as unavailable until :meth:`reopen` repeats the full validation. The
     held file is never read through a different path.
 
-    Limits, stated honestly: the descriptor proof needs ``/dev/fd`` (Linux, macOS); where it
-    is absent only the path checks apply. It considers the descriptors opened in the state
-    directory during the single open; a foreign thread that opens the same database file in
+    Limits, stated honestly: the descriptor proof needs a complete ``/dev/fd`` listing
+    (Linux, macOS); where it is absent or incomplete only the path checks apply. It considers
+    the descriptors opened in the state directory during the single open; a foreign thread
+    that opens the same database file in
     that instant, outside this module's open lock, could satisfy it, so it is not a proof
     against such code. If SQLite reuses a descriptor it already held for this inode, no new
     descriptor appears and the open is retried a bounded number of times, then refused.
@@ -659,7 +672,7 @@ class SqliteGrantVerificationStore:
             if (held.st_dev, held.st_ino) != (status.st_dev, status.st_ino):
                 raise PermissionError("grant authority database changed during validation")
             identity = (held.st_dev, held.st_ino)
-            connection = self._connect_proven(resolved, identity)
+            connection = self._connect_proven(resolved, identity, probe=descriptor)
             try:
                 self._check_private_directory(directory_fd)
                 connection.row_factory = sqlite3.Row
@@ -680,8 +693,10 @@ class SqliteGrantVerificationStore:
         self._identity = identity
         self._connection_handle = connection
 
-    def _connect_proven(self, resolved: Path, identity: tuple[int, int]) -> sqlite3.Connection:
-        """Open once under the module open lock and prove SQLite took the validated file."""
+    def _connect_proven(
+        self, resolved: Path, identity: tuple[int, int], *, probe: int
+    ) -> sqlite3.Connection:
+        """Open once and prove SQLite took the file validated by the held ``probe`` fd."""
         directory = str(resolved.parent)
         last: _OpenProofFailed | None = None
         for _ in range(_OPEN_ATTEMPTS):
@@ -697,6 +712,13 @@ class SqliteGrantVerificationStore:
                 try:
                     connection.execute("PRAGMA user_version").fetchone()  # force the open
                     after = _open_regular_files()
+                    if not (
+                        _snapshot_contains_validated_descriptor(before, probe, identity)
+                        and _snapshot_contains_validated_descriptor(after, probe, identity)
+                    ):
+                        # A partial /dev/fd view cannot prove which descriptors SQLite opened.
+                        # Keep the documented path-check fallback for incomplete views.
+                        before = after = None
                     if before is not None and after is not None:
                         _judge_opened(
                             identity,

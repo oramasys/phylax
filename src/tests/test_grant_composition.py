@@ -931,6 +931,23 @@ STATE = "/state"
 DB_NAME = "grants.sqlite3"
 
 
+def test_a_descriptor_snapshot_must_include_the_validated_held_file() -> None:
+    """Only a snapshot containing the exact held descriptor can support open proof."""
+    from phylax.grant_store import _snapshot_contains_validated_descriptor
+
+    identity = (2, 100)
+    complete = {7: (_fake_status(dev=2, ino=100), None)}
+    assert _snapshot_contains_validated_descriptor(complete, 7, identity)
+    assert not _snapshot_contains_validated_descriptor(None, 7, identity)
+    assert not _snapshot_contains_validated_descriptor({}, 7, identity)
+    assert not _snapshot_contains_validated_descriptor(
+        {7: (_fake_status(dev=2, ino=101), None)}, 7, identity
+    )
+    assert not _snapshot_contains_validated_descriptor(
+        {7: (_fake_status(dev=3, ino=100), None)}, 7, identity
+    )
+
+
 def _judge(opened: list) -> None:
     from phylax.grant_store import _judge_opened
 
@@ -1189,10 +1206,10 @@ def test_the_retained_connection_cannot_write(tmp_path: Path, seeds: Path) -> No
             )
 
 
-def test_a_failed_proof_is_retried_and_a_persistent_failure_is_refused(
+def test_an_incomplete_descriptor_listing_falls_back_to_path_checks(
     tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One transient miss is retried; a miss every time is refused after the bound."""
+    """A partial descriptor listing does not make an otherwise private store unavailable."""
     from phylax import grant_store
 
     state = _verifier_state(tmp_path, seeds)
@@ -1218,13 +1235,12 @@ def test_a_failed_proof_is_retried_and_a_persistent_failure_is_refused(
 
     monkeypatch.setattr(grant_store, "_open_regular_files", hide_first_after)
     SqliteGrantVerificationStore(state / "grants.sqlite3").close()
-    assert connects["n"] == 2  # first attempt failed the proof, the second passed
+    assert connects["n"] == 1
 
     connects["n"] = 0
     monkeypatch.setattr(grant_store, "_open_regular_files", lambda: {})
-    with pytest.raises(PermissionError, match="not the file that was validated"):
-        SqliteGrantVerificationStore(state / "grants.sqlite3")
-    assert connects["n"] == grant_store._OPEN_ATTEMPTS
+    SqliteGrantVerificationStore(state / "grants.sqlite3").close()
+    assert connects["n"] == 1
 
 
 @needs_fd_listing
