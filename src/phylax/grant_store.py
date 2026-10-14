@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import math
+import os
 import sqlite3
+import stat
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator
 
@@ -437,3 +439,72 @@ class SqliteGrantAuthorityStore:
             retain_until=_parse_stamp(row["retain_until"]),
             latest_live_expiry=_parse_stamp(row["latest_live_expiry"]),
         )
+
+
+class SqliteGrantVerificationStore:
+    """Read grant verification facts from an existing SQLite database only."""
+
+    def __init__(self, path: str | Path, *, timeout: float = 5.0) -> None:
+        """Bind to an existing database using SQLite's read-only URI mode."""
+        raw_path = Path(path)
+        try:
+            status = raw_path.lstat()
+        except FileNotFoundError:
+            raise FileNotFoundError("grant authority database does not exist")
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+            raise ValueError("grant authority database must be a regular file")
+        if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
+            raise PermissionError("grant authority database is not private to the current user")
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self.path = raw_path.resolve(strict=True)
+        self._uri = self.path.as_uri() + "?mode=ro"
+        self._timeout = timeout
+        with self._connection() as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if version > 1:
+                raise RuntimeError("grant authority store schema is newer than this Phylax build")
+            SqliteGrantAuthorityStore._validate_schema(connection, require_all=True)
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open one query-only connection without creating or migrating state."""
+        connection = sqlite3.connect(
+            self._uri, uri=True, timeout=self._timeout, isolation_level=None
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Close each read-only SQLite connection promptly."""
+        connection = self._connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    def key(self, key_id: str) -> IssuerKeyRecord | None:
+        """Read public key metadata for the exact issuer key identifier."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM issuer_keys WHERE key_id = ?", (key_id,)
+            ).fetchone()
+        return None if row is None else SqliteGrantAuthorityStore._key_record(row)
+
+    def is_issued(self, grant_id: str, payload_digest: str, wire: bytes) -> bool:
+        """Require an exact durable issuance record without mutating the database."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload_digest,grant_wire FROM issued_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+        return row is not None and row["payload_digest"] == payload_digest and bytes(row["grant_wire"]) == wire
+
+    def is_revoked(self, grant_id: str) -> bool:
+        """Read current durable revocation state; SQLite errors fail closed upstream."""
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM grant_revocations WHERE grant_id = ?", (grant_id,)
+            ).fetchone() is not None

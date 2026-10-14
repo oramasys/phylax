@@ -94,6 +94,16 @@ class VerifiedGrant:
     verifier_id: str
 
 
+class GrantVerificationStore(Protocol):
+    """Read-only facts required to validate an issued grant."""
+
+    def key(self, key_id: str) -> IssuerKeyRecord | None: ...
+
+    def is_issued(self, grant_id: str, payload_digest: str, wire: bytes) -> bool: ...
+
+    def is_revoked(self, grant_id: str) -> bool: ...
+
+
 @dataclass(frozen=True, slots=True)
 class RevocationObservation:
     """Durable revocation state with an observation timestamp."""
@@ -627,6 +637,9 @@ class PhylaxGrantAuthority:
         _require_text(verifier_id, "verifier_id")
         self._verifier_id = verifier_id
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._verifier = PhylaxGrantVerifier(
+            store=self._store, verifier_id=verifier_id, clock=lambda: self._clock()
+        )
 
     def issue(
         self,
@@ -680,52 +693,7 @@ class PhylaxGrantAuthority:
 
     def verify(self, wire: bytes) -> VerifiedGrant:
         """Verify durable issuance, signature, time and revocation before projection."""
-        try:
-            grant = AdjustmentGrant.from_wire(wire)
-            try:
-                now = self._now()
-            except (TypeError, ValueError) as exc:
-                raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
-            key = self._store.key(grant.issuer_key_id)
-            if key is None or key.status == "revoked":
-                raise GrantRefusal(GrantRefusalReason.GRANT_KEY_UNKNOWN)
-            if key.status == "retired" and key.retain_until is not None and now > key.retain_until:
-                raise GrantRefusal(GrantRefusalReason.GRANT_KEY_UNKNOWN)
-            if not self._keyring.verify(grant, now=now):
-                raise GrantRefusal(GrantRefusalReason.GRANT_SIGNATURE_INVALID)
-            if grant.issued_at > now + _FUTURE_ISSUANCE_SKEW:
-                raise GrantRefusal(GrantRefusalReason.GRANT_FUTURE_DATED)
-            if now >= grant.expires_at:
-                raise GrantRefusal(GrantRefusalReason.GRANT_EXPIRED)
-            if not self._store.is_issued(grant.grant_id, grant.payload_digest, wire):
-                raise GrantRefusal(GrantRefusalReason.GRANT_MALFORMED)
-            if self._store.is_revoked(grant.grant_id):
-                raise GrantRefusal(GrantRefusalReason.GRANT_REVOKED)
-            return VerifiedGrant(
-                grant_id=grant.grant_id,
-                principal=grant.principal,
-                run_id=grant.run_id,
-                hold_id=grant.hold_id,
-                kind=grant.kind,
-                units=grant.units,
-                units_basis=grant.units_basis,
-                ledger_cost_basis=grant.ledger_cost_basis,
-                hold_fence_epoch=grant.hold_fence_epoch,
-                consumer_lease_epoch=grant.consumer_lease_epoch,
-                ledger_store_id=grant.ledger_store_id,
-                issued_at=grant.issued_at,
-                expires_at=grant.expires_at,
-                payload_digest=grant.payload_digest,
-                verifier_id=self._verifier_id,
-            )
-        except GrantRefusal:
-            raise
-        except NotImplementedError as exc:
-            raise GrantRefusal(GrantRefusalReason.GRANT_SCHEMA_UNSUPPORTED) from exc
-        except (sqlite3.Error, OSError) as exc:
-            raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
-        except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
-            raise GrantRefusal(GrantRefusalReason.GRANT_MALFORMED) from exc
+        return self._verifier.verify(wire)
 
     def revoke(self, grant_id: str) -> None:
         """Durably revoke a grant; a restart cannot make it valid again."""
@@ -739,11 +707,7 @@ class PhylaxGrantAuthority:
 
     def revocation(self, grant_id: str) -> RevocationObservation:
         """Return a durable, timestamped revocation observation for transport."""
-        _require_text(grant_id, "grant_id")
-        try:
-            return RevocationObservation(grant_id, self._store.is_revoked(grant_id), self._now())
-        except (sqlite3.Error, OSError, TypeError, ValueError, AttributeError) as exc:
-            raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
+        return self._verifier.revocation(grant_id)
 
     def revocation_status(self, grant_id: str) -> RevocationObservation:
         """Compatibility spelling for the issuer-side transport operation."""
@@ -751,7 +715,7 @@ class PhylaxGrantAuthority:
 
     def verifier_adapter(self) -> PhylaxAdjustmentGrantVerifier:
         """Return the narrow verify/revocation surface for composition wiring."""
-        return PhylaxAdjustmentGrantVerifier(self)
+        return PhylaxAdjustmentGrantVerifier(self._verifier)
 
     def issuance_audit(self, grant_id: str) -> P5IssuanceAudit | None:
         """Return the opaque P5 issuance evidence without exposing raw receipt tokens."""
@@ -810,17 +774,93 @@ class PhylaxGrantAuthority:
         return _utc_datetime(self._clock(), "authority clock")
 
 
-class PhylaxAdjustmentGrantVerifier:
-    """Structural adapter exposing no signing or grant-management operations."""
+class PhylaxGrantVerifier:
+    """Verify grants using public keys and durable records, with no issuer secrets."""
 
-    def __init__(self, authority: PhylaxGrantAuthority) -> None:
-        """Bind verification to the durable Phylax authority instance."""
-        self._authority = authority
+    def __init__(
+        self,
+        *,
+        store: GrantVerificationStore,
+        verifier_id: str = "phylax-primary",
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        """Bind the verifier to a read-only store and a timestamp source."""
+        _require_text(verifier_id, "verifier_id")
+        self._store = store
+        self._verifier_id = verifier_id
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    def verify(self, wire: bytes) -> VerifiedGrant:
+        """Verify canonical wire, signature, durable issuance, time and revocation."""
+        try:
+            grant = AdjustmentGrant.from_wire(wire)
+            try:
+                now = _utc_datetime(self._clock(), "verifier clock")
+            except (TypeError, ValueError) as exc:
+                raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
+            key = self._store.key(grant.issuer_key_id)
+            if key is None or key.status == "revoked":
+                raise GrantRefusal(GrantRefusalReason.GRANT_KEY_UNKNOWN)
+            if key.status == "retired" and key.retain_until is not None and now > key.retain_until:
+                raise GrantRefusal(GrantRefusalReason.GRANT_KEY_UNKNOWN)
+            if not _verify(key.public_key, grant.canonical_body(), _b64decode(grant.issuer_signature)):
+                raise GrantRefusal(GrantRefusalReason.GRANT_SIGNATURE_INVALID)
+            if grant.issued_at > now + _FUTURE_ISSUANCE_SKEW:
+                raise GrantRefusal(GrantRefusalReason.GRANT_FUTURE_DATED)
+            if now >= grant.expires_at:
+                raise GrantRefusal(GrantRefusalReason.GRANT_EXPIRED)
+            if not self._store.is_issued(grant.grant_id, grant.payload_digest, wire):
+                raise GrantRefusal(GrantRefusalReason.GRANT_MALFORMED)
+            if self._store.is_revoked(grant.grant_id):
+                raise GrantRefusal(GrantRefusalReason.GRANT_REVOKED)
+            return VerifiedGrant(
+                grant_id=grant.grant_id,
+                principal=grant.principal,
+                run_id=grant.run_id,
+                hold_id=grant.hold_id,
+                kind=grant.kind,
+                units=grant.units,
+                units_basis=grant.units_basis,
+                ledger_cost_basis=grant.ledger_cost_basis,
+                hold_fence_epoch=grant.hold_fence_epoch,
+                consumer_lease_epoch=grant.consumer_lease_epoch,
+                ledger_store_id=grant.ledger_store_id,
+                issued_at=grant.issued_at,
+                expires_at=grant.expires_at,
+                payload_digest=grant.payload_digest,
+                verifier_id=self._verifier_id,
+            )
+        except GrantRefusal:
+            raise
+        except NotImplementedError as exc:
+            raise GrantRefusal(GrantRefusalReason.GRANT_SCHEMA_UNSUPPORTED) from exc
+        except (sqlite3.Error, OSError) as exc:
+            raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
+        except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+            raise GrantRefusal(GrantRefusalReason.GRANT_MALFORMED) from exc
+
+    def revocation(self, grant_id: str) -> RevocationObservation:
+        """Return a timestamped observation from the durable revocation index."""
+        _require_text(grant_id, "grant_id")
+        try:
+            revoked = self._store.is_revoked(grant_id)
+            observed_at = _utc_datetime(self._clock(), "verifier clock")
+            return RevocationObservation(grant_id, revoked, observed_at)
+        except (sqlite3.Error, OSError, TypeError, ValueError, AttributeError) as exc:
+            raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
+
+
+class PhylaxAdjustmentGrantVerifier:
+    """Structural consumer adapter exposing no signing or grant-management operations."""
+
+    def __init__(self, verifier: PhylaxGrantVerifier) -> None:
+        """Bind only the public verification surface, not the issuer authority."""
+        self._verifier = verifier
 
     def verify(self, wire: bytes) -> VerifiedGrant:
         """Return the minimal verified projection for the consumer port."""
-        return self._authority.verify(wire)
+        return self._verifier.verify(wire)
 
     def revocation(self, grant_id: str) -> RevocationObservation:
         """Return durable revocation state with its observation time."""
-        return self._authority.revocation(grant_id)
+        return self._verifier.revocation(grant_id)

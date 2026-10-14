@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import errno
 import os
+import sqlite3
 import stat
 import threading
 from datetime import UTC, datetime
@@ -18,9 +19,11 @@ from phylax.grant_composition import (
     CompositionError,
     FileSeedProvider,
     GrantAuthorityConfig,
+    GrantVerifierConfig,
     open_grant_authority,
+    open_grant_verifier,
 )
-from phylax.grant_store import SqliteGrantAuthorityStore
+from phylax.grant_store import SqliteGrantAuthorityStore, SqliteGrantVerificationStore
 from phylax.p5_approval import SqliteP5ApprovalStore
 
 SEED_HEX = "11" * 32
@@ -159,6 +162,70 @@ def test_state_survives_reopening_including_revocation(tmp_path: Path, seeds: Pa
         second.verifier_adapter().verify(grant.to_wire())
     assert refused.value.reason.value == "grant.revoked"
     assert second.verifier_adapter().revocation(grant.grant_id).revoked is True
+
+
+def test_verify_only_opens_existing_state_without_secret_configuration(
+    tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The serving verifier reads durable authority state without issuer secrets."""
+    authority = open_grant_authority(config(tmp_path, seeds))
+    grant = authority.issue(
+        grant_request(), authenticated_principal="local-operator",
+        operator_evidence_ref="trusted-ui://approval/1",
+    )
+
+    def reject_seed_load(self: FileSeedProvider, seed_ref: str) -> bytes:
+        raise AssertionError("verify-only mode attempted to load a signing seed")
+
+    monkeypatch.setattr(FileSeedProvider, "load_seed", reject_seed_load)
+    verifier = open_grant_verifier(
+        GrantVerifierConfig(state_dir=tmp_path / "state", verifier_id="consumer-1")
+    )
+
+    assert verifier.verify(grant.to_wire()).grant_id == grant.grant_id
+    assert verifier.revocation(grant.grant_id).revoked is False
+
+
+def test_verify_only_fails_closed_without_creating_state(tmp_path: Path) -> None:
+    """A serving process never bootstraps issuer state as a side effect."""
+    state = tmp_path / "missing-state"
+
+    with pytest.raises(CompositionError, match="does not exist"):
+        open_grant_verifier(GrantVerifierConfig(state_dir=state))
+
+    assert not state.exists()
+
+
+def test_verify_only_uses_read_only_database_and_observes_revocation(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """The verifier reads WAL-backed revocations without modifying the database."""
+    authority = open_grant_authority(config(tmp_path, seeds))
+    grant = authority.issue(
+        grant_request(), authenticated_principal="local-operator",
+        operator_evidence_ref="trusted-ui://approval/1",
+    )
+    authority.revoke(grant.grant_id)
+    state = tmp_path / "state"
+    database = state / "grants.sqlite3"
+    before = database.read_bytes()
+    database.chmod(0o400)
+    try:
+        store = SqliteGrantVerificationStore(database)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            with store._connection() as connection:
+                connection.execute(
+                    "INSERT INTO grant_revocations(grant_id, revoked_at) VALUES(?, ?)",
+                    ("unauthorized-write", "2026-10-14T00:00:00.000000Z"),
+                )
+        verifier = open_grant_verifier(GrantVerifierConfig(state_dir=state))
+        with pytest.raises(GrantRefusal) as refused:
+            verifier.verify(grant.to_wire())
+        assert refused.value.reason.value == "grant.revoked"
+        assert verifier.revocation(grant.grant_id).revoked is True
+        assert database.read_bytes() == before
+    finally:
+        database.chmod(0o600)
 
 
 def test_a_seed_that_does_not_match_the_durable_key_refuses_to_start(tmp_path: Path, seeds: Path) -> None:
