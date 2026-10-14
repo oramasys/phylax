@@ -9,6 +9,7 @@ import math
 import os
 import sqlite3
 import stat
+import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator
 
@@ -441,46 +442,134 @@ class SqliteGrantAuthorityStore:
         )
 
 
+def _open_regular_files() -> dict[int, os.stat_result] | None:
+    """Return fd -> status for every regular file this process holds, or None if unlistable.
+
+    ``/dev/fd`` exists on Linux and macOS; where it does not, the caller keeps its
+    path-based checks and states that the descriptor proof was unavailable.
+    """
+    try:
+        names = os.listdir("/dev/fd")
+    except OSError:
+        return None
+    held: dict[int, os.stat_result] = {}
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            status = os.fstat(int(name))
+        except OSError:
+            continue
+        if stat.S_ISREG(status.st_mode):
+            held[int(name)] = status
+    return held
+
+
 class SqliteGrantVerificationStore:
     """Read grant verification facts from an existing SQLite database only.
 
-    Residual limit (not a full guarantee): the file's type, owner, mode and inode are
-    checked with ``lstat`` and again around each connect, but SQLite still opens the
-    database by path. A process that can write to the containing directory could swap the
-    file in the instant between a check and the open; these checks narrow that window and
-    do not close it. They are sound only while the state directory is private to one user.
-    The tests show the checks fire when a swap is visible, not that the instant swap is
-    impossible. Closing it needs the already-validated connection to be retained.
+    The database is validated and opened once. The validated file is the one the retained
+    read-only connection holds: after the single open, the descriptors SQLite acquired are
+    compared with the file that was checked (device and inode, owner, private mode), so a
+    swap between the check and the open is refused, including a swap that is put back
+    before a second path check. No operation reopens the path.
+
+    A path that later stops naming the held file (replaced, linked, loosened) makes every
+    read fail closed as unavailable until :meth:`reopen` repeats the full validation. The
+    held file is never read through a different path.
+
+    Limits, stated honestly: the descriptor proof needs ``/dev/fd`` (Linux, macOS); where it
+    is absent only the path checks apply. If SQLite reuses a descriptor it already held for
+    this inode, no new descriptor appears and the open is refused rather than assumed safe;
+    :meth:`reopen` retries. Sidecars are proven only to be private regular files owned by
+    this user, not tied to a path. The checks remain sound only for a state directory that
+    is private to one user.
     """
 
     def __init__(self, path: str | Path, *, timeout: float = 5.0) -> None:
-        """Bind to an existing database using SQLite's read-only URI mode."""
-        raw_path = Path(path)
+        """Validate the database, open it once read-only, and retain the connection."""
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self._timeout = timeout
+        self._lock = threading.RLock()
+        self._connection_handle: sqlite3.Connection | None = None
+        self.path = Path(path)
+        self._open_validated(Path(path))
+
+    @staticmethod
+    def _check_private_regular(status: os.stat_result, *, what: str) -> None:
+        """Refuse anything but a private regular file owned by the effective user."""
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+            raise ValueError(f"{what} must be a regular file")
+        if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
+            raise PermissionError(f"{what} is not private to the current user")
+
+    def _open_validated(self, raw_path: Path) -> None:
+        """Validate on the held object, open once, prove the open took the validated file."""
         try:
             status = raw_path.lstat()
         except FileNotFoundError:
             raise FileNotFoundError("grant authority database does not exist") from None
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
-            raise ValueError("grant authority database must be a regular file")
-        if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
-            raise PermissionError("grant authority database is not private to the current user")
-        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("timeout must be positive")
-        self.path = raw_path.resolve(strict=True)
-        resolved_status = self.path.lstat()
-        if (resolved_status.st_dev, resolved_status.st_ino) != (status.st_dev, status.st_ino):
-            raise PermissionError("grant authority database changed during validation")
-        self._identity = (status.st_dev, status.st_ino)
-        self._uri = self.path.as_uri() + "?mode=ro"
-        self._timeout = timeout
-        with self._connection() as connection:
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version > 1:
-                raise RuntimeError("grant authority store schema is newer than this Phylax build")
-            SqliteGrantAuthorityStore._validate_schema(connection, require_all=True)
+        self._check_private_regular(status, what="grant authority database")
+        resolved = raw_path.resolve(strict=True)
+        # Validate the object itself: the descriptor, not the path, is what is inspected.
+        descriptor = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            held = os.fstat(descriptor)
+            self._check_private_regular(held, what="grant authority database")
+            if (held.st_dev, held.st_ino) != (status.st_dev, status.st_ino):
+                raise PermissionError("grant authority database changed during validation")
+            identity = (held.st_dev, held.st_ino)
+            before = _open_regular_files()
+            connection = sqlite3.connect(
+                resolved.as_uri() + "?mode=ro",
+                uri=True,
+                timeout=self._timeout,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            try:
+                self._prove_open(connection, identity, before)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("PRAGMA foreign_keys = ON")
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version > 1:
+                    raise RuntimeError(
+                        "grant authority store schema is newer than this Phylax build"
+                    )
+                SqliteGrantAuthorityStore._validate_schema(connection, require_all=True)
+            except BaseException:
+                connection.close()
+                raise
+        finally:
+            os.close(descriptor)
+        self.path = resolved
+        self._identity = identity
+        self._connection_handle = connection
+
+    @staticmethod
+    def _prove_open(
+        connection: sqlite3.Connection,
+        identity: tuple[int, int],
+        before: dict[int, os.stat_result] | None,
+    ) -> None:
+        """Refuse unless the descriptors SQLite just opened include the validated file."""
+        connection.execute("PRAGMA user_version").fetchone()  # force the file to open
+        after = _open_regular_files()
+        if before is None or after is None:
+            return
+        opened = [status for fd, status in after.items() if fd not in before]
+        if not any((s.st_dev, s.st_ino) == identity for s in opened):
+            raise PermissionError(
+                "grant authority database opened by SQLite is not the file that was validated"
+            )
+        for status in opened:
+            if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
+                raise PermissionError("a file opened by SQLite is not private to the current user")
 
     def _assert_database_identity(self) -> None:
-        """Refuse a replaced, linked, non-regular, or newly non-private database path."""
+        """Fail closed when the path no longer names the file this store holds."""
         try:
             status = self.path.lstat()
         except FileNotFoundError:
@@ -494,30 +583,29 @@ class SqliteGrantVerificationStore:
         if (status.st_dev, status.st_ino) != self._identity:
             raise PermissionError("grant authority database was replaced after validation")
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open one query-only connection without creating or migrating state."""
-        self._assert_database_identity()
-        connection = sqlite3.connect(
-            self._uri, uri=True, timeout=self._timeout, isolation_level=None
-        )
-        try:
-            self._assert_database_identity()
-        except BaseException:
-            connection.close()
-            raise
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only = ON")
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
-
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        """Close each read-only SQLite connection promptly."""
-        connection = self._connect()
-        try:
+        """Yield the retained read-only connection after confirming the path still matches."""
+        with self._lock:
+            connection = self._connection_handle
+            if connection is None:
+                raise sqlite3.ProgrammingError("grant verification store is closed")
+            self._assert_database_identity()
             yield connection
-        finally:
+
+    def close(self) -> None:
+        """Release the retained connection; every later read fails closed."""
+        with self._lock:
+            connection, self._connection_handle = self._connection_handle, None
+        if connection is not None:
             connection.close()
+
+    def reopen(self) -> None:
+        """Repeat the full validation and open; on failure the store stays closed."""
+        with self._lock:
+            path = self.path
+            self.close()
+            self._open_validated(path)
 
     def key(self, key_id: str) -> IssuerKeyRecord | None:
         """Read public key metadata for the exact issuer key identifier."""

@@ -264,13 +264,13 @@ def open_grant_verifier(
     is avoided so fresh revocations are not hidden behind a stale main-database
     snapshot. No signing seed or P5 secret is loaded by this path.
 
-    Residual limit (not a full guarantee): every check here is made on the path, and SQLite
-    then opens that path as a separate step, so a process that can write to the state
-    directory could swap the file between the check and the open. The store re-checks the
-    file's identity before and after connecting, which narrows that window but does not
-    close it. The safety of this path therefore depends on the state directory being
-    private to one user, which ``_require_private`` enforces. Closing the gap would mean
-    keeping the validated connection instead of reopening by path.
+    The database is validated and opened once by the store, which retains that read-only
+    connection and proves the open took the validated file (device, inode, private owner
+    and mode of every file SQLite opened), so no operation re-resolves the path. A path
+    that later stops naming the held file fails closed as unavailable until the store is
+    reopened. Limits: the descriptor proof needs ``/dev/fd`` (Linux, macOS), and the
+    guarantee still assumes a state directory private to one user, which
+    ``_require_private`` enforces.
     """
     state_dir = Path(config.state_dir)
     _require_private(state_dir, directory=True)

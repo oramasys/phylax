@@ -765,3 +765,133 @@ def test_verify_only_open_does_not_read_secrets_or_write_state(
     assert {k: v for k, v in after.items() if not k.endswith(("-wal", "-shm"))} == {
         k: v for k, v in before.items() if not k.endswith(("-wal", "-shm"))
     }
+
+
+# --- Retained verifier connection ------------------------------------------------------
+# The database is opened once, the open is proven to have taken the validated file, and no
+# later operation reopens the path.
+
+needs_fd_listing = pytest.mark.skipif(
+    not Path("/dev/fd").is_dir(), reason="descriptor proof needs /dev/fd (Linux or macOS)"
+)
+
+
+def _counting_connect(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every sqlite3.connect the store makes, delegating to the real one."""
+    real = sqlite3.connect
+    calls: list[str] = []
+
+    def counting(database, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(database))
+        return real(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", counting)
+    return calls
+
+
+def test_reads_reuse_one_connection_and_never_reopen_the_path(
+    tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After construction no verification, key, issuance or revocation read reconnects."""
+    authority = open_grant_authority(config(tmp_path, seeds))
+    grant = authority.issue(
+        grant_request(), authenticated_principal="local-operator",
+        operator_evidence_ref="trusted-ui://approval/1",
+    )
+    calls = _counting_connect(monkeypatch)
+    verifier = open_grant_verifier(GrantVerifierConfig(state_dir=tmp_path / "state"))
+    assert len(calls) == 1
+    for _ in range(5):
+        verifier.verify(grant.to_wire())
+        verifier.revocation(grant.grant_id)
+    assert len(calls) == 1
+
+
+def test_a_commit_after_open_is_visible_through_the_retained_connection(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """Retaining the connection must not freeze revocation state at open time."""
+    authority = open_grant_authority(config(tmp_path, seeds))
+    grant = authority.issue(
+        grant_request(), authenticated_principal="local-operator",
+        operator_evidence_ref="trusted-ui://approval/1",
+    )
+    store = SqliteGrantVerificationStore(tmp_path / "state" / "grants.sqlite3")
+    assert store.is_revoked(grant.grant_id) is False
+    authority.revoke(grant.grant_id)
+    assert store.is_revoked(grant.grant_id) is True
+
+
+@needs_fd_listing
+def test_a_swap_that_is_put_back_during_connect_is_refused(
+    tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An A-B-A swap passes any before/after path check; the descriptor proof catches it."""
+    state = _verifier_state(tmp_path, seeds)
+    database = state / "grants.sqlite3"
+    original = database.with_name("original.sqlite3")
+    attacker = database.with_name("attacker.sqlite3")
+    attacker.write_bytes(database.read_bytes())
+    attacker.chmod(0o600)
+    real = sqlite3.connect
+
+    def swapping(target, *args, **kwargs):  # type: ignore[no-untyped-def]
+        database.rename(original)
+        attacker.rename(database)
+        try:
+            return real(target, *args, **kwargs)
+        finally:
+            # Make a single read open the swapped-in file, then restore the original path.
+            database.rename(attacker)
+            original.rename(database)
+
+    monkeypatch.setattr(sqlite3, "connect", swapping)
+    with pytest.raises(PermissionError, match="not the file that was validated"):
+        SqliteGrantVerificationStore(database)
+
+
+def test_a_path_swapped_after_open_fails_closed_and_is_not_reopened(
+    tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later replacement is a staleness signal; the path is never read through again."""
+    state = _verifier_state(tmp_path, seeds)
+    database = state / "grants.sqlite3"
+    store = SqliteGrantVerificationStore(database)
+    calls = _counting_connect(monkeypatch)
+    replacement = state / "replacement.sqlite3"
+    replacement.write_bytes(b"not a database")
+    replacement.chmod(0o600)
+    database.unlink()
+    replacement.rename(database)
+    with pytest.raises(PermissionError, match="replaced after validation"):
+        store.is_revoked("grant-1")
+    assert calls == []
+
+
+def test_reopen_revalidates_and_a_failed_reopen_leaves_the_store_closed(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """reopen() is the only way to adopt a replaced file, and it fails closed."""
+    state = _verifier_state(tmp_path, seeds)
+    database = state / "grants.sqlite3"
+    store = SqliteGrantVerificationStore(database)
+    store.reopen()
+    assert store.is_revoked("absent") is False
+
+    real = state / "real.sqlite3"
+    database.replace(real)
+    database.symlink_to(real)
+    with pytest.raises(ValueError, match="regular file"):
+        store.reopen()
+    with pytest.raises(sqlite3.Error):
+        store.is_revoked("absent")
+
+
+def test_a_closed_store_fails_closed_as_a_database_error(tmp_path: Path, seeds: Path) -> None:
+    """Reads after close() raise sqlite3.Error, which verification reports as unavailable."""
+    state = _verifier_state(tmp_path, seeds)
+    store = SqliteGrantVerificationStore(state / "grants.sqlite3")
+    store.close()
+    store.close()
+    with pytest.raises(sqlite3.Error):
+        store.is_revoked("absent")
