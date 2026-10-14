@@ -504,6 +504,25 @@ def _open_regular_files() -> dict[int, tuple[os.stat_result, str | None]] | None
     return held
 
 
+def _new_descriptors(
+    before: dict[int, tuple[os.stat_result, str | None]],
+    after: dict[int, tuple[os.stat_result, str | None]],
+) -> list[tuple[os.stat_result, str | None]]:
+    """Return descriptors in ``after`` that were not already open on the same file.
+
+    A descriptor number can be closed and reused between the scans (by another thread's
+    close and SQLite's next open), so "new" means a (number, device, inode) not seen before,
+    never merely a number not seen before.
+    """
+    seen = {
+        (fd, status.st_dev, status.st_ino) for fd, (status, _path) in before.items()
+    }
+    return [
+        item for fd, item in after.items()
+        if (fd, item[0].st_dev, item[0].st_ino) not in seen
+    ]
+
+
 _SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
@@ -680,7 +699,7 @@ class SqliteGrantVerificationStore:
                             identity,
                             directory,
                             resolved.name,
-                            [item for fd, item in after.items() if fd not in before],
+                            _new_descriptors(before, after),
                         )
                     return connection
                 except _OpenProofFailed as failure:

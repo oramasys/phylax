@@ -991,7 +991,7 @@ def test_unrelated_file_churn_in_the_state_directory_does_not_break_opening(
     worker = threading.Thread(target=churn)
     worker.start()
     try:
-        for _ in range(60):
+        for _ in range(300):
             store = SqliteGrantVerificationStore(state / "grants.sqlite3")
             store.close()
     finally:
@@ -1254,3 +1254,15 @@ def test_the_open_lock_keeps_another_open_of_the_real_file_out_of_the_window(
         release.set()
         for worker in workers:
             worker.join(timeout=10)
+
+
+def test_a_reused_descriptor_number_still_counts_as_newly_opened() -> None:
+    """SQLite can be handed a number another thread just closed; that is still a new file."""
+    from phylax.grant_store import _new_descriptors
+
+    noise = (_fake_status(ino=500, mode=0o644), "/state/notes.txt")
+    database = (_fake_status(ino=100), "/state/grants.sqlite3")
+    other = (_fake_status(ino=7), "/state/other")
+    assert _new_descriptors({7: noise}, {7: database}) == [database]
+    assert _new_descriptors({7: database}, {7: database}) == []
+    assert _new_descriptors({7: noise}, {7: noise, 9: other}) == [other]
