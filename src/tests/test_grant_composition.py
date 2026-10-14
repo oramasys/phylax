@@ -598,3 +598,170 @@ def test_a_vanished_directory_is_refused_after_one_retry_not_looped(
     with pytest.raises(CompositionError, match="does not exist"):
         grant_composition._prepare_state_files(state)
     assert len(attempts) == 2
+
+
+# --- Verify-only refusal matrix -------------------------------------------------------
+# Each case refuses before any grant is read and leaves the durable state untouched.
+
+
+def _verifier_state(tmp_path: Path, seeds: Path) -> Path:
+    """Create real authority state, then return its private state directory."""
+    open_grant_authority(config(tmp_path, seeds))
+    return tmp_path / "state"
+
+
+def _snapshot(state: Path) -> dict[str, bytes]:
+    """Return every file in the state directory as name -> bytes."""
+    return {p.name: p.read_bytes() for p in sorted(state.iterdir()) if p.is_file()}
+
+
+def _refuses_untouched(state: Path, match: str) -> None:
+    """Assert open_grant_verifier refuses with ``match`` and changes nothing on disk."""
+    before = _snapshot(state)
+    with pytest.raises(CompositionError, match=match):
+        open_grant_verifier(GrantVerifierConfig(state_dir=state))
+    assert _snapshot(state) == before
+
+
+def test_verify_only_refuses_a_missing_database_in_an_existing_state_directory(
+    tmp_path: Path,
+) -> None:
+    """A private but empty directory is not a bootstrap opportunity for a verifier."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    with pytest.raises(CompositionError, match="does not exist"):
+        open_grant_verifier(GrantVerifierConfig(state_dir=state))
+    assert list(state.iterdir()) == []
+
+
+def test_verify_only_refuses_a_loose_state_directory(tmp_path: Path, seeds: Path) -> None:
+    """A group- or world-accessible directory cannot be trusted to hold grant state."""
+    state = _verifier_state(tmp_path, seeds)
+    state.chmod(0o755)
+    try:
+        _refuses_untouched(state, "group or others")
+    finally:
+        state.chmod(0o700)
+
+
+def test_verify_only_refuses_a_symlinked_database(tmp_path: Path, seeds: Path) -> None:
+    """A private parent must not authorize following a database symlink."""
+    state = _verifier_state(tmp_path, seeds)
+    real = state / "real.sqlite3"
+    (state / "grants.sqlite3").replace(real)
+    (state / "grants.sqlite3").symlink_to(real)
+    _refuses_untouched(state, "symlink")
+
+
+def test_verify_only_refuses_a_database_that_is_not_a_regular_file(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """A directory at the database path is refused, not opened."""
+    state = _verifier_state(tmp_path, seeds)
+    database = state / "grants.sqlite3"
+    database.replace(state / "kept.sqlite3")
+    database.mkdir(mode=0o700)
+    with pytest.raises(CompositionError, match="regular file"):
+        open_grant_verifier(GrantVerifierConfig(state_dir=state))
+
+
+def test_verify_only_refuses_a_loose_database(tmp_path: Path, seeds: Path) -> None:
+    """Startup reports unsafe permissions without silently tightening them."""
+    state = _verifier_state(tmp_path, seeds)
+    database = state / "grants.sqlite3"
+    database.chmod(0o644)
+    _refuses_untouched(state, "group or others")
+    assert stat.S_IMODE(database.stat().st_mode) == 0o644
+
+
+def test_verify_only_refuses_a_database_owned_by_another_user(
+    tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ownership is compared with the effective uid (simulated: no chown without root)."""
+    state = _verifier_state(tmp_path, seeds)
+    real_uid = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: real_uid + 1)
+    with pytest.raises(CompositionError, match="owned by the current user"):
+        open_grant_verifier(GrantVerifierConfig(state_dir=state))
+    with pytest.raises(PermissionError, match="not private to the current user"):
+        SqliteGrantVerificationStore(state / "grants.sqlite3")
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_verify_only_refuses_a_symlinked_sidecar(
+    tmp_path: Path, seeds: Path, suffix: str
+) -> None:
+    """Sidecar files have the same trust boundary as the database itself."""
+    state = _verifier_state(tmp_path, seeds)
+    outside = seed_file(tmp_path, "outside-sidecar", "sentinel")
+    sidecar = state / ("grants.sqlite3" + suffix)
+    if sidecar.exists():
+        sidecar.unlink()
+    sidecar.symlink_to(outside)
+    _refuses_untouched(state, "symlink")
+    assert outside.read_text(encoding="ascii") == "sentinel\n"
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_verify_only_refuses_a_loose_sidecar(tmp_path: Path, seeds: Path, suffix: str) -> None:
+    """A world-readable sidecar can leak or alter state the database protects."""
+    state = _verifier_state(tmp_path, seeds)
+    sidecar = state / ("grants.sqlite3" + suffix)
+    sidecar.touch(mode=0o644)
+    sidecar.chmod(0o644)
+    _refuses_untouched(state, "group or others")
+
+
+def test_verify_only_refuses_a_newer_schema_without_migrating_it(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """A database written by a newer Phylax build is never read or downgraded."""
+    state = _verifier_state(tmp_path, seeds)
+    database = state / "grants.sqlite3"
+    writer = sqlite3.connect(database, isolation_level=None)
+    try:
+        writer.execute("PRAGMA user_version = 2")
+    finally:
+        writer.close()
+    before = database.read_bytes()
+    with pytest.raises(RuntimeError, match="newer than this Phylax build"):
+        open_grant_verifier(GrantVerifierConfig(state_dir=state))
+    assert database.read_bytes() == before
+
+
+def test_verify_only_store_refuses_a_missing_or_symlinked_path_directly(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """The store enforces its own contract; composition checks are not its only guard."""
+    state = _verifier_state(tmp_path, seeds)
+    with pytest.raises(FileNotFoundError):
+        SqliteGrantVerificationStore(state / "absent.sqlite3")
+    link = state / "link.sqlite3"
+    link.symlink_to(state / "grants.sqlite3")
+    with pytest.raises(ValueError, match="regular file"):
+        SqliteGrantVerificationStore(link)
+
+
+def test_verify_only_open_does_not_read_secrets_or_write_state(
+    tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening and verifying never loads a seed, a P5 secret, or changes durable bytes."""
+    authority = open_grant_authority(config(tmp_path, seeds))
+    grant = authority.issue(
+        grant_request(), authenticated_principal="local-operator",
+        operator_evidence_ref="trusted-ui://approval/1",
+    )
+    state = tmp_path / "state"
+
+    def forbidden(*_a: object, **_k: object) -> bytes:
+        raise AssertionError("verify-only mode read a secret")
+
+    monkeypatch.setattr(FileSeedProvider, "load_seed", forbidden)
+    before = _snapshot(state)
+    verifier = open_grant_verifier(GrantVerifierConfig(state_dir=state))
+    verifier.verify(grant.to_wire())
+    verifier.revocation(grant.grant_id)
+    after = _snapshot(state)
+    assert {k: v for k, v in after.items() if not k.endswith(("-wal", "-shm"))} == {
+        k: v for k, v in before.items() if not k.endswith(("-wal", "-shm"))
+    }
