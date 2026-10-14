@@ -535,9 +535,11 @@ def _judge_opened(
     """Refuse unless the files SQLite opened for this database include the validated file.
 
     Only descriptors whose current path is the database or one of its sidecars in
-    ``directory`` (or whose path cannot be read) are SQLite's candidates, so unrelated
-    files other threads open, even in the same directory, neither satisfy nor break the
-    proof. Every candidate must be a private file owned by this user. The descriptor named
+    ``directory`` are SQLite's named candidates, so unrelated files other threads open,
+    even in the same directory, neither satisfy nor break the proof. Every named candidate
+    must be a private file owned by this user. A descriptor whose path cannot be read (a
+    file closed or unlinked mid-scan) can only count toward the validated identity; it is
+    not privacy-judged, because that identity is the thing being proved. The descriptor named
     exactly like the database must be the validated inode, and a sidecar name must never
     carry that inode, so a hard link of the validated file cannot pose as a sidecar.
     """
@@ -545,7 +547,8 @@ def _judge_opened(
     candidates: list[tuple[os.stat_result, str | None]] = []
     for status, path in opened:
         if path is None:
-            candidates.append((status, None))
+            if (status.st_dev, status.st_ino) == identity:
+                candidates.append((status, None))
         elif os.path.dirname(path) == directory and os.path.basename(path) in (
             sidecars | {database_name}
         ):

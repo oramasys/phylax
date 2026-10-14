@@ -962,17 +962,17 @@ def test_unrelated_files_neither_satisfy_nor_break_the_proof() -> None:
         _judge([(_fake_status(ino=100), f"{STATE}/application.txt")])
 
 
-def test_an_unreadable_descriptor_path_is_treated_as_a_candidate() -> None:
-    """When a path cannot be read the descriptor is judged, not ignored (fail closed)."""
+def test_an_unreadable_descriptor_path_counts_only_toward_the_validated_identity() -> None:
+    """A path that vanished mid-scan can show the file was opened, never veto the open."""
     from phylax.grant_store import _OpenProofFailed
 
-    with pytest.raises(PermissionError, match="not private"):
-        _judge([
-            (_fake_status(ino=100), f"{STATE}/grants.sqlite3"),
-            (_fake_status(ino=7, mode=0o644), None),
-        ])
+    _judge([
+        (_fake_status(ino=100), f"{STATE}/grants.sqlite3"),
+        (_fake_status(ino=7, mode=0o644), None),  # unrelated, closed mid-scan: ignored
+    ])
+    _judge([(_fake_status(ino=100), None)])  # the validated inode itself, path unreadable
     with pytest.raises(_OpenProofFailed):
-        _judge([(_fake_status(ino=7), None)])
+        _judge([(_fake_status(ino=7), None)])  # an unrelated unreadable file proves nothing
 
 
 def test_unrelated_file_churn_in_the_state_directory_does_not_break_opening(
