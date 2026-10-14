@@ -6,11 +6,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import math
+import os
 import sqlite3
+import stat
+import threading
+from collections.abc import Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator
 
 from .sqlite_wal import enable_wal
+
+try:  # POSIX only; where absent the descriptor proof is skipped and path checks remain.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from .adjustment_grant import AdjustmentGrant, P5IssuanceAudit
@@ -79,7 +88,8 @@ class SqliteGrantAuthorityStore:
 
     def _connect(self) -> sqlite3.Connection:
         """Open one configured connection with row access and enforced foreign keys."""
-        connection = sqlite3.connect(self.path, timeout=self._timeout, isolation_level=None)
+        with _OPEN_LOCK:
+            connection = sqlite3.connect(self.path, timeout=self._timeout, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA synchronous = FULL")
@@ -437,3 +447,354 @@ class SqliteGrantAuthorityStore:
             retain_until=_parse_stamp(row["retain_until"]),
             latest_live_expiry=_parse_stamp(row["latest_live_expiry"]),
         )
+
+
+# Serializes every open of a Phylax SQLite file made by this module, so the descriptor
+# snapshot around one open cannot include another of our own opens.
+_OPEN_LOCK = threading.Lock()
+_OPEN_ATTEMPTS = 3
+
+
+class _OpenProofFailed(PermissionError):
+    """SQLite's descriptors did not include the validated file (retryable, then refused)."""
+
+
+def _descriptor_path(descriptor: int) -> str | None:
+    """Return the file's current path for an open descriptor, or None if unavailable."""
+    try:
+        if fcntl is not None and hasattr(fcntl, "F_GETPATH"):
+            raw = fcntl.fcntl(descriptor, fcntl.F_GETPATH, b"\0" * 1024)
+            return os.fsdecode(raw.split(b"\0", 1)[0])
+        return os.readlink(f"/dev/fd/{descriptor}")
+    except (OSError, ValueError):
+        return None
+
+
+def _open_regular_files() -> dict[int, tuple[os.stat_result, str | None]] | None:
+    """Return fd -> (status, current path) for regular files this process holds.
+
+    ``/dev/fd`` exists on Linux and macOS; where it does not, the caller keeps its
+    path-based checks and states that the descriptor proof was unavailable.
+    """
+    try:
+        names = os.listdir("/dev/fd")
+    except OSError:
+        return None
+    held: dict[int, tuple[os.stat_result, str | None]] = {}
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            status = os.fstat(int(name))
+        except OSError:
+            continue
+        if not stat.S_ISREG(status.st_mode):
+            continue
+        path = _descriptor_path(int(name))
+        if path is None:
+            # An unreadable path is judged (fail closed) only if the same descriptor is
+            # still open on the same file; one closed or reused meanwhile is not ours.
+            try:
+                again = os.fstat(int(name))
+            except OSError:
+                continue
+            if (again.st_dev, again.st_ino) != (status.st_dev, status.st_ino):
+                continue
+        held[int(name)] = (status, path)
+    return held
+
+
+def _snapshot_contains_validated_descriptor(
+    snapshot: dict[int, tuple[os.stat_result, str | None]] | None,
+    descriptor: int,
+    identity: tuple[int, int],
+) -> bool:
+    """Return whether a snapshot includes the still-held validated file."""
+    if snapshot is None:
+        return False
+    observed = snapshot.get(descriptor)
+    return observed is not None and (observed[0].st_dev, observed[0].st_ino) == identity
+
+
+def _new_descriptors(
+    before: dict[int, tuple[os.stat_result, str | None]],
+    after: dict[int, tuple[os.stat_result, str | None]],
+) -> list[tuple[os.stat_result, str | None]]:
+    """Return descriptors in ``after`` that were not already open on the same file.
+
+    A descriptor number can be closed and reused between the scans (by another thread's
+    close and SQLite's next open), so "new" means a (number, device, inode) not seen before,
+    never merely a number not seen before.
+    """
+    seen = {
+        (fd, status.st_dev, status.st_ino) for fd, (status, _path) in before.items()
+    }
+    return [
+        item for fd, item in after.items()
+        if (fd, item[0].st_dev, item[0].st_ino) not in seen
+    ]
+
+
+_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _judge_opened(
+    identity: tuple[int, int],
+    directory: str,
+    database_name: str,
+    opened: Iterable[tuple[os.stat_result, str | None]],
+) -> None:
+    """Refuse unless the files SQLite opened for this database include the validated file.
+
+    Only descriptors whose current path is the database or one of its sidecars in
+    ``directory`` are SQLite's named candidates, so unrelated files other threads open,
+    even in the same directory, neither satisfy nor break the proof. Every named candidate
+    must be a private file owned by this user. A descriptor whose path cannot be read (a
+    file closed or unlinked mid-scan) can only count toward the validated identity; it is
+    not privacy-judged, because that identity is the thing being proved. The descriptor named
+    exactly like the database must be the validated inode, and a sidecar name must never
+    carry that inode, so a hard link of the validated file cannot pose as a sidecar.
+    """
+    sidecars = {database_name + suffix for suffix in _SIDECAR_SUFFIXES}
+    candidates: list[tuple[os.stat_result, str | None]] = []
+    for status, path in opened:
+        if path is None:
+            if (status.st_dev, status.st_ino) == identity:
+                candidates.append((status, None))
+        elif os.path.dirname(path) == directory and os.path.basename(path) in (
+            sidecars | {database_name}
+        ):
+            candidates.append((status, os.path.basename(path)))
+    identities = [(s.st_dev, s.st_ino) for s, _ in candidates]
+    if identity not in identities:
+        raise _OpenProofFailed(
+            "grant authority database opened by SQLite is not the file that was validated"
+        )
+    for status, name in candidates:
+        held = (status.st_dev, status.st_ino)
+        if name == database_name and held != identity:
+            raise _OpenProofFailed(
+                "grant authority database opened by SQLite is not the file that was validated"
+            )
+        if name in sidecars and held == identity:
+            raise _OpenProofFailed(
+                "a sidecar descriptor refers to the database file itself"
+            )
+        if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
+            raise PermissionError("a file opened by SQLite is not private to the current user")
+
+
+class SqliteGrantVerificationStore:
+    """Read grant verification facts from an existing SQLite database only.
+
+    The database is validated and opened once. The validated file is the one the retained
+    read-only connection holds: after the single open, the descriptors SQLite acquired are
+    compared with the file that was checked (device and inode, owner, private mode), so a
+    swap between the check and the open is refused, including a swap that is put back
+    before a second path check. No operation reopens the path.
+
+    A path that later stops naming the held file (replaced, linked, loosened) makes every
+    read fail closed as unavailable until :meth:`reopen` repeats the full validation. The
+    held file is never read through a different path.
+
+    Limits, stated honestly: the descriptor proof needs a complete ``/dev/fd`` listing
+    (Linux, macOS); where it is absent or incomplete only the path checks apply. It considers
+    the descriptors opened in the state directory during the single open; a foreign thread
+    that opens the same database file in
+    that instant, outside this module's open lock, could satisfy it, so it is not a proof
+    against such code. If SQLite reuses a descriptor it already held for this inode, no new
+    descriptor appears and the open is retried a bounded number of times, then refused.
+    Layers, strongest first: the state directory is checked on a held descriptor before and
+    after the open (owned by this user, no group or other access), which is the boundary
+    that excludes every other user; the database must have exactly one link; the open is
+    proven by descriptor identity with role rules (the descriptor named like the database
+    is the validated inode, and no sidecar name carries that inode). A same-user or root
+    attacker is outside this boundary: it can already read the keys and the process. The
+    descriptor role cannot be read from the kernel, so a hard link that is removed before
+    the scan is not distinguishable from a legitimate open by this proof alone.
+    """
+
+    def __init__(self, path: str | Path, *, timeout: float = 5.0) -> None:
+        """Validate the database, open it once read-only, and retain the connection."""
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self._timeout = timeout
+        self._lock = threading.RLock()
+        self._connection_handle: sqlite3.Connection | None = None
+        self.path = Path(path)
+        self._open_validated(Path(path))
+
+    @staticmethod
+    def _check_private_regular(status: os.stat_result, *, what: str) -> None:
+        """Refuse anything but a private regular file owned by the effective user."""
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+            raise ValueError(f"{what} must be a regular file")
+        if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
+            raise PermissionError(f"{what} is not private to the current user")
+
+    def _open_validated(self, raw_path: Path) -> None:
+        """Validate on the held object, open once, prove the open took the validated file."""
+        try:
+            status = raw_path.lstat()
+        except FileNotFoundError:
+            raise FileNotFoundError("grant authority database does not exist") from None
+        self._check_private_regular(status, what="grant authority database")
+        resolved = raw_path.resolve(strict=True)
+        # Validate the object itself: the descriptor, not the path, is what is inspected.
+        directory_fd = os.open(
+            resolved.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        try:
+            self._check_private_directory(directory_fd)
+            self._open_on_descriptor(resolved, status, directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _check_private_directory(directory_fd: int) -> None:
+        """Refuse a state directory that anyone but this user could write to."""
+        status = os.fstat(directory_fd)
+        if not stat.S_ISDIR(status.st_mode):
+            raise ValueError("grant authority state path must be a directory")
+        if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
+            raise PermissionError("grant authority state directory is not private")
+
+    def _open_on_descriptor(
+        self, resolved: Path, status: os.stat_result, directory_fd: int
+    ) -> None:
+        """Open the validated file once; re-check the directory is still private after."""
+        descriptor = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            held = os.fstat(descriptor)
+            self._check_private_regular(held, what="grant authority database")
+            if held.st_nlink != 1:
+                raise PermissionError("grant authority database must have exactly one link")
+            if (held.st_dev, held.st_ino) != (status.st_dev, status.st_ino):
+                raise PermissionError("grant authority database changed during validation")
+            identity = (held.st_dev, held.st_ino)
+            connection = self._connect_proven(resolved, identity, probe=descriptor)
+            try:
+                self._check_private_directory(directory_fd)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("PRAGMA foreign_keys = ON")
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version > 1:
+                    raise RuntimeError(
+                        "grant authority store schema is newer than this Phylax build"
+                    )
+                SqliteGrantAuthorityStore._validate_schema(connection, require_all=True)
+            except BaseException:
+                connection.close()
+                raise
+        finally:
+            os.close(descriptor)
+        self.path = resolved
+        self._identity = identity
+        self._connection_handle = connection
+
+    def _connect_proven(
+        self, resolved: Path, identity: tuple[int, int], *, probe: int
+    ) -> sqlite3.Connection:
+        """Open once and prove SQLite took the file validated by the held ``probe`` fd."""
+        directory = str(resolved.parent)
+        last: _OpenProofFailed | None = None
+        for _ in range(_OPEN_ATTEMPTS):
+            with _OPEN_LOCK:
+                before = _open_regular_files()
+                connection = sqlite3.connect(
+                    resolved.as_uri() + "?mode=ro",
+                    uri=True,
+                    timeout=self._timeout,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                try:
+                    connection.execute("PRAGMA user_version").fetchone()  # force the open
+                    after = _open_regular_files()
+                    if not (
+                        _snapshot_contains_validated_descriptor(before, probe, identity)
+                        and _snapshot_contains_validated_descriptor(after, probe, identity)
+                    ):
+                        # A partial /dev/fd view cannot prove which descriptors SQLite opened.
+                        # Keep the documented path-check fallback for incomplete views.
+                        before = after = None
+                    if before is not None and after is not None:
+                        _judge_opened(
+                            identity,
+                            directory,
+                            resolved.name,
+                            _new_descriptors(before, after),
+                        )
+                    return connection
+                except _OpenProofFailed as failure:
+                    connection.close()
+                    last = failure
+                except BaseException:
+                    connection.close()
+                    raise
+        assert last is not None
+        raise last
+
+    def _assert_database_identity(self) -> None:
+        """Fail closed when the path no longer names the file this store holds."""
+        try:
+            status = self.path.lstat()
+        except FileNotFoundError:
+            raise FileNotFoundError("grant authority database does not exist") from None
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+            # An OSError subtype: a path that changed after open is a verifier fault
+            # (verifier.unavailable), not evidence that the presented grant is malformed.
+            raise PermissionError("grant authority database must be a regular file")
+        if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
+            raise PermissionError("grant authority database is not private to the current user")
+        if (status.st_dev, status.st_ino) != self._identity:
+            raise PermissionError("grant authority database was replaced after validation")
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Yield the retained read-only connection after confirming the path still matches."""
+        with self._lock:
+            connection = self._connection_handle
+            if connection is None:
+                raise sqlite3.ProgrammingError("grant verification store is closed")
+            self._assert_database_identity()
+            yield connection
+
+    def close(self) -> None:
+        """Release the retained connection; every later read fails closed."""
+        with self._lock:
+            connection, self._connection_handle = self._connection_handle, None
+        if connection is not None:
+            connection.close()
+
+    def reopen(self) -> None:
+        """Repeat the full validation and open; on failure the store stays closed."""
+        with self._lock:
+            path = self.path
+            self.close()
+            self._open_validated(path)
+
+    def key(self, key_id: str) -> IssuerKeyRecord | None:
+        """Read public key metadata for the exact issuer key identifier."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM issuer_keys WHERE key_id = ?", (key_id,)
+            ).fetchone()
+        return None if row is None else SqliteGrantAuthorityStore._key_record(row)
+
+    def is_issued(self, grant_id: str, payload_digest: str, wire: bytes) -> bool:
+        """Require an exact durable issuance record without mutating the database."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload_digest,grant_wire FROM issued_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+        return row is not None and row["payload_digest"] == payload_digest and bytes(row["grant_wire"]) == wire
+
+    def is_revoked(self, grant_id: str) -> bool:
+        """Read current durable revocation state; SQLite errors fail closed upstream."""
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM grant_revocations WHERE grant_id = ?", (grant_id,)
+            ).fetchone() is not None

@@ -25,8 +25,13 @@ from typing import Callable, Final, Iterator
 
 from nacl.bindings import crypto_sign_SEEDBYTES
 
-from .adjustment_grant import PhylaxGrantAuthority, RotatingIssuerKeyring
-from .grant_store import SqliteGrantAuthorityStore
+from .adjustment_grant import (
+    PhylaxAdjustmentGrantVerifier,
+    PhylaxGrantAuthority,
+    PhylaxGrantVerifier,
+    RotatingIssuerKeyring,
+)
+from .grant_store import SqliteGrantAuthorityStore, SqliteGrantVerificationStore
 from .p5_approval import P5ApprovalAuthority, SqliteP5ApprovalStore
 
 _REF_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -37,6 +42,19 @@ _SEED_HEX_RE: Final = re.compile(rb"[0-9A-Fa-f]{%d}" % (crypto_sign_SEEDBYTES * 
 
 class CompositionError(ValueError):
     """Raised when configuration, a secret file or a state directory is unsafe."""
+
+
+@dataclass(frozen=True, slots=True)
+class GrantVerifierConfig:
+    """Minimal serving configuration; it intentionally has no secret references."""
+
+    state_dir: Path
+    verifier_id: str = "phylax-primary"
+
+    def __post_init__(self) -> None:
+        """Reject an empty verifier identity before opening durable state."""
+        if not isinstance(self.verifier_id, str) or not self.verifier_id.strip():
+            raise CompositionError("verifier_id is required")
 
 
 def _require_private(
@@ -231,3 +249,45 @@ def open_grant_authority(
         verifier_id=config.verifier_id,
         clock=clock,
     )
+
+
+def open_grant_verifier(
+    config: GrantVerifierConfig,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> PhylaxAdjustmentGrantVerifier:
+    """Open a verifier from existing state without reading or creating secrets/state.
+
+    The database is opened with SQLite ``mode=ro`` and query-only enforcement.
+    WAL may still require its shared-memory sidecar for coordination, so the
+    private state directory must permit that SQLite bookkeeping. Immutable mode
+    is avoided so fresh revocations are not hidden behind a stale main-database
+    snapshot. No signing seed or P5 secret is loaded by this path.
+
+    The database is validated and opened once by the store, which retains that read-only
+    connection and proves the open took the validated file (device, inode, private owner
+    and mode of every file SQLite opened), so no operation re-resolves the path. A path
+    that later stops naming the held file fails closed as unavailable until the store is
+    reopened. Limits: the descriptor proof needs ``/dev/fd`` (Linux, macOS), and the
+    guarantee still assumes a state directory private to one user, which
+    ``_require_private`` enforces.
+    """
+    state_dir = Path(config.state_dir)
+    _require_private(state_dir, directory=True)
+    database = state_dir / "grants.sqlite3"
+    _require_private(database, directory=False)
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = state_dir / (database.name + suffix)
+        try:
+            os.lstat(sidecar)
+        except FileNotFoundError:
+            continue
+        _require_private(sidecar, directory=False)
+    try:
+        store = SqliteGrantVerificationStore(database)
+    except FileNotFoundError as exc:
+        raise CompositionError("grants.sqlite3 does not exist") from exc
+    verifier = PhylaxGrantVerifier(
+        store=store, verifier_id=config.verifier_id, clock=clock
+    )
+    return PhylaxAdjustmentGrantVerifier(verifier)
