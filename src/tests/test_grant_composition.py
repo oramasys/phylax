@@ -228,6 +228,26 @@ def test_verify_only_uses_read_only_database_and_observes_revocation(
         database.chmod(0o600)
 
 
+def test_verify_only_adapter_closes_its_retained_connection(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """The serving adapter exposes only lifecycle cleanup after verification opens."""
+    authority = open_grant_authority(config(tmp_path, seeds))
+    grant = authority.issue(
+        grant_request(),
+        authenticated_principal="local-operator",
+        operator_evidence_ref="trusted-ui://approval/1",
+    )
+    verifier = open_grant_verifier(GrantVerifierConfig(state_dir=tmp_path / "state"))
+
+    verifier.close()
+    verifier.close()
+
+    with pytest.raises(GrantRefusal) as refused:
+        verifier.verify(grant.to_wire())
+    assert refused.value.reason.value == "verifier.unavailable"
+
+
 def test_verify_only_refuses_database_replaced_after_validation(
     tmp_path: Path, seeds: Path
 ) -> None:

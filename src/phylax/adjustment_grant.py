@@ -849,6 +849,10 @@ class PhylaxGrantVerifier:
         except (sqlite3.Error, OSError, TypeError, ValueError, AttributeError) as exc:
             raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
 
+    def close(self) -> None:
+        """Release the read-only verification store without exposing issuer operations."""
+        self._store.close()
+
 
 class PhylaxAdjustmentGrantVerifier:
     """Structural consumer adapter exposing no signing or grant-management operations."""
@@ -864,3 +868,7 @@ class PhylaxAdjustmentGrantVerifier:
     def revocation(self, grant_id: str) -> RevocationObservation:
         """Return durable revocation state with its observation time."""
         return self._verifier.revocation(grant_id)
+
+    def close(self) -> None:
+        """Release retained verification resources during the consumer's shutdown."""
+        self._verifier.close()
