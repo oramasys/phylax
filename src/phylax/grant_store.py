@@ -477,7 +477,9 @@ class SqliteGrantVerificationStore:
         except FileNotFoundError:
             raise FileNotFoundError("grant authority database does not exist") from None
         if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
-            raise ValueError("grant authority database must be a regular file")
+            # An OSError subtype: a path that changed after open is a verifier fault
+            # (verifier.unavailable), not evidence that the presented grant is malformed.
+            raise PermissionError("grant authority database must be a regular file")
         if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
             raise PermissionError("grant authority database is not private to the current user")
         if (status.st_dev, status.st_ino) != self._identity:

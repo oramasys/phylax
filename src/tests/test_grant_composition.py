@@ -247,6 +247,28 @@ def test_verify_only_refuses_database_replaced_after_validation(
         store.is_revoked("grant-1")
 
 
+def test_verifier_reports_a_symlinked_database_as_unavailable(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """A database path turned into a symlink is a verifier fault, not a malformed grant."""
+    authority = open_grant_authority(config(tmp_path, seeds))
+    grant = authority.issue(
+        grant_request(), authenticated_principal="local-operator",
+        operator_evidence_ref="trusted-ui://approval/1",
+    )
+    database = tmp_path / "state" / "grants.sqlite3"
+    verifier = open_grant_verifier(GrantVerifierConfig(state_dir=database.parent))
+    store = SqliteGrantVerificationStore(database)
+    real = database.with_name("real.sqlite3")
+    database.replace(real)
+    database.symlink_to(real)
+    with pytest.raises(GrantRefusal) as refused:
+        verifier.verify(grant.to_wire())
+    assert refused.value.reason.value == "verifier.unavailable"
+    with pytest.raises(OSError, match="regular file"):
+        store.is_revoked(grant.grant_id)
+
+
 def test_open_verifier_observes_revoke_while_wal_reader_is_active(
     tmp_path: Path, seeds: Path
 ) -> None:
