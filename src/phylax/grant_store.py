@@ -504,10 +504,13 @@ def _open_regular_files() -> dict[int, tuple[os.stat_result, str | None]] | None
     return held
 
 
+_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
 def _judge_opened(
     identity: tuple[int, int],
     directory: str,
-    names: frozenset[str],
+    database_name: str,
     opened: Iterable[tuple[os.stat_result, str | None]],
 ) -> None:
     """Refuse unless the files SQLite opened for this database include the validated file.
@@ -515,18 +518,34 @@ def _judge_opened(
     Only descriptors whose current path is the database or one of its sidecars in
     ``directory`` (or whose path cannot be read) are SQLite's candidates, so unrelated
     files other threads open, even in the same directory, neither satisfy nor break the
-    proof. Every candidate must be a private file owned by this user.
+    proof. Every candidate must be a private file owned by this user. The descriptor named
+    exactly like the database must be the validated inode, and a sidecar name must never
+    carry that inode, so a hard link of the validated file cannot pose as a sidecar.
     """
-    candidates = [
-        status for status, path in opened
-        if path is None
-        or (os.path.dirname(path) == directory and os.path.basename(path) in names)
-    ]
-    if not any((s.st_dev, s.st_ino) == identity for s in candidates):
+    sidecars = {database_name + suffix for suffix in _SIDECAR_SUFFIXES}
+    candidates: list[tuple[os.stat_result, str | None]] = []
+    for status, path in opened:
+        if path is None:
+            candidates.append((status, None))
+        elif os.path.dirname(path) == directory and os.path.basename(path) in (
+            sidecars | {database_name}
+        ):
+            candidates.append((status, os.path.basename(path)))
+    identities = [(s.st_dev, s.st_ino) for s, _ in candidates]
+    if identity not in identities:
         raise _OpenProofFailed(
             "grant authority database opened by SQLite is not the file that was validated"
         )
-    for status in candidates:
+    for status, name in candidates:
+        held = (status.st_dev, status.st_ino)
+        if name == database_name and held != identity:
+            raise _OpenProofFailed(
+                "grant authority database opened by SQLite is not the file that was validated"
+            )
+        if name in sidecars and held == identity:
+            raise _OpenProofFailed(
+                "a sidecar descriptor refers to the database file itself"
+            )
         if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
             raise PermissionError("a file opened by SQLite is not private to the current user")
 
@@ -550,8 +569,14 @@ class SqliteGrantVerificationStore:
     that instant, outside this module's open lock, could satisfy it, so it is not a proof
     against such code. If SQLite reuses a descriptor it already held for this inode, no new
     descriptor appears and the open is retried a bounded number of times, then refused.
-    Sidecars are proven only to be private regular files owned by this user, not tied to a
-    path. The checks remain sound only for a state directory that is private to one user.
+    Layers, strongest first: the state directory is checked on a held descriptor before and
+    after the open (owned by this user, no group or other access), which is the boundary
+    that excludes every other user; the database must have exactly one link; the open is
+    proven by descriptor identity with role rules (the descriptor named like the database
+    is the validated inode, and no sidecar name carries that inode). A same-user or root
+    attacker is outside this boundary: it can already read the keys and the process. The
+    descriptor role cannot be read from the kernel, so a hard link that is removed before
+    the scan is not distinguishable from a legitimate open by this proof alone.
     """
 
     def __init__(self, path: str | Path, *, timeout: float = 5.0) -> None:
@@ -581,15 +606,40 @@ class SqliteGrantVerificationStore:
         self._check_private_regular(status, what="grant authority database")
         resolved = raw_path.resolve(strict=True)
         # Validate the object itself: the descriptor, not the path, is what is inspected.
+        directory_fd = os.open(
+            resolved.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        try:
+            self._check_private_directory(directory_fd)
+            self._open_on_descriptor(resolved, status, directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _check_private_directory(directory_fd: int) -> None:
+        """Refuse a state directory that anyone but this user could write to."""
+        status = os.fstat(directory_fd)
+        if not stat.S_ISDIR(status.st_mode):
+            raise ValueError("grant authority state path must be a directory")
+        if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
+            raise PermissionError("grant authority state directory is not private")
+
+    def _open_on_descriptor(
+        self, resolved: Path, status: os.stat_result, directory_fd: int
+    ) -> None:
+        """Open the validated file once; re-check the directory is still private after."""
         descriptor = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             held = os.fstat(descriptor)
             self._check_private_regular(held, what="grant authority database")
+            if held.st_nlink != 1:
+                raise PermissionError("grant authority database must have exactly one link")
             if (held.st_dev, held.st_ino) != (status.st_dev, status.st_ino):
                 raise PermissionError("grant authority database changed during validation")
             identity = (held.st_dev, held.st_ino)
             connection = self._connect_proven(resolved, identity)
             try:
+                self._check_private_directory(directory_fd)
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA query_only = ON")
                 connection.execute("PRAGMA foreign_keys = ON")
@@ -611,9 +661,6 @@ class SqliteGrantVerificationStore:
     def _connect_proven(self, resolved: Path, identity: tuple[int, int]) -> sqlite3.Connection:
         """Open once under the module open lock and prove SQLite took the validated file."""
         directory = str(resolved.parent)
-        names = frozenset(
-            resolved.name + suffix for suffix in ("", "-wal", "-shm", "-journal")
-        )
         last: _OpenProofFailed | None = None
         for _ in range(_OPEN_ATTEMPTS):
             with _OPEN_LOCK:
@@ -632,7 +679,7 @@ class SqliteGrantVerificationStore:
                         _judge_opened(
                             identity,
                             directory,
-                            names,
+                            resolved.name,
                             [item for fd, item in after.items() if fd not in before],
                         )
                     return connection
