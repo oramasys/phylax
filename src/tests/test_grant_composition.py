@@ -895,3 +895,180 @@ def test_a_closed_store_fails_closed_as_a_database_error(tmp_path: Path, seeds: 
     store.close()
     with pytest.raises(sqlite3.Error):
         store.is_revoked("absent")
+
+
+# --- Descriptor proof: scope, privacy checks, concurrency ------------------------------
+
+
+def _fake_status(*, ino: int, uid: int | None = None, mode: int = 0o600, dev: int = 1) -> os.stat_result:
+    """Build a regular-file stat result without touching the filesystem."""
+    owner = os.geteuid() if uid is None else uid
+    return os.stat_result((stat.S_IFREG | mode, ino, dev, 1, owner, 0, 0, 0, 0, 0))
+
+
+DB_IDENTITY = (1, 100)
+STATE = "/state"
+NAMES = frozenset({"grants.sqlite3", "grants.sqlite3-wal", "grants.sqlite3-shm", "grants.sqlite3-journal"})
+
+
+def _judge(opened: list) -> None:
+    from phylax.grant_store import _judge_opened
+
+    _judge_opened(DB_IDENTITY, STATE, NAMES, opened)
+
+
+def test_the_proof_accepts_the_validated_file_with_private_sidecars() -> None:
+    """The database inode plus private -wal and -shm files is the normal WAL open."""
+    _judge([
+        (_fake_status(ino=100), f"{STATE}/grants.sqlite3"),
+        (_fake_status(ino=101), f"{STATE}/grants.sqlite3-wal"),
+        (_fake_status(ino=102), f"{STATE}/grants.sqlite3-shm"),
+    ])
+
+
+def test_the_proof_refuses_when_sqlite_opened_a_different_inode() -> None:
+    """A swapped-in file is refused even though the path later names the original."""
+    from phylax.grant_store import _OpenProofFailed
+
+    with pytest.raises(_OpenProofFailed, match="not the file that was validated"):
+        _judge([(_fake_status(ino=999), f"{STATE}/grants.sqlite3")])
+    with pytest.raises(_OpenProofFailed):
+        _judge([])
+
+
+@pytest.mark.parametrize("bad", [
+    {"mode": 0o644}, {"mode": 0o660}, {"mode": 0o604}, {"uid": os.geteuid() + 1},
+])
+def test_the_proof_refuses_a_loose_or_foreign_sqlite_file(bad: dict) -> None:
+    """Every file SQLite opened for this database must be private and ours."""
+    with pytest.raises(PermissionError, match="not private"):
+        _judge([
+            (_fake_status(ino=100), f"{STATE}/grants.sqlite3"),
+            (_fake_status(ino=101, **bad), f"{STATE}/grants.sqlite3-wal"),
+        ])
+
+
+def test_unrelated_files_neither_satisfy_nor_break_the_proof() -> None:
+    """Other threads' files, even loose ones in the same directory, are out of scope."""
+    _judge([
+        (_fake_status(ino=100), f"{STATE}/grants.sqlite3"),
+        (_fake_status(ino=500, mode=0o644), f"{STATE}/application.txt"),
+        (_fake_status(ino=501, mode=0o644), "/var/log/elsewhere.txt"),
+        (_fake_status(ino=100, dev=1), "/elsewhere/other-name"),
+    ])
+    from phylax.grant_store import _OpenProofFailed
+
+    with pytest.raises(_OpenProofFailed):  # the same inode under an unrelated name is not enough
+        _judge([(_fake_status(ino=100), f"{STATE}/application.txt")])
+
+
+def test_an_unreadable_descriptor_path_is_treated_as_a_candidate() -> None:
+    """When a path cannot be read the descriptor is judged, not ignored (fail closed)."""
+    from phylax.grant_store import _OpenProofFailed
+
+    with pytest.raises(PermissionError, match="not private"):
+        _judge([
+            (_fake_status(ino=100), f"{STATE}/grants.sqlite3"),
+            (_fake_status(ino=7, mode=0o644), None),
+        ])
+    with pytest.raises(_OpenProofFailed):
+        _judge([(_fake_status(ino=7), None)])
+
+
+def test_unrelated_file_churn_in_the_state_directory_does_not_break_opening(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """A loose file opened and closed beside the database must not cause a false refusal."""
+    state = _verifier_state(tmp_path, seeds)
+    noise = state / "operator-notes.txt"
+    stop = threading.Event()
+
+    def churn() -> None:
+        while not stop.is_set():
+            fd = os.open(noise, os.O_WRONLY | os.O_CREAT, 0o644)
+            os.close(fd)
+
+    worker = threading.Thread(target=churn)
+    worker.start()
+    try:
+        for _ in range(60):
+            store = SqliteGrantVerificationStore(state / "grants.sqlite3")
+            store.close()
+    finally:
+        stop.set()
+        worker.join()
+
+
+def test_concurrent_reads_and_reopen_never_corrupt_or_crash(tmp_path: Path, seeds: Path) -> None:
+    """Readers racing close/reopen see a result or a database error, nothing else."""
+    state = _verifier_state(tmp_path, seeds)
+    store = SqliteGrantVerificationStore(state / "grants.sqlite3")
+    unexpected: list[BaseException] = []
+
+    def reader() -> None:
+        for _ in range(60):
+            try:
+                assert store.is_revoked("absent") is False
+            except (sqlite3.Error, OSError):
+                pass
+            except BaseException as error:  # noqa: BLE001 - the point is to catch anything else
+                unexpected.append(error)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(reader) for _ in range(5)]
+        for _ in range(15):
+            store.reopen()
+        for future in futures:
+            future.result()
+    assert unexpected == []
+    assert store.is_revoked("absent") is False
+
+
+def test_open_refuses_a_path_swapped_for_a_symlink_just_before_the_descriptor_open(
+    tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O_NOFOLLOW refuses a symlink that appears between lstat and the open."""
+    state = _verifier_state(tmp_path, seeds)
+    database = state / "grants.sqlite3"
+    other = state / "other.sqlite3"
+    other.write_bytes(database.read_bytes())
+    other.chmod(0o600)
+    real_open = os.open
+    swapped = {"done": False}
+
+    def swapping_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not swapped["done"] and Path(path) == database.resolve():
+            swapped["done"] = True
+            database.unlink()
+            database.symlink_to(other)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    with pytest.raises(OSError):
+        SqliteGrantVerificationStore(database)
+    assert swapped["done"]
+
+
+def test_open_refuses_a_different_file_swapped_in_between_lstat_and_open(
+    tmp_path: Path, seeds: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The descriptor's identity must match what lstat validated."""
+    state = _verifier_state(tmp_path, seeds)
+    database = state / "grants.sqlite3"
+    other = state / "other.sqlite3"
+    other.write_bytes(database.read_bytes())
+    other.chmod(0o600)
+    real_open = os.open
+    swapped = {"done": False}
+
+    def swapping_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not swapped["done"] and Path(path) == database.resolve():
+            swapped["done"] = True
+            database.unlink()
+            other.rename(database)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    with pytest.raises(PermissionError, match="changed during validation"):
+        SqliteGrantVerificationStore(database)
+    assert swapped["done"]
