@@ -1286,3 +1286,37 @@ def test_a_reused_descriptor_number_still_counts_as_newly_opened() -> None:
     assert _new_descriptors({7: noise}, {7: database}) == [database]
     assert _new_descriptors({7: database}, {7: database}) == []
     assert _new_descriptors({7: noise}, {7: noise, 9: other}) == [other]
+
+
+def test_closing_an_authority_built_verifier_adapter_is_a_safe_no_op(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """The issuer-side adapter wraps a store with no retained connection; close must not fail."""
+    authority = open_grant_authority(config(tmp_path, seeds))
+    grant = authority.issue(
+        grant_request(), authenticated_principal="local-operator",
+        operator_evidence_ref="trusted-ui://approval/1",
+    )
+    adapter = authority.verifier_adapter()
+    adapter.close()
+    adapter.close()
+    assert adapter.verify(grant.to_wire()).grant_id == grant.grant_id
+
+
+def test_closing_a_verifier_over_a_store_without_close_is_a_safe_no_op() -> None:
+    """The store Protocol has no close(); an injected store must not break shutdown."""
+    from phylax.adjustment_grant import PhylaxGrantVerifier
+
+    class MinimalStore:
+        def key(self, key_id: str) -> None:
+            return None
+
+        def is_issued(self, grant_id: str, payload_digest: str, wire: bytes) -> bool:
+            return False
+
+        def is_revoked(self, grant_id: str) -> bool:
+            return False
+
+    verifier = PhylaxGrantVerifier(store=MinimalStore())
+    verifier.close()
+    verifier.close()

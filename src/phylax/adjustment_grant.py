@@ -850,8 +850,14 @@ class PhylaxGrantVerifier:
             raise GrantRefusal(GrantRefusalReason.VERIFIER_UNAVAILABLE) from exc
 
     def close(self) -> None:
-        """Release the read-only verification store without exposing issuer operations."""
-        self._store.close()
+        """Release a retained read-only store connection; never exposes issuer operations.
+
+        A store that holds no connection (the issuer-side store, an injected test store)
+        has nothing to release, so it is a no-op there. Safe to call more than once.
+        """
+        close = getattr(self._store, "close", None)
+        if callable(close):
+            close()
 
 
 class PhylaxAdjustmentGrantVerifier:
