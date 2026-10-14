@@ -228,6 +228,53 @@ def test_verify_only_uses_read_only_database_and_observes_revocation(
         database.chmod(0o600)
 
 
+def test_verify_only_refuses_database_replaced_after_validation(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """A fresh connection cannot silently follow the verified DB path to another inode."""
+    open_grant_authority(config(tmp_path, seeds))
+    database = tmp_path / "state" / "grants.sqlite3"
+    database.chmod(0o600)
+    store = SqliteGrantVerificationStore(database)
+
+    replacement = database.with_name("replacement.sqlite3")
+    replacement.write_bytes(database.read_bytes())
+    replacement.chmod(0o600)
+    database.unlink()
+    replacement.replace(database)
+
+    with pytest.raises(PermissionError, match="replaced after validation"):
+        store.is_revoked("grant-1")
+
+
+def test_open_verifier_observes_revoke_while_wal_reader_is_active(
+    tmp_path: Path, seeds: Path
+) -> None:
+    """A verifier opened before a revoke reads the newly committed WAL state."""
+    authority = open_grant_authority(config(tmp_path, seeds))
+    grant = authority.issue(
+        grant_request(), authenticated_principal="local-operator",
+        operator_evidence_ref="trusted-ui://approval/1",
+    )
+    database = tmp_path / "state" / "grants.sqlite3"
+    verifier = open_grant_verifier(
+        GrantVerifierConfig(state_dir=database.parent, verifier_id="consumer-1")
+    )
+    blocker = sqlite3.connect(database, isolation_level=None)
+    try:
+        blocker.execute("BEGIN")
+        blocker.execute("SELECT COUNT(*) FROM grant_revocations").fetchone()
+        authority.revoke(grant.grant_id)
+        assert Path(f"{database}-wal").exists()
+        with pytest.raises(GrantRefusal) as refused:
+            verifier.verify(grant.to_wire())
+        assert refused.value.reason.value == "grant.revoked"
+        assert verifier.revocation(grant.grant_id).revoked is True
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
 def test_a_seed_that_does_not_match_the_durable_key_refuses_to_start(tmp_path: Path, seeds: Path) -> None:
     """Swapping the seed file under an existing registry is caught at open."""
     open_grant_authority(config(tmp_path, seeds))

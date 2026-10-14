@@ -450,7 +450,7 @@ class SqliteGrantVerificationStore:
         try:
             status = raw_path.lstat()
         except FileNotFoundError:
-            raise FileNotFoundError("grant authority database does not exist")
+            raise FileNotFoundError("grant authority database does not exist") from None
         if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
             raise ValueError("grant authority database must be a regular file")
         if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
@@ -458,6 +458,10 @@ class SqliteGrantVerificationStore:
         if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be positive")
         self.path = raw_path.resolve(strict=True)
+        resolved_status = self.path.lstat()
+        if (resolved_status.st_dev, resolved_status.st_ino) != (status.st_dev, status.st_ino):
+            raise PermissionError("grant authority database changed during validation")
+        self._identity = (status.st_dev, status.st_ino)
         self._uri = self.path.as_uri() + "?mode=ro"
         self._timeout = timeout
         with self._connection() as connection:
@@ -466,11 +470,30 @@ class SqliteGrantVerificationStore:
                 raise RuntimeError("grant authority store schema is newer than this Phylax build")
             SqliteGrantAuthorityStore._validate_schema(connection, require_all=True)
 
+    def _assert_database_identity(self) -> None:
+        """Refuse a replaced, linked, non-regular, or newly non-private database path."""
+        try:
+            status = self.path.lstat()
+        except FileNotFoundError:
+            raise FileNotFoundError("grant authority database does not exist") from None
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+            raise ValueError("grant authority database must be a regular file")
+        if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) & 0o077:
+            raise PermissionError("grant authority database is not private to the current user")
+        if (status.st_dev, status.st_ino) != self._identity:
+            raise PermissionError("grant authority database was replaced after validation")
+
     def _connect(self) -> sqlite3.Connection:
         """Open one query-only connection without creating or migrating state."""
+        self._assert_database_identity()
         connection = sqlite3.connect(
             self._uri, uri=True, timeout=self._timeout, isolation_level=None
         )
+        try:
+            self._assert_database_identity()
+        except BaseException:
+            connection.close()
+            raise
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA foreign_keys = ON")
