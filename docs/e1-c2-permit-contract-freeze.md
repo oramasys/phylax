@@ -85,7 +85,10 @@ Every object is a JSON object with exactly the listed keys. No extra keys, no `n
 * A permit is signed with the keyring's active key and names it in `issuer_key_id`.
 * A finalization carries no key id. It is signed with the key named by its bound permit, and the
   consumer verifies it under that key. If that key is no longer the active key, the issuer refuses
-  with `finalization.key_rotated` and the attempt ends through the attested abandon.
+  with `finalization.key_rotated` and the attempt ends through the attested abandon. This applies to a
+  FIRST finalization only. A retry of an already stored finalization returns the stored bytes unchanged
+  even after a rotation: a lost-response retry must not be stranded, and the stored bytes stay
+  verifiable for as long as the retired public key stays published in the registry.
 * Every event names its own `issuer_key_id`. Public keys come from the existing key registry.
 * The vector key is a fixed test seed and is never a production key.
 
@@ -166,8 +169,10 @@ share one serialization domain; there is no lock-order problem to solve in slice
 * **FREEZE-CHOICE 13, retry expiry.** A finalization retry reads the finalization's expiry from its
   stored bytes; no expiry column is added.
 * **FREEZE-CHOICE 14, schema and files.** The permit store uses its own database file (separate from
-  the grant store), `user_version` 1, a connection per operation, and validates the schema by column
-  and index names. It adds no private-file-mode handling, as the existing writer store has none.
+  the grant store), `user_version` 1, a connection per operation, and validates the schema by comparing
+  the stored DDL text of every table and index with the frozen DDL (column names alone would bless a
+  file with weaker constraints). It adds no private-file-mode handling, as the existing writer store
+  has none.
 
 ## 9. What is not in slice 1
 
@@ -177,10 +182,14 @@ Deliberately deferred, so slice 1 is not mistaken for the whole ratified specifi
   the operator lookup and operator authentication of abort and abandon (the store's abort method
   trusts its caller), reconciliation, retention and checkpoints, and wiring the signer port to the
   existing key registry.
-* **Consumer client:** the 15-second minimum finalization window, deadline accounting and bounded
+* **Consumer client:** request-side validators (12 and 8 fields), catch-up envelope validation
+  (contiguity, `from_version`, `through_version`, the 64-event bound; slice 1 ingests a bare event
+  list), wiring the sender precondition at the effect boundary, a durable UTC high-water mark, the
+  15-second minimum finalization window, deadline accounting and bounded
   retries, the circuit breaker and alert, the recovery calls after the authority deadline, and the
   `dispatch.issuer_unavailable` status path.
-* **Both:** the effect grant v2 parser and `effect_class` registry (slice 1 reaches the signed grant
+* **Both:** the body shapes of `revocation` and `cascade` events (not frozen; slice 1 treats them as
+  opaque and its revocation port is the consumer's abstraction of them), the effect grant v2 parser and `effect_class` registry (slice 1 reaches the signed grant
   through an injected lookup), and any pin change. None is enabled by this freeze.
 
 **Next actions (repeated).** Reviewers confirm or change each `FREEZE-CHOICE`; implementers build
