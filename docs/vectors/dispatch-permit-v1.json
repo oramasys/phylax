@@ -1,0 +1,105 @@
+{
+  "binding_digest": "d0e316958a948a0540e6f60a4af64c6ba9604a9a2a401e3678a8095fa2ffd5da",
+  "event_preimage_example": "{\"body\":{\"finalization_id\":\"fin-vector-0001\"},\"kind\":\"finalization\",\"previous_event_digest\":\"5dcc2c0591d7e174245f32ad9856d16b6513b8dd1b403263d9678f549bd497e0\",\"version\":2}",
+  "events": [
+    {
+      "body": {
+        "finalization_id": "fin-vector-prior"
+      },
+      "event_digest": "5dcc2c0591d7e174245f32ad9856d16b6513b8dd1b403263d9678f549bd497e0",
+      "issuer_key_id": "phylax-vector-key-1",
+      "kind": "finalization",
+      "previous_event_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "0BUGyl26sfeCXKzAbbNw23EUjOwWyM8XhwuXsG6RspTk0IiK6MAw6F03TNtCn4NyLpTJtwvgStOlmwZxZTbRDQ",
+      "version": 1
+    },
+    {
+      "body": {
+        "finalization_id": "fin-vector-0001"
+      },
+      "event_digest": "716e3426bccd538c50ed8a35cbb100c3e52301e188bbc57ddc3a9e89613a1ec2",
+      "issuer_key_id": "phylax-vector-key-1",
+      "kind": "finalization",
+      "previous_event_digest": "5dcc2c0591d7e174245f32ad9856d16b6513b8dd1b403263d9678f549bd497e0",
+      "signature": "rA_tIofTitCcxSPFDwKVExSnz26jffUjKefNSPlxqz2UVXQX10ytQiPvGN_YyEohUrDVx2QFxaslnGRR_LUbCg",
+      "version": 2
+    }
+  ],
+  "finalization": {
+    "body": {
+      "attempt_id": "attempt-vector-0001",
+      "authority_epoch": 5,
+      "consumer_acked_through": 1,
+      "expires_at": "2026-10-19T04:01:31.000000Z",
+      "finalization_id": "fin-vector-0001",
+      "issued_at": "2026-10-19T04:00:31.000000Z",
+      "ledger_store_id": "vector-ledger",
+      "permit_digest": "ca0776a49e0498f05fb50c924981c6072e60721960fee2306790420a6ec19a2f",
+      "permit_id": "permit-vector-0001",
+      "requested_at": "2026-10-19T04:00:30.000000Z",
+      "reservation_id": "res-vector-0001",
+      "revocation_event_digest": "716e3426bccd538c50ed8a35cbb100c3e52301e188bbc57ddc3a9e89613a1ec2",
+      "revocation_version": 2,
+      "schema_version": 1
+    },
+    "body_bytes": "{\"attempt_id\":\"attempt-vector-0001\",\"authority_epoch\":5,\"consumer_acked_through\":1,\"expires_at\":\"2026-10-19T04:01:31.000000Z\",\"finalization_id\":\"fin-vector-0001\",\"issued_at\":\"2026-10-19T04:00:31.000000Z\",\"ledger_store_id\":\"vector-ledger\",\"permit_digest\":\"ca0776a49e0498f05fb50c924981c6072e60721960fee2306790420a6ec19a2f\",\"permit_id\":\"permit-vector-0001\",\"requested_at\":\"2026-10-19T04:00:30.000000Z\",\"reservation_id\":\"res-vector-0001\",\"revocation_event_digest\":\"716e3426bccd538c50ed8a35cbb100c3e52301e188bbc57ddc3a9e89613a1ec2\",\"revocation_version\":2,\"schema_version\":1}",
+    "finalization_digest": "1d0d740dbe7d18002e5f316fe9694627fc5291158803653ffb5a2f078db737b5",
+    "signature": "QYywvVU3AlHU3dIiX4iUvUhij2Jxnh2sHGL3AhAMzCMy9UHLnENSv7r7jJ_1_cH6_09X6sbxIV8CCWA9SlfWDw",
+    "wire": "{\"attempt_id\":\"attempt-vector-0001\",\"authority_epoch\":5,\"consumer_acked_through\":1,\"expires_at\":\"2026-10-19T04:01:31.000000Z\",\"finalization_id\":\"fin-vector-0001\",\"issued_at\":\"2026-10-19T04:00:31.000000Z\",\"issuer_signature\":\"QYywvVU3AlHU3dIiX4iUvUhij2Jxnh2sHGL3AhAMzCMy9UHLnENSv7r7jJ_1_cH6_09X6sbxIV8CCWA9SlfWDw\",\"ledger_store_id\":\"vector-ledger\",\"permit_digest\":\"ca0776a49e0498f05fb50c924981c6072e60721960fee2306790420a6ec19a2f\",\"permit_id\":\"permit-vector-0001\",\"requested_at\":\"2026-10-19T04:00:30.000000Z\",\"reservation_id\":\"res-vector-0001\",\"revocation_event_digest\":\"716e3426bccd538c50ed8a35cbb100c3e52301e188bbc57ddc3a9e89613a1ec2\",\"revocation_version\":2,\"schema_version\":1}"
+  },
+  "finalization_request": {
+    "attempt_id": "attempt-vector-0001",
+    "authority_epoch": 5,
+    "consumer_acked_through": 1,
+    "ledger_store_id": "vector-ledger",
+    "permit_digest": "ca0776a49e0498f05fb50c924981c6072e60721960fee2306790420a6ec19a2f",
+    "permit_id": "permit-vector-0001",
+    "requested_at": "2026-10-19T04:00:30.000000Z",
+    "reservation_id": "res-vector-0001"
+  },
+  "genesis_event_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "issuer_key_id": "phylax-vector-key-1",
+  "permit": {
+    "body": {
+      "artifact_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "attempt_id": "attempt-vector-0001",
+      "authority_epoch": 5,
+      "configuration_policy_epoch": 3,
+      "consumer_acked_through": 1,
+      "expires_at": "2026-10-19T04:01:31.000000Z",
+      "grant_id": "grant-vector-0001",
+      "grant_payload_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "issued_at": "2026-10-19T04:00:01.000000Z",
+      "issuer_authority_version": 1,
+      "issuer_key_id": "phylax-vector-key-1",
+      "ledger_store_id": "vector-ledger",
+      "operation_id": "op-vector-0001",
+      "permit_id": "permit-vector-0001",
+      "request_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "requested_at": "2026-10-19T04:00:00.000000Z",
+      "reservation_id": "res-vector-0001",
+      "revocation_version": 1,
+      "schema_version": 1
+    },
+    "body_bytes": "{\"artifact_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"attempt_id\":\"attempt-vector-0001\",\"authority_epoch\":5,\"configuration_policy_epoch\":3,\"consumer_acked_through\":1,\"expires_at\":\"2026-10-19T04:01:31.000000Z\",\"grant_id\":\"grant-vector-0001\",\"grant_payload_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"issued_at\":\"2026-10-19T04:00:01.000000Z\",\"issuer_authority_version\":1,\"issuer_key_id\":\"phylax-vector-key-1\",\"ledger_store_id\":\"vector-ledger\",\"operation_id\":\"op-vector-0001\",\"permit_id\":\"permit-vector-0001\",\"request_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requested_at\":\"2026-10-19T04:00:00.000000Z\",\"reservation_id\":\"res-vector-0001\",\"revocation_version\":1,\"schema_version\":1}",
+    "payload_digest": "ca0776a49e0498f05fb50c924981c6072e60721960fee2306790420a6ec19a2f",
+    "signature": "F7Y7blm6cFnqxq3qaLbT14w8N6KRjZ-4VKIsIZ6STO9BKlfMmUmGfIYFTxy9wbpg874ch7sB24cUK5SNBYoCDw",
+    "wire": "{\"artifact_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"attempt_id\":\"attempt-vector-0001\",\"authority_epoch\":5,\"configuration_policy_epoch\":3,\"consumer_acked_through\":1,\"expires_at\":\"2026-10-19T04:01:31.000000Z\",\"grant_id\":\"grant-vector-0001\",\"grant_payload_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"issued_at\":\"2026-10-19T04:00:01.000000Z\",\"issuer_authority_version\":1,\"issuer_key_id\":\"phylax-vector-key-1\",\"issuer_signature\":\"F7Y7blm6cFnqxq3qaLbT14w8N6KRjZ-4VKIsIZ6STO9BKlfMmUmGfIYFTxy9wbpg874ch7sB24cUK5SNBYoCDw\",\"ledger_store_id\":\"vector-ledger\",\"operation_id\":\"op-vector-0001\",\"payload_digest\":\"ca0776a49e0498f05fb50c924981c6072e60721960fee2306790420a6ec19a2f\",\"permit_id\":\"permit-vector-0001\",\"request_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requested_at\":\"2026-10-19T04:00:00.000000Z\",\"reservation_id\":\"res-vector-0001\",\"revocation_version\":1,\"schema_version\":1}"
+  },
+  "permit_request": {
+    "artifact_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "attempt_id": "attempt-vector-0001",
+    "authority_epoch": 5,
+    "configuration_policy_epoch": 3,
+    "consumer_acked_through": 1,
+    "grant_id": "grant-vector-0001",
+    "grant_payload_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "ledger_store_id": "vector-ledger",
+    "operation_id": "op-vector-0001",
+    "request_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "requested_at": "2026-10-19T04:00:00.000000Z",
+    "reservation_id": "res-vector-0001"
+  },
+  "public_key": "d7b7e8458dd7d675ac34542a00ef81be9776c5cbbed2b14731d66dee66df9649",
+  "schema": "phylax.dispatch-permit.conformance.v1"
+}
