@@ -57,8 +57,9 @@ Every object is a JSON object with exactly the listed keys. No extra keys, no `n
   valid. This is the same function Phylax already uses for the v1 grant.
 * **Permit digest (FREEZE-CHOICE 2):** the body is the canonical bytes of the permit without
   `payload_digest` and `issuer_signature`. `payload_digest` is the SHA-256 of the body. The wire
-  adds `payload_digest` and `issuer_signature`. `permit_digest` in a finalization request is the
-  permit's `payload_digest`.
+  adds `payload_digest` and `issuer_signature`. `permit_digest` (a finalization request field) and
+  `payload_digest` (a permit wire field) are the SAME value under two names; `permit_digest` is not a
+  separate permit field.
 * **Finalization digest (FREEZE-CHOICE 3):** the body is the canonical bytes of the finalization
   without `issuer_signature`. The finalization digest recorded in the outbox is the SHA-256 of that
   body. It is computed, never a wire field.
@@ -133,7 +134,9 @@ share one serialization domain; there is no lock-order problem to solve in slice
   columns (`payload_digest`, `permit_bytes`, `r_p`, `issued_at`, `expires_at`, binding columns, and
   `finalization_id`, `finalization_bytes`, `finalization_digest` when present);
   `replaces_permit_id`; `abort_disposition`. An `aborted` row has no permit bytes.
-* Three database constraints that count only rows holding a permit: at most one original permit
+* Three database constraints that count only rows holding a permit (each a partial unique index on
+  `grant_id`, which is NOT NULL, so SQLite's rule that NULLs are distinct in a unique index does not
+  apply; the predicate `replaces_permit_id IS NULL` only selects which rows are counted): at most one original permit
   (`replaces_permit_id IS NULL`) per `grant_id`; at most one `issued` or `finalized` permit per
   grant; `replaces_permit_id` unique where present.
 * `issuer_events`: `version` primary key, `kind`, `body`, `previous_event_digest`, `event_digest`
