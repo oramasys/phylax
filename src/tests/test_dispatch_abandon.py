@@ -58,10 +58,12 @@ def abandon_code(store, attest, operator=OPERATOR) -> str:
 
 
 def state_of(store, attempt: str = "attempt-1") -> str:
+    """Return one attempt's persisted permit state through the authenticated lookup."""
     return store.lookup_attempt(attempt, operator=OPERATOR)["state"]
 
 
 def dump(db: Path) -> dict[str, list]:
+    """Return the lifecycle tables whose rows prove a test did not mutate state unexpectedly."""
     conn = sqlite3.connect(db)
     try:
         return {
@@ -77,6 +79,7 @@ def dump(db: Path) -> dict[str, list]:
 
 @pytest.mark.parametrize("reference", [None, "", "   "])
 def test_every_operator_call_is_refused_without_a_reference(store, db, grants, signer, reference) -> None:
+    """Each operator-controlled operation fails before it can mutate state without a reference."""
     permit = admit(store, grants, signer)
     denied = FakeOperator(reference)
     before = dump(db)
@@ -91,6 +94,7 @@ def test_every_operator_call_is_refused_without_a_reference(store, db, grants, s
 
 
 def test_the_operator_port_receives_the_operation_attempt_and_grant(store, grants, signer) -> None:
+    """Lookup and abort supply the port with their distinct operation and subject bindings."""
     admit(store, grants, signer)
     spy = FakeOperator("op-spy")
     store.lookup_attempt("attempt-1", operator=spy)
@@ -99,6 +103,7 @@ def test_the_operator_port_receives_the_operation_attempt_and_grant(store, grant
 
 
 def test_the_operator_reference_is_recorded_as_the_abort_disposition(store, db) -> None:
+    """An admitted abort persists the non-blank operator reference as its disposition evidence."""
     store.abort("attempt-x", GRANT_ID, operator=FakeOperator("op-77"), now=NOW)
     conn = sqlite3.connect(db)
     try:
@@ -108,6 +113,7 @@ def test_the_operator_reference_is_recorded_as_the_abort_disposition(store, db) 
 
 
 def test_a_lookup_never_changes_state(store, db, grants, signer) -> None:
+    """The authenticated lookup path is observational and leaves every tracked table unchanged."""
     admit(store, grants, signer)
     before = dump(db)
     assert state_of(store) == "issued"
@@ -128,6 +134,7 @@ def test_a_lookup_never_changes_state(store, db, grants, signer) -> None:
     ],
 )
 def test_a_malformed_attestation_is_refused_and_writes_nothing(store, db, grants, signer, overrides) -> None:
+    """Malformed typed fields reject before the issuer writes any abandonment state."""
     permit = admit(store, grants, signer)
     before = dump(db)
     assert abandon_code(store, attestation(permit, **overrides)) == "abandon.invalid_attestation"
@@ -135,6 +142,7 @@ def test_a_malformed_attestation_is_refused_and_writes_nothing(store, db, grants
 
 
 def test_an_attestation_with_missing_or_extra_fields_is_refused(store, grants, signer) -> None:
+    """The abandon attestation has an exact closed field set."""
     permit = admit(store, grants, signer)
     good = attestation(permit)
     missing = {k: v for k, v in good.items() if k != "cause"}
@@ -143,6 +151,7 @@ def test_an_attestation_with_missing_or_extra_fields_is_refused(store, grants, s
 
 
 def test_a_malformed_attestation_is_refused_before_the_operator_is_consulted(store, grants, signer) -> None:
+    """Wire validation precedes the operator authorization call for malformed abandonment input."""
     permit = admit(store, grants, signer)
     spy = FakeOperator("op-spy")
     assert abandon_code(store, attestation(permit, cause="x"), spy) == "abandon.invalid_attestation"
@@ -153,6 +162,7 @@ def test_a_malformed_attestation_is_refused_before_the_operator_is_consulted(sto
 
 
 def test_abandon_marks_the_permit_and_records_the_attestation_as_audit_evidence(store, db, grants, signer) -> None:
+    """A valid abandon atomically marks the permit and stores the unverified attestation as evidence."""
     permit = admit(store, grants, signer)
     attest = attestation(permit)
     outcome, record = store.abandon(attest, operator=FakeOperator("op-9"), now=NOW)
@@ -169,6 +179,7 @@ def test_abandon_marks_the_permit_and_records_the_attestation_as_audit_evidence(
 
 
 def test_an_identical_abandon_retry_returns_the_recorded_outcome(store, db, grants, signer) -> None:
+    """An identical abandon is idempotent even when authenticated by a later operator invocation."""
     permit = admit(store, grants, signer)
     attest = attestation(permit)
     first = store.abandon(attest, operator=OPERATOR, now=NOW)[1]
@@ -178,6 +189,7 @@ def test_an_identical_abandon_retry_returns_the_recorded_outcome(store, db, gran
 
 
 def test_a_different_attestation_for_an_abandoned_permit_conflicts(store, db, grants, signer) -> None:
+    """A later abandon with different caller evidence cannot rewrite the recorded audit record."""
     permit = admit(store, grants, signer)
     store.abandon(attestation(permit), operator=OPERATOR, now=NOW)
     before = dump(db)
@@ -186,6 +198,7 @@ def test_a_different_attestation_for_an_abandoned_permit_conflicts(store, db, gr
 
 
 def test_abandon_of_an_unknown_permit_or_the_wrong_attempt_is_refused(store, grants, signer) -> None:
+    """Abandonment binds the claimed permit identifier to the expected attempt identifier."""
     permit = admit(store, grants, signer)
     assert abandon_code(store, attestation(permit, permit_id="permit-nope")) == "abandon.permit_unknown"
     assert abandon_code(store, attestation(permit, attempt_id="attempt-9")) == "abandon.attempt_mismatch"
@@ -193,6 +206,7 @@ def test_abandon_of_an_unknown_permit_or_the_wrong_attempt_is_refused(store, gra
 
 
 def test_abandon_never_proves_anything_a_finalized_permit_is_abandoned_too(store, grants, signer) -> None:
+    """Abandoning a nonterminal finalized permit records no claim beyond its changed issuer state."""
     permit = admit(store, grants, signer)
     finalize(store, grants, signer, final_request(permit))
     assert state_of(store) == "finalized"
@@ -201,6 +215,7 @@ def test_abandon_never_proves_anything_a_finalized_permit_is_abandoned_too(store
 
 
 def test_an_abandoned_permit_can_never_be_finalized(store, db, grants, signer) -> None:
+    """After abandonment, a finalization request is permanently unusable and state remains stable."""
     permit = admit(store, grants, signer)
     store.abandon(attestation(permit), operator=OPERATOR, now=NOW)
     before = dump(db)
@@ -209,6 +224,7 @@ def test_an_abandoned_permit_can_never_be_finalized(store, db, grants, signer) -
 
 
 def test_abandoning_a_finalized_permit_blocks_a_finalization_retry(store, grants, signer) -> None:
+    """Abandonment also invalidates a retry of a finalization that previously completed."""
     permit = admit(store, grants, signer)
     request = final_request(permit)
     finalize(store, grants, signer, request)
@@ -217,6 +233,7 @@ def test_abandoning_a_finalized_permit_blocks_a_finalization_retry(store, grants
 
 
 def test_abandon_refuses_a_nonterminal_permit_that_already_has_a_successor(store, db, grants, signer) -> None:
+    """A permit with a successor is terminal for abandonment even if corrupted back to issued."""
     first = admit(store, grants, signer)
     store.abandon(attestation(first), operator=OPERATOR, now=NOW)
     second = admit(store, grants, signer, permit_request(attempt_id="attempt-2"))
@@ -229,6 +246,7 @@ def test_abandon_refuses_a_nonterminal_permit_that_already_has_a_successor(store
 
 
 def test_a_new_attempt_after_an_abandon_is_a_successor_and_records_its_predecessor(store, db, grants, signer) -> None:
+    """A new post-abandon attempt creates a fresh permit with durable predecessor lineage."""
     first = admit(store, grants, signer)
     store.abandon(attestation(first), operator=OPERATOR, now=NOW)
     second = admit(store, grants, signer, permit_request(attempt_id="attempt-2"), now=NOW + timedelta(seconds=1))
@@ -247,6 +265,7 @@ def test_a_new_attempt_after_an_abandon_is_a_successor_and_records_its_predecess
 
 
 def test_an_unabandoned_permit_never_yields_a_successor_even_when_expired(store, grants, signer) -> None:
+    """Expiry alone cannot create successor eligibility without a durable abandonment record."""
     admit(store, grants, signer)
     later = NOW + timedelta(hours=1)
     request = permit_request(attempt_id="attempt-2", requested_at=wire.timestamp(later))
@@ -254,6 +273,7 @@ def test_an_unabandoned_permit_never_yields_a_successor_even_when_expired(store,
 
 
 def test_a_second_successor_while_the_first_is_live_conflicts(store, db, grants, signer) -> None:
+    """Only one live successor may follow a predecessor permit at a time."""
     first = admit(store, grants, signer)
     store.abandon(attestation(first), operator=OPERATOR, now=NOW)
     admit(store, grants, signer, permit_request(attempt_id="attempt-2"))
@@ -262,6 +282,7 @@ def test_a_second_successor_while_the_first_is_live_conflicts(store, db, grants,
 
 
 def test_an_identical_successor_retry_returns_the_stored_permit(store, db, grants, signer) -> None:
+    """Issuing the same successor request twice returns the original durable permit bytes."""
     first = admit(store, grants, signer)
     store.abandon(attestation(first), operator=OPERATOR, now=NOW)
     request = permit_request(attempt_id="attempt-2")
@@ -270,6 +291,7 @@ def test_an_identical_successor_retry_returns_the_stored_permit(store, db, grant
 
 
 def test_a_successor_passes_every_issuance_check(store, grants, signer) -> None:
+    """Successor issuance still enforces grant status, stream position, and payload identity."""
     first = admit(store, grants, signer)
     store.abandon(attestation(first), operator=OPERATOR, now=NOW)
     grants.set(revoked=True)
@@ -283,6 +305,7 @@ def test_a_successor_passes_every_issuance_check(store, grants, signer) -> None:
 
 
 def test_a_successor_may_itself_be_abandoned_and_replaced(store, db, grants, signer) -> None:
+    """The successor lineage supports another explicitly abandoned attempt without reusing permits."""
     first = admit(store, grants, signer)
     store.abandon(attestation(first), operator=OPERATOR, now=NOW)
     second = admit(store, grants, signer, permit_request(attempt_id="attempt-2"))
@@ -292,6 +315,7 @@ def test_a_successor_may_itself_be_abandoned_and_replaced(store, db, grants, sig
 
 
 def test_the_database_itself_refuses_two_successors_of_one_permit(store, db, grants, signer) -> None:
+    """The database uniqueness constraint remains the final concurrent-successor backstop."""
     first = admit(store, grants, signer)
     store.abandon(attestation(first), operator=OPERATOR, now=NOW)
     admit(store, grants, signer, permit_request(attempt_id="attempt-2"))
@@ -306,6 +330,7 @@ def test_the_database_itself_refuses_two_successors_of_one_permit(store, db, gra
 
 
 def test_a_finalized_successor_works_end_to_end(store, grants, signer) -> None:
+    """A properly issued successor can progress through the normal finalization path."""
     first = admit(store, grants, signer)
     store.abandon(attestation(first), operator=OPERATOR, now=NOW)
     second = admit(store, grants, signer, permit_request(attempt_id="attempt-2"))
@@ -318,6 +343,7 @@ def test_a_finalized_successor_works_end_to_end(store, grants, signer) -> None:
 
 @pytest.mark.parametrize("iteration", range(5))
 def test_two_racing_successor_requests_have_exactly_one_winner(db, iteration) -> None:
+    """Concurrent successor requests produce one permit and one conflict across repeated races."""
     grants, signer = FakeGrants(), FakeSigner()
     first, second = SqliteDispatchPermitStore(db), SqliteDispatchPermitStore(db)
     permit = admit(first, grants, signer)
@@ -326,6 +352,7 @@ def test_two_racing_successor_requests_have_exactly_one_winner(db, iteration) ->
     results: dict[str, object] = {}
 
     def run(name: str, store, attempt: str) -> None:
+        """Submit one competing successor request after both contenders reach the barrier."""
         barrier.wait()
         try:
             results[name] = admit(store, grants, signer, permit_request(attempt_id=attempt))
@@ -349,6 +376,7 @@ def test_two_racing_successor_requests_have_exactly_one_winner(db, iteration) ->
 
 @pytest.mark.parametrize("iteration", range(5))
 def test_abandon_and_finalization_race_leaves_a_consistent_state(db, iteration) -> None:
+    """A concurrent abandon/finalize race ends with an abandoned permit and no future finalization."""
     grants, signer = FakeGrants(), FakeSigner()
     first, second = SqliteDispatchPermitStore(db), SqliteDispatchPermitStore(db)
     permit = admit(first, grants, signer)
@@ -356,10 +384,12 @@ def test_abandon_and_finalization_race_leaves_a_consistent_state(db, iteration) 
     results: dict[str, object] = {}
 
     def do_abandon() -> None:
+        """Attempt the abandonment side of the race after synchronization."""
         barrier.wait()
         results["abandon"] = first.abandon(attestation(permit), operator=OPERATOR, now=NOW)[0]
 
     def do_finalize() -> None:
+        """Attempt the finalization side of the race after synchronization."""
         barrier.wait()
         try:
             results["finalize"] = finalize(second, grants, signer, final_request(permit))[0]
@@ -383,6 +413,7 @@ def test_abandon_and_finalization_race_leaves_a_consistent_state(db, iteration) 
 
 
 def test_a_slice_one_database_gains_the_attestation_table_on_open(tmp_path: Path) -> None:
+    """Opening a prior schema recreates the additive abandonment-audit table."""
     path = tmp_path / "old.db"
     SqliteDispatchPermitStore(path).close()
     raw_exec(path, "DROP TABLE abandon_attestations")
@@ -396,6 +427,7 @@ def test_a_slice_one_database_gains_the_attestation_table_on_open(tmp_path: Path
 
 
 def test_the_abandon_vocabulary_is_closed_and_separate_from_permit_refusals() -> None:
+    """Abandonment uses a dedicated closed refusal vocabulary instead of permit refusal codes."""
     assert wire.ABANDON_REFUSAL_CODES.isdisjoint(wire.REFUSAL_CODES)
     with pytest.raises(ValueError):
         AbandonRefused("abandon.made_up")
