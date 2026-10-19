@@ -171,8 +171,17 @@ share one serialization domain; there is no lock-order problem to solve in slice
 
 ## 9. What is not in slice 1
 
-The effect grant v2 parser and registry, replacement and reconciliation, retention and checkpoints,
-the operator lookup, the breaker and alert, and any pin change. None is enabled by this freeze.
+Deliberately deferred, so slice 1 is not mistaken for the whole ratified specification:
+
+* **Issuer:** the attested abandon and the successor request (an `abandoned` permit with no successor),
+  the operator lookup and operator authentication of abort and abandon (the store's abort method
+  trusts its caller), reconciliation, retention and checkpoints, and wiring the signer port to the
+  existing key registry.
+* **Consumer client:** the 15-second minimum finalization window, deadline accounting and bounded
+  retries, the circuit breaker and alert, the recovery calls after the authority deadline, and the
+  `dispatch.issuer_unavailable` status path.
+* **Both:** the effect grant v2 parser and `effect_class` registry (slice 1 reaches the signed grant
+  through an injected lookup), and any pin change. None is enabled by this freeze.
 
 **Next actions (repeated).** Reviewers confirm or change each `FREEZE-CHOICE`; implementers build
 only against this contract; nothing enables serving, issuance or a pin change.
