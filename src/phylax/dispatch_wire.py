@@ -57,6 +57,17 @@ FINALIZATION_REFUSAL_CODES: Final = frozenset({
 REFUSAL_CODES: Final = PERMIT_REFUSAL_CODES | FINALIZATION_REFUSAL_CODES
 ABORT_OUTCOMES: Final = frozenset({"abort.recorded", "abort.already_aborted", "abort.admission_won"})
 
+ABANDON_CAUSES: Final = frozenset({"transient_delay", "cancellation", "loss"})
+ABANDON_ATTESTATION_FIELDS: Final = (
+    "attempt_id", "permit_id", "cause", "consumer_fencing_epoch", "fence_evidence",
+    "non_commit_evidence", "release_pending_record", "no_intent_exists",
+)
+ABANDON_OUTCOMES: Final = frozenset({"abandon.recorded", "abandon.already_abandoned"})
+ABANDON_REFUSAL_CODES: Final = frozenset({
+    "abandon.invalid_attestation", "abandon.permit_unknown", "abandon.attempt_mismatch",
+    "abandon.permit_terminal", "abandon.conflict",
+})
+
 PERMIT_REQUEST_FIELDS: Final = (
     "grant_id", "grant_payload_digest", "operation_id", "request_digest", "artifact_digest",
     "reservation_id", "ledger_store_id", "configuration_policy_epoch", "authority_epoch",
@@ -277,6 +288,35 @@ def event_digest(version: int, kind: str, body: Mapping[str, object], previous_e
 def finalization_event_digest(version: int, finalization_id: str, previous_event_digest: str) -> str:
     """Return the digest of the finalization event for ``finalization_id`` at ``version``."""
     return event_digest(version, "finalization", {"finalization_id": finalization_id}, previous_event_digest)
+
+
+def validate_abandon_attestation(attestation: Mapping[str, object]) -> None:
+    """Require exactly the attestation fields, typed; anything else is a ``WireError``.
+
+    The attestation is the consumer's own statement, recorded by the issuer as audit evidence.
+    It is never verified here, so no safety property may depend on it being true.
+    """
+    if not isinstance(attestation, Mapping):
+        raise WireError("attestation must be an object")
+    keys = set(attestation)
+    expected = set(ABANDON_ATTESTATION_FIELDS)
+    if keys != expected:
+        raise WireError(f"fields differ: missing={sorted(expected - keys)} extra={sorted(keys - expected)}")
+    for name in ("attempt_id", "permit_id", "fence_evidence", "non_commit_evidence", "release_pending_record"):
+        _require_text(name, attestation[name])
+    if not isinstance(attestation["cause"], str) or attestation["cause"] not in ABANDON_CAUSES:
+        raise WireError("cause must be transient_delay, cancellation or loss")
+    epoch = attestation["consumer_fencing_epoch"]
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or not 1 <= epoch <= MAX_SAFE_INTEGER:
+        raise WireError("consumer_fencing_epoch must be a safe integer of at least 1")
+    if attestation["no_intent_exists"] is not True:
+        raise WireError("no_intent_exists must be true")
+
+
+def attestation_digest(attestation: Mapping[str, object]) -> str:
+    """Return the SHA-256 of the canonical attestation (identity of an abandon retry)."""
+    validate_abandon_attestation(attestation)
+    return sha256_hex(canonical_bytes(dict(attestation)))
 
 
 def _sign(seed: bytes, *chunks: bytes) -> bytes:
