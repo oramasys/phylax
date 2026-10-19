@@ -98,6 +98,11 @@ _DIGEST_RE: Final = re.compile(r"[0-9a-f]{64}")
 _TIMESTAMP_RE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
 
 
+def _is_digest(value: object) -> bool:
+    """Return whether ``value`` is exactly 64 lowercase hexadecimal characters of text."""
+    return isinstance(value, str) and _DIGEST_RE.fullmatch(value) is not None
+
+
 class WireError(ValueError):
     """A wire object is malformed: wrong fields, wrong types or non-canonical bytes."""
 
@@ -177,7 +182,7 @@ def validate_fields(obj: Mapping[str, object], expected: tuple[str, ...]) -> Non
             if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= MAX_SAFE_INTEGER:
                 raise WireError(f"{name} must be a safe integer of at least {minimum}")
         elif name in _DIGEST_FIELDS:
-            if not isinstance(value, str) or not _DIGEST_RE.fullmatch(value):
+            if not _is_digest(value):
                 raise WireError(f"{name} must be 64 lowercase hexadecimal characters")
         elif name in _TIMESTAMP_FIELDS:
             parse_timestamp(value)
@@ -255,7 +260,7 @@ def event_digest(version: int, kind: str, body: Mapping[str, object], previous_e
         raise WireError("unknown event kind")
     if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= MAX_SAFE_INTEGER:
         raise WireError("event version must be a positive safe integer")
-    if not isinstance(previous_event_digest, str) or not _DIGEST_RE.fullmatch(previous_event_digest):
+    if not _is_digest(previous_event_digest):
         raise WireError("previous_event_digest must be 64 lowercase hexadecimal characters")
     if not isinstance(body, Mapping):
         raise WireError("event body must be an object")
@@ -316,13 +321,13 @@ def verify_finalization(public_key: bytes, body: Mapping[str, object], signature
 
 def sign_event(seed: bytes, digest: str) -> str:
     """Sign an event digest (Ed25519ph over the event domain and the 64 ASCII hex characters)."""
-    if not _DIGEST_RE.fullmatch(digest):
+    if not _is_digest(digest):
         raise WireError("event digest must be 64 lowercase hexadecimal characters")
     return b64url_encode(_sign(seed, EVENT_DOMAIN, digest.encode("ascii")))
 
 
 def verify_event(public_key: bytes, digest: str, signature: str) -> bool:
     """Verify an event signature over exactly the domain-separated digest text."""
-    if not _DIGEST_RE.fullmatch(digest):
+    if not _is_digest(digest):
         return False
     return _verify(public_key, b64url_decode(signature), EVENT_DOMAIN, digest.encode("ascii"))

@@ -214,3 +214,11 @@ def test_event_digest_refuses_a_non_mapping_body_with_a_wire_error(body: object)
 def test_event_digest_refuses_a_non_string_previous_digest_with_a_wire_error(previous: object) -> None:
     with pytest.raises(wire.WireError, match="previous_event_digest"):
         wire.event_digest(1, "finalization", {"finalization_id": "f-1"}, previous)
+
+
+@pytest.mark.parametrize("digest", [None, 0, b"0" * 64, ["0" * 64]])
+def test_event_signing_classifies_a_non_text_digest(digest: object) -> None:
+    """Signing refuses with WireError; verifying reports False. Never a raw TypeError."""
+    with pytest.raises(wire.WireError, match="event digest"):
+        wire.sign_event(b"\x01" * 32, digest)
+    assert wire.verify_event(b"\x02" * 32, digest, "AAAA") is False
