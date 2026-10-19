@@ -151,6 +151,21 @@ share one serialization domain; there is no lock-order problem to solve in slice
 | Attempts, fence, grant-use consumption, intent, outbox | Oramasys | one transaction at step 4.3 |
 | Vectors | Phylax produces; Oramasys vendors a byte-identical copy with a hash test | |
 
+## 8a. Slice 1 implementation notes (for reviewers; each is a choice to confirm)
+
+* **FREEZE-CHOICE 11, finalization retry and the bound.** A finalization retry applies the same
+  catch-up bound as a first finalization. If the gap from the request's acknowledgement to the stored
+  `R_f` exceeds the bound it is refused as `finalization.catchup_required` and nothing changes. The
+  retry envelope runs from `consumer_acked_through + 1` through the stored `R_f`; it is empty when the
+  acknowledgement is already at or past `R_f`.
+* **FREEZE-CHOICE 12, unknown grant at finalization.** A grant the lookup no longer knows is refused
+  as `finalization.grant_revoked` (fail closed). The vocabulary has no separate code for it.
+* **FREEZE-CHOICE 13, retry expiry.** A finalization retry reads the finalization's expiry from its
+  stored bytes; no expiry column is added.
+* **FREEZE-CHOICE 14, schema and files.** The permit store uses its own database file (separate from
+  the grant store), `user_version` 1, a connection per operation, and validates the schema by column
+  and index names. It adds no private-file-mode handling, as the existing writer store has none.
+
 ## 9. What is not in slice 1
 
 The effect grant v2 parser and registry, replacement and reconciliation, retention and checkpoints,
