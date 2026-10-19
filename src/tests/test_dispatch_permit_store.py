@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +25,17 @@ NOW = datetime(2026, 10, 19, 4, 0, 0, tzinfo=UTC)
 SEEDS = {"key-1": b"1" * 32, "key-2": b"2" * 32}
 GRANT_ID = "grant-1"
 PAYLOAD = "a" * 64
+
+
+@contextmanager
+def open_db(path: Path | str) -> Iterator[sqlite3.Connection]:
+    """Open a SQLite connection, commit on success and always close it."""
+    connection = sqlite3.connect(path)
+    try:
+        yield connection
+        connection.commit()
+    finally:
+        connection.close()
 
 
 class FakeGrants:
@@ -149,7 +162,7 @@ def refusal(callable_, *args, **kwargs) -> str:
 
 def row_count(db: Path, table: str = "dispatch_permits") -> int:
     """Count rows with a raw connection."""
-    with sqlite3.connect(db) as conn:
+    with open_db(db) as conn:
         return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
@@ -620,12 +633,12 @@ def test_schema_guards(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         SqliteDispatchPermitStore(tmp_path / "t.db", timeout=0)
     newer = tmp_path / "newer.db"
-    with sqlite3.connect(newer) as conn:
+    with open_db(newer) as conn:
         conn.execute("PRAGMA user_version = 99")
     with pytest.raises(RuntimeError):
         SqliteDispatchPermitStore(newer)
     foreign = tmp_path / "foreign.db"
-    with sqlite3.connect(foreign) as conn:
+    with open_db(foreign) as conn:
         conn.execute("CREATE TABLE dispatch_permits(x INTEGER)")
     with pytest.raises(RuntimeError):
         SqliteDispatchPermitStore(foreign)
@@ -696,7 +709,7 @@ def test_finalized_retry_applies_the_permits_r_p_floor(store, db, grants, signer
     final_request_two = final_request(second, consumer_acked_through=1)
     finalize(store, grants, signer, final_request_two)
     assert json.loads(second)["revocation_version"] == 1
-    with sqlite3.connect(db) as connection:
+    with open_db(db) as connection:
         connection.execute("DELETE FROM issuer_events")  # simulate a lost chain: counter 0 < R_p 1
     request = final_request(second, consumer_acked_through=0)
     assert refusal(finalize, store, grants, signer, request) == "finalization.issuer_rolled_back"
@@ -716,7 +729,7 @@ def test_finalized_retry_after_key_rotation_returns_the_stored_bytes(store, db, 
 def _weakened_database(path: Path, old: str, new: str) -> None:
     """Create a database whose DDL has the right column names but one weakened clause."""
     assert old in store_module._SCHEMA
-    with sqlite3.connect(path) as connection:
+    with open_db(path) as connection:
         connection.executescript(store_module._SCHEMA.replace(old, new, 1))
 
 
@@ -741,6 +754,6 @@ def test_store_refuses_a_file_with_weaker_constraints_than_the_frozen_schema(tmp
 def test_a_frozen_schema_file_reopens_cleanly(tmp_path) -> None:
     """The exact frozen DDL created by another connection is accepted."""
     path = tmp_path / "ok.db"
-    with sqlite3.connect(path) as connection:
+    with open_db(path) as connection:
         connection.executescript(store_module._SCHEMA)
     SqliteDispatchPermitStore(path).close()
