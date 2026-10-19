@@ -153,6 +153,7 @@ def sha256_hex(data: bytes) -> str:
 
 
 def _require_text(name: str, value: object) -> None:
+    """Require non-blank text no longer than the frozen byte limit."""
     if not isinstance(value, str) or not value.strip():
         raise WireError(f"{name} must be non-blank text")
     if len(value.encode("utf-8")) > MAX_TEXT_BYTES:
@@ -269,6 +270,7 @@ def finalization_event_digest(version: int, finalization_id: str, previous_event
 
 
 def _sign(seed: bytes, *chunks: bytes) -> bytes:
+    """Return an RFC 8032 Ed25519ph signature over the concatenated message chunks."""
     _public_key, secret_key = crypto_sign_seed_keypair(seed)
     state = crypto_sign_ed25519ph_state()
     for chunk in chunks:
@@ -277,6 +279,7 @@ def _sign(seed: bytes, *chunks: bytes) -> bytes:
 
 
 def _verify(public_key: bytes, signature: bytes, *chunks: bytes) -> bool:
+    """Return True only if the Ed25519ph signature verifies over the message chunks."""
     state = crypto_sign_ed25519ph_state()
     for chunk in chunks:
         crypto_sign_ed25519ph_update(state, chunk)

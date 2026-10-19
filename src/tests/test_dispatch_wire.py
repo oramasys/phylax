@@ -115,6 +115,7 @@ def test_a_tampered_field_breaks_digest_and_signature() -> None:
 
 
 def _permit_wire() -> dict[str, object]:
+    """Return a fresh copy of the vector permit wire for mutation."""
     return json.loads(VECTORS["permit"]["wire"])
 
 
