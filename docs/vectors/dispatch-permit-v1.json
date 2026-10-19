@@ -1,4 +1,5 @@
 {
+  "binding_digest": "d0e316958a948a0540e6f60a4af64c6ba9604a9a2a401e3678a8095fa2ffd5da",
   "event_preimage_example": "{\"body\":{\"finalization_id\":\"fin-vector-0001\"},\"kind\":\"finalization\",\"previous_event_digest\":\"5dcc2c0591d7e174245f32ad9856d16b6513b8dd1b403263d9678f549bd497e0\",\"version\":2}",
   "events": [
     {

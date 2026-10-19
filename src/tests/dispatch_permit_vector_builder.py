@@ -71,6 +71,7 @@ def build_vectors() -> dict[str, object]:
         "public_key": public_key.hex(),
         "genesis_event_digest": wire.GENESIS_EVENT_DIGEST,
         "permit_request": request,
+        "binding_digest": wire.binding_digest(request),
         "permit": {
             "body": permit_body, "body_bytes": wire.permit_body_bytes(permit_body).decode("utf-8"),
             "payload_digest": permit_digest, "signature": permit_signature,

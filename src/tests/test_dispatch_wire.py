@@ -64,6 +64,33 @@ def test_event_chain_links_signs_and_matches_the_finalization() -> None:
     assert json.loads(VECTORS["event_preimage_example"])["version"] == fin["revocation_version"]
 
 
+def test_binding_digest_covers_exactly_the_nine_fields() -> None:
+    """The retry-identity digest ignores requested_at, the acknowledgement and attempt_id."""
+    request = copy.deepcopy(VECTORS["permit_request"])
+    assert wire.binding_digest(request) == VECTORS["binding_digest"]
+    for ignored in ("requested_at", "consumer_acked_through", "attempt_id"):
+        changed = {**request, ignored: "x" if ignored != "consumer_acked_through" else 9}
+        assert wire.binding_digest(changed) == VECTORS["binding_digest"]
+    assert wire.binding_digest({**request, "reservation_id": "res-other"}) != VECTORS["binding_digest"]
+    assert len(wire.BINDING_FIELDS) == 9
+
+
+def test_refusal_vocabulary_is_closed_and_disjoint() -> None:
+    """Permit and finalization refusal codes are separate, namespaced and never overlap abort outcomes."""
+    assert all(code.startswith("permit.") for code in wire.PERMIT_REFUSAL_CODES)
+    assert all(code.startswith("finalization.") for code in wire.FINALIZATION_REFUSAL_CODES)
+    assert not wire.REFUSAL_CODES & wire.ABORT_OUTCOMES
+
+
+def test_epochs_must_be_positive_like_the_merged_consumer_helper() -> None:
+    """Zero epochs are refused, matching the consumer helper's minimum of 1."""
+    wire_obj = json.loads(VECTORS["permit"]["wire"])
+    for name in ("configuration_policy_epoch", "authority_epoch", "issuer_authority_version"):
+        with pytest.raises(wire.WireError):
+            wire.validate_fields({**wire_obj, name: 0}, wire.PERMIT_WIRE_FIELDS)
+    wire.validate_fields({**wire_obj, "consumer_acked_through": 0}, wire.PERMIT_WIRE_FIELDS)
+
+
 def test_finalization_id_alone_is_never_the_preimage() -> None:
     """Hashing the bare identifier gives a different digest from the canonical wrapper object."""
     last = VECTORS["events"][-1]

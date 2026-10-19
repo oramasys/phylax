@@ -30,7 +30,9 @@ Every object is a JSON object with exactly the listed keys. No extra keys, no `n
 | --- | --- | --- |
 | Text | ids, `issuer_key_id` | non-blank UTF-8, at most 1,024 bytes |
 | Digest | `grant_payload_digest`, `request_digest`, `artifact_digest`, `permit_digest`, `revocation_event_digest`, `payload_digest` | 64 lowercase hexadecimal characters |
-| Integer | `configuration_policy_epoch`, `authority_epoch`, `consumer_acked_through`, `revocation_version`, `issuer_authority_version`, `schema_version` | safe integer from 0 to 2^53 - 1; `schema_version` is exactly 1 |
+| Integer | `configuration_policy_epoch`, `authority_epoch`, `issuer_authority_version` | safe integer from 1 to 2^53 - 1 (positive, as the merged consumer helper requires) |
+| Integer | `consumer_acked_through`, `revocation_version` | safe integer from 0 to 2^53 - 1 |
+| Integer | `schema_version` | exactly 1 |
 | Timestamp | `requested_at`, `issued_at`, `expires_at` | `YYYY-MM-DDTHH:MM:SS.ffffffZ`, six digits, UTC |
 | Signature | `issuer_signature`, event `signature` | unpadded base64url of 64 bytes, canonical |
 
@@ -63,6 +65,11 @@ Every object is a JSON object with exactly the listed keys. No extra keys, no `n
 * **Signatures (SPEC domains, FREEZE-CHOICE 4 framing):** Ed25519ph (RFC 8032) over the domain bytes
   followed by the body. Permit domain `phylax-dispatch-permit-v1\x00`, finalization domain
   `phylax-dispatch-finalization-v1\x00`. This matches the v1 grant framing exactly.
+* **Binding digest (SPEC):** SHA-256 hex of the canonical object of exactly nine fields: `grant_id`,
+  `grant_payload_digest`, `operation_id`, `request_digest`, `artifact_digest`, `reservation_id`,
+  `ledger_store_id`, `configuration_policy_epoch`, `authority_epoch`. `requested_at`,
+  `consumer_acked_through` and `attempt_id` are excluded. It is byte-identical to the consumer
+  repository's merged `compute_binding_digest`, and the vector file carries one example.
 * **Event digest (SPEC):** SHA-256 hex of the canonical wrapper
   `{"body", "kind", "previous_event_digest", "version"}`. A finalization body is exactly
   `{"finalization_id": ...}`. The first event's previous digest is 64 `0` characters.
@@ -91,6 +98,7 @@ The set is closed. A collaborator or storage fault is never one of these; it rai
 | `permit.attempt_aborted` | the `attempt_id` has an `aborted` row |
 | `permit.grant_mismatch` | digest, operation, request or ledger differs from the signed grant |
 | `permit.grant_revoked` | grant, approval chain or issuer revoked, or a cascade pending |
+| `permit.grant_expired` | the signed grant has expired, so no permit can outlive it |
 | `permit.issuer_rolled_back` | the issuer counter is below `consumer_acked_through` |
 | `permit.invalid_request` | malformed request wire |
 | `finalization.conflict` (SPEC) | a changed binding value for the same permit and attempt |
@@ -110,6 +118,8 @@ Abort outcomes (not refusals): `abort.recorded`, `abort.already_aborted` (idempo
 * Wire objects: at most 65,536 bytes (SPEC). Text fields: at most 1,024 bytes. Integers: at most
   2^53 - 1. Lifetime: 90 seconds for permit and finalization (SPEC), never past the grant's expiry
   or the permit's expiry. Expiry is strict: refused when `now >= expires_at`.
+* Constants in the wire module: lifetime 90 seconds, `ISSUER_AUTHORITY_VERSION` 1 for slice 1,
+  catch-up bound 64 events.
 * Catch-up bound: 64 events per envelope, a starting value to be replaced by a measured signed-policy
   value before enablement. Recovery-call timeouts: signed policy, not fixed here.
 

@@ -36,6 +36,27 @@ GENESIS_EVENT_DIGEST: Final = "0" * 64
 
 EVENT_KINDS: Final = frozenset({"revocation", "cascade", "finalization"})
 
+PERMIT_LIFETIME_SECONDS: Final = 90
+ISSUER_AUTHORITY_VERSION: Final = 1
+CATCHUP_MAX_EVENTS: Final = 64
+
+BINDING_FIELDS: Final = (
+    "grant_id", "grant_payload_digest", "operation_id", "request_digest", "artifact_digest",
+    "reservation_id", "ledger_store_id", "configuration_policy_epoch", "authority_epoch",
+)
+
+PERMIT_REFUSAL_CODES: Final = frozenset({
+    "permit.conflict", "permit.attempt_aborted", "permit.grant_mismatch", "permit.grant_revoked",
+    "permit.grant_expired", "permit.issuer_rolled_back", "permit.invalid_request",
+})
+FINALIZATION_REFUSAL_CODES: Final = frozenset({
+    "finalization.conflict", "finalization.catchup_required", "finalization.permit_unusable",
+    "finalization.grant_revoked", "finalization.issuer_rolled_back", "finalization.key_rotated",
+    "finalization.invalid_request",
+})
+REFUSAL_CODES: Final = PERMIT_REFUSAL_CODES | FINALIZATION_REFUSAL_CODES
+ABORT_OUTCOMES: Final = frozenset({"abort.recorded", "abort.already_aborted", "abort.admission_won"})
+
 PERMIT_REQUEST_FIELDS: Final = (
     "grant_id", "grant_payload_digest", "operation_id", "request_digest", "artifact_digest",
     "reservation_id", "ledger_store_id", "configuration_policy_epoch", "authority_epoch",
@@ -68,6 +89,9 @@ _DIGEST_FIELDS: Final = frozenset({
 _INTEGER_FIELDS: Final = frozenset({
     "configuration_policy_epoch", "authority_epoch", "consumer_acked_through",
     "revocation_version", "issuer_authority_version", "schema_version",
+})
+_POSITIVE_INTEGER_FIELDS: Final = frozenset({
+    "configuration_policy_epoch", "authority_epoch", "issuer_authority_version",
 })
 _TIMESTAMP_FIELDS: Final = frozenset({"requested_at", "issued_at", "expires_at"})
 _DIGEST_RE: Final = re.compile(r"[0-9a-f]{64}")
@@ -145,8 +169,9 @@ def validate_fields(obj: Mapping[str, object], expected: tuple[str, ...]) -> Non
         raise WireError(f"fields differ: missing={missing} extra={extra}")
     for name, value in obj.items():
         if name in _INTEGER_FIELDS:
-            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_SAFE_INTEGER:
-                raise WireError(f"{name} must be a safe non-negative integer")
+            minimum = 1 if name in _POSITIVE_INTEGER_FIELDS else 0
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= MAX_SAFE_INTEGER:
+                raise WireError(f"{name} must be a safe integer of at least {minimum}")
         elif name in _DIGEST_FIELDS:
             if not isinstance(value, str) or not _DIGEST_RE.fullmatch(value):
                 raise WireError(f"{name} must be 64 lowercase hexadecimal characters")
@@ -159,6 +184,18 @@ def validate_fields(obj: Mapping[str, object], expected: tuple[str, ...]) -> Non
             _require_text(name, value)
     if obj.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION:
         raise WireError("schema_version must be the integer 1")
+
+
+def binding_digest(request: Mapping[str, object]) -> str:
+    """Return the retry-identity digest: SHA-256 of the canonical object of the nine binding fields.
+
+    ``requested_at``, ``consumer_acked_through`` and ``attempt_id`` are excluded. The encoding is
+    identical to the consumer repository's merged ``compute_binding_digest``.
+    """
+    missing = [name for name in BINDING_FIELDS if name not in request]
+    if missing:
+        raise WireError(f"binding fields missing: {missing}")
+    return sha256_hex(canonical_bytes({name: request[name] for name in BINDING_FIELDS}))
 
 
 def permit_body_bytes(body: Mapping[str, object]) -> bytes:
