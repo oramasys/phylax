@@ -28,3 +28,36 @@ jobs:
         run: python -m pytest
       - name: Compile smoke
         run: python -m compileall -q src/phylax
+
+  # Cross-repository evidence that the issuer here and the Oramasys consumer still interoperate
+  # with real Ed25519ph signatures. The Oramasys commit lives in exactly one place,
+  # src/tests/interop/oramasys-permit-pin.txt; bump it whenever the consumer changes the permit
+  # surface. Nothing here enables serving or promotes a production pin.
+  permit-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read the pinned Oramasys commit
+        id: pin
+        run: |
+          PIN="$(tr -d '[:space:]' < src/tests/interop/oramasys-permit-pin.txt)"
+          echo "$PIN" | grep -Eq '^[0-9a-f]{40}$'
+          echo "commit=$PIN" >> "$GITHUB_OUTPUT"
+      - name: Check out Oramasys at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: oramasys/oramasys
+          ref: ${{ steps.pin.outputs.commit }}
+          path: oramasys-pinned
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyNaCl only
+        run: python -m pip install 'PyNaCl>=1.5'
+      - name: Probe copies must be byte-identical
+        run: cmp src/tests/interop/c2_interop_probe.py oramasys-pinned/src/tests/interop/c2_interop_probe.py
+      - name: Run the interop probe
+        run: python src/tests/interop/c2_interop_probe.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/oramasys-pinned"
