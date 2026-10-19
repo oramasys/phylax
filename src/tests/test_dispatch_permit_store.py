@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from nacl.bindings import crypto_sign_seed_keypair
 
+from phylax import dispatch_permit_store as store_module
 from phylax import dispatch_wire as wire
 from phylax.dispatch_permit_store import (
     GrantFacts,
@@ -680,3 +681,66 @@ def test_threaded_admission_abort_race_has_one_winner(db, iteration) -> None:
     assert row_count(db) == 1
     first.close()
     second.close()
+
+
+def test_finalized_retry_applies_the_permits_r_p_floor(store, db, grants, signer) -> None:
+    """A stored finalization is refused when the counter has fallen below the permit's R_p."""
+    first = admit(store, grants, signer)
+    finalize(store, grants, signer, final_request(first))
+    grants.facts["grant-2"] = FakeGrants.live()
+    second = admit(
+        store, grants, signer,
+        permit_request(grant_id="grant-2", attempt_id="attempt-2", reservation_id="res-2",
+                       consumer_acked_through=1),
+    )
+    final_request_two = final_request(second, consumer_acked_through=1)
+    finalize(store, grants, signer, final_request_two)
+    assert json.loads(second)["revocation_version"] == 1
+    with sqlite3.connect(db) as connection:
+        connection.execute("DELETE FROM issuer_events")  # simulate a lost chain: counter 0 < R_p 1
+    request = final_request(second, consumer_acked_through=0)
+    assert refusal(finalize, store, grants, signer, request) == "finalization.issuer_rolled_back"
+
+
+def test_finalized_retry_after_key_rotation_returns_the_stored_bytes(store, db, grants) -> None:
+    """A lost-response retry is not stranded by rotation: stored bytes stay verifiable."""
+    old = FakeSigner("key-1")
+    permit = admit(store, grants, old)
+    first, _ = finalize(store, grants, old, final_request(permit))
+    again, _ = finalize(store, grants, FakeSigner("key-2"), final_request(permit))
+    assert again == first and row_count(db, "issuer_events") == 1
+    body = {k: v for k, v in json.loads(first).items() if k != "issuer_signature"}
+    assert wire.verify_finalization(public_key("key-1"), body, json.loads(first)["issuer_signature"])
+
+
+def _weakened_database(path: Path, old: str, new: str) -> None:
+    """Create a database whose DDL has the right column names but one weakened clause."""
+    assert old in store_module._SCHEMA
+    with sqlite3.connect(path) as connection:
+        connection.executescript(store_module._SCHEMA.replace(old, new, 1))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("attempt_id TEXT NOT NULL UNIQUE", "attempt_id TEXT NOT NULL"),
+        ("replaces_permit_id TEXT UNIQUE REFERENCES", "replaces_permit_id TEXT REFERENCES"),
+        ("WHERE replaces_permit_id IS NULL AND state != 'aborted'", "WHERE replaces_permit_id IS NULL"),
+        ("WHERE state IN ('issued', 'finalized')", "WHERE state IN ('issued')"),
+        ("CHECK(state != 'aborted' OR (permit_bytes IS NULL AND permit_id IS NULL))", "CHECK(1)"),
+    ],
+)
+def test_store_refuses_a_file_with_weaker_constraints_than_the_frozen_schema(tmp_path, old, new) -> None:
+    """The right column names are not enough: every constraint and index predicate must match."""
+    path = tmp_path / "weak.db"
+    _weakened_database(path, old, new)
+    with pytest.raises(RuntimeError, match="incompatible"):
+        SqliteDispatchPermitStore(path)
+
+
+def test_a_frozen_schema_file_reopens_cleanly(tmp_path) -> None:
+    """The exact frozen DDL created by another connection is accepted."""
+    path = tmp_path / "ok.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(store_module._SCHEMA)
+    SqliteDispatchPermitStore(path).close()

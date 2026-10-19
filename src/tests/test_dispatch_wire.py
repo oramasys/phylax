@@ -178,3 +178,27 @@ def test_wire_size_limit_is_enforced() -> None:
             wire.permit_wire_bytes(body, VECTORS["permit"]["signature"])
     finally:
         wire.MAX_WIRE_BYTES = original  # type: ignore[misc]
+
+
+def test_timestamps_accept_ascii_digits_only() -> None:
+    """Unicode digits such as fullwidth numerals are not canonical timestamps."""
+    for bad in ("２０２６-10-19T04:00:00.000000Z", "2026-10-19T04:00:00.０００００Z"):
+        with pytest.raises(wire.WireError):
+            wire.parse_timestamp(bad)
+        permit = json.loads(VECTORS["permit"]["wire"])
+        with pytest.raises(wire.WireError):
+            wire.validate_fields({**permit, "issued_at": bad}, wire.PERMIT_WIRE_FIELDS)
+
+
+def test_event_digest_refuses_a_non_string_kind_with_a_wire_error() -> None:
+    """An unhashable or non-string kind is a classified WireError, never a raw TypeError."""
+    for kind in (["finalization"], {"k": 1}, 7, None):
+        with pytest.raises(wire.WireError):
+            wire.event_digest(1, kind, {"finalization_id": "f"}, wire.GENESIS_EVENT_DIGEST)
+
+
+def test_canonical_bytes_classifies_non_encodable_values() -> None:
+    """NaN and unencodable values become WireError instead of leaking ValueError or TypeError."""
+    for bad in ({"a": float("nan")}, {"a": float("inf")}, {"a": object()}, {"a": "\ud800"}):
+        with pytest.raises(wire.WireError):
+            wire.canonical_bytes(bad)

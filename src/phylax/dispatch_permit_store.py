@@ -123,6 +123,27 @@ class PermitRefused(Exception):
         self.code = code
 
 
+def _normalize_sql(sql: str) -> str:
+    """Collapse whitespace so equivalent DDL text compares equal."""
+    return " ".join(sql.split())
+
+
+_EXPECTED_SQL: dict[str, str] = {}
+
+
+def _expected_sql() -> dict[str, str]:
+    """Return the DDL SQLite stores for the frozen schema, by object name (built once)."""
+    if not _EXPECTED_SQL:
+        memory = sqlite3.connect(":memory:")
+        try:
+            memory.executescript(_SCHEMA)
+            for name, sql in memory.execute("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL"):
+                _EXPECTED_SQL[name] = _normalize_sql(sql)
+        finally:
+            memory.close()
+    return _EXPECTED_SQL
+
+
 class SqliteDispatchPermitStore:
     """File-backed issuer state for dispatch permits, finalizations and the event chain."""
 
@@ -184,6 +205,16 @@ class SqliteDispatchPermitStore:
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection, *, require_all: bool) -> None:
         """Reject incompatible pre-existing tables or indexes instead of blessing them."""
+        stored = {
+            row["name"]: _normalize_sql(row["sql"]) for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL"
+            ).fetchall()
+        }
+        for name, sql in _expected_sql().items():
+            if name in stored and stored[name] != sql:
+                raise RuntimeError("dispatch permit store schema is incompatible")
+            if name not in stored and require_all:
+                raise RuntimeError("dispatch permit store schema is incompatible")
         expected = {"dispatch_permits": _COLUMNS, "issuer_events": _EVENT_COLUMNS}
         existing = {
             row["name"] for row in connection.execute(
@@ -402,7 +433,7 @@ class SqliteDispatchPermitStore:
         if now >= wire.parse_timestamp(body["expires_at"]):
             raise PermitRefused("finalization.permit_unusable")
         acked = request["consumer_acked_through"]
-        if counter < acked:
+        if counter < acked or counter < row["r_p"]:
             raise PermitRefused("finalization.issuer_rolled_back")
         r_f = body["revocation_version"]
         if r_f - acked > catchup_max:

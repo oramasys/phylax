@@ -95,7 +95,7 @@ _POSITIVE_INTEGER_FIELDS: Final = frozenset({
 })
 _TIMESTAMP_FIELDS: Final = frozenset({"requested_at", "issued_at", "expires_at"})
 _DIGEST_RE: Final = re.compile(r"[0-9a-f]{64}")
-_TIMESTAMP_RE: Final = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
+_TIMESTAMP_RE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
 
 
 class WireError(ValueError):
@@ -142,9 +142,12 @@ def canonical_bytes(obj: Mapping[str, object]) -> bytes:
     """Serialize ``obj`` as the one valid canonical JSON form (sorted keys, no whitespace)."""
     if not isinstance(obj, Mapping):
         raise WireError("canonical form requires an object")
-    return json.dumps(
-        dict(obj), ensure_ascii=False, separators=(",", ":"), sort_keys=True, allow_nan=False
-    ).encode("utf-8")
+    try:
+        return json.dumps(
+            dict(obj), ensure_ascii=False, separators=(",", ":"), sort_keys=True, allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise WireError("value cannot be canonicalised") from exc
 
 
 def sha256_hex(data: bytes) -> str:
@@ -248,7 +251,7 @@ def event_digest(version: int, kind: str, body: Mapping[str, object], previous_e
     the body is exactly ``{"finalization_id": ...}``; ``finalization_id`` alone is never the
     preimage. The signature is detached and is not part of the preimage.
     """
-    if kind not in EVENT_KINDS:
+    if not isinstance(kind, str) or kind not in EVENT_KINDS:
         raise WireError("unknown event kind")
     if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= MAX_SAFE_INTEGER:
         raise WireError("event version must be a positive safe integer")
