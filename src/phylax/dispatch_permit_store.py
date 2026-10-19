@@ -583,6 +583,13 @@ class SqliteDispatchPermitStore:
         the consumer's store, and safety does not rest on it (the consumer fences first and
         consumes the grant's single use at step 4.3). The abandon applies only while the permit
         is nonterminal and has no successor; later finalization of it is refused.
+
+        Nonterminal means ``issued`` or ``finalized`` (spec glossary: only ``abandoned`` and
+        ``aborted`` are terminal, and ``finalized`` stays retryable). Abandoning a ``finalized``
+        permit is intended: the abandon marks "the prior permit, and any finalization,
+        ``abandoned``". The finalization already committed here stays live at the issuer and is made
+        safe by the consumer, which refuses a fenced attempt at 4.3 and refuses any later permit for
+        a use it has already consumed, so a wrong attestation cannot cause a second dispatch.
         """
         try:
             wire.validate_abandon_attestation(attestation)

@@ -186,6 +186,10 @@ share one serialization domain; there is no lock-order problem to solve in slice
   `abandon.invalid_attestation`, `abandon.permit_unknown`, `abandon.attempt_mismatch`,
   `abandon.permit_terminal` (a nonterminal permit that already has a successor, reachable only through
   a corrupted store) and `abandon.conflict` (a different attestation for an already abandoned permit).
+  Nonterminal means `issued` or `finalized`, as in the specification's glossary (only `abandoned` and
+  `aborted` are terminal). Abandoning a `finalized` permit is therefore intended, not a gap: the abandon
+  marks the prior permit "and any finalization" abandoned, the finalization stays live at the issuer, and
+  safety rests on the consumer (step 4.3 refuses a fenced attempt and any later permit for a consumed use).
 * **FREEZE-CHOICE 16, operator authority.** `abort`, `abandon` and `lookup_attempt` take a required
   keyword `operator` implementing `OperatorAuthority.authorize(operation, attempt_id=, grant_id=)`, which
   returns a non-blank disposition reference or None. A None or blank result raises `OperatorRefused`

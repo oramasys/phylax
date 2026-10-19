@@ -399,3 +399,25 @@ def test_the_abandon_vocabulary_is_closed_and_separate_from_permit_refusals() ->
     assert wire.ABANDON_REFUSAL_CODES.isdisjoint(wire.REFUSAL_CODES)
     with pytest.raises(ValueError):
         AbandonRefused("abandon.made_up")
+
+
+def test_abandoning_a_finalized_permit_is_intended_and_keeps_the_audit_trail(store, db, grants, signer) -> None:
+    """Spec: abandon marks the prior permit "and any finalization"; ``finalized`` is nonterminal.
+
+    The finalization and its chain event stay recorded (audit), the abandoned permit can never
+    finalize again, and the grant's successor is a fresh, independently validated issuance. Safety
+    for a wrong attestation is the consumer's: 4.3 refuses a fenced attempt and a consumed use.
+    """
+    permit = admit(store, grants, signer)
+    request = final_request(permit)
+    final_bytes, _ = finalize(store, grants, signer, request)
+    events_before = store.events(1, 10)
+    store.abandon(attestation(permit), operator=OPERATOR, now=NOW)
+    row = store.lookup_attempt("attempt-1", operator=OPERATOR)
+    assert row["state"] == "abandoned"
+    assert bytes(row["finalization_bytes"]) == final_bytes and row["finalization_id"]
+    assert store.events(1, 10) == events_before
+    assert refusal(finalize, store, grants, signer, request) == "finalization.permit_unusable"
+    successor = admit(store, grants, signer, permit_request(attempt_id="attempt-2"))
+    assert json.loads(successor)["permit_id"] != json.loads(permit)["permit_id"]
+    assert store.lookup_attempt("attempt-2", operator=OPERATOR)["replaces_permit_id"] == json.loads(permit)["permit_id"]
