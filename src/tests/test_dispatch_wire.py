@@ -202,3 +202,15 @@ def test_canonical_bytes_classifies_non_encodable_values() -> None:
     for bad in ({"a": float("nan")}, {"a": float("inf")}, {"a": object()}, {"a": "\ud800"}):
         with pytest.raises(wire.WireError):
             wire.canonical_bytes(bad)
+
+
+@pytest.mark.parametrize("body", [None, "finalization_id", ["finalization_id"], 7])
+def test_event_digest_refuses_a_non_mapping_body_with_a_wire_error(body: object) -> None:
+    with pytest.raises(wire.WireError, match="event body must be an object"):
+        wire.event_digest(1, "finalization", body, "0" * 64)
+
+
+@pytest.mark.parametrize("previous", [None, 0, b"0" * 64])
+def test_event_digest_refuses_a_non_string_previous_digest_with_a_wire_error(previous: object) -> None:
+    with pytest.raises(wire.WireError, match="previous_event_digest"):
+        wire.event_digest(1, "finalization", {"finalization_id": "f-1"}, previous)

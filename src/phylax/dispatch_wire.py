@@ -255,8 +255,10 @@ def event_digest(version: int, kind: str, body: Mapping[str, object], previous_e
         raise WireError("unknown event kind")
     if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= MAX_SAFE_INTEGER:
         raise WireError("event version must be a positive safe integer")
-    if not _DIGEST_RE.fullmatch(previous_event_digest):
+    if not isinstance(previous_event_digest, str) or not _DIGEST_RE.fullmatch(previous_event_digest):
         raise WireError("previous_event_digest must be 64 lowercase hexadecimal characters")
+    if not isinstance(body, Mapping):
+        raise WireError("event body must be an object")
     if kind == "finalization":
         if set(body) != {"finalization_id"}:
             raise WireError("a finalization event body is exactly {finalization_id}")
