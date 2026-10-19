@@ -38,6 +38,22 @@ def seed_file(root: Path, name: str, content: str = SEED_HEX, mode: int = 0o600)
     return path
 
 
+@pytest.fixture(autouse=True)
+def close_opened_verification_stores(monkeypatch: pytest.MonkeyPatch):
+    """Close every verification store a test opens; each retains a SQLite connection."""
+    opened: list[SqliteGrantVerificationStore] = []
+    original = SqliteGrantVerificationStore.__init__
+
+    def tracking_init(self: SqliteGrantVerificationStore, *args: object, **kwargs: object) -> None:
+        original(self, *args, **kwargs)
+        opened.append(self)
+
+    monkeypatch.setattr(SqliteGrantVerificationStore, "__init__", tracking_init)
+    yield
+    for store in opened:
+        store.close()
+
+
 @pytest.fixture
 def seeds(tmp_path: Path) -> Path:
     """Return a private seed directory holding an issuer seed and a P5 secret."""
