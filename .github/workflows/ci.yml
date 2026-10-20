@@ -61,3 +61,5 @@ jobs:
         run: cmp src/tests/interop/c2_interop_probe.py oramasys-pinned/src/tests/interop/c2_interop_probe.py
       - name: Run the interop probe
         run: python src/tests/interop/c2_interop_probe.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/oramasys-pinned"
+      - name: Run the slice 2 interop probe
+        run: python src/tests/interop/c2_slice2_probe.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/oramasys-pinned"
