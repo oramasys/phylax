@@ -30,6 +30,9 @@ _COLUMNS = (
 _EVENT_COLUMNS = (
     "version", "kind", "body", "previous_event_digest", "event_digest", "issuer_key_id", "signature",
 )
+_ATTESTATION_COLUMNS = (
+    "permit_id", "attempt_id", "attestation_digest", "attestation", "disposition_ref", "recorded_at",
+)
 _INDEXES = ("one_original_permit_per_grant", "one_nonterminal_permit_per_grant")
 _LIFETIME = timedelta(seconds=wire.PERMIT_LIFETIME_SECONDS)
 
@@ -64,6 +67,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_original_permit_per_grant
     ON dispatch_permits(grant_id) WHERE replaces_permit_id IS NULL AND state != 'aborted';
 CREATE UNIQUE INDEX IF NOT EXISTS one_nonterminal_permit_per_grant
     ON dispatch_permits(grant_id) WHERE state IN ('issued', 'finalized');
+CREATE TABLE IF NOT EXISTS abandon_attestations (
+    permit_id TEXT PRIMARY KEY REFERENCES dispatch_permits(permit_id),
+    attempt_id TEXT NOT NULL,
+    attestation_digest TEXT NOT NULL,
+    attestation TEXT NOT NULL,
+    disposition_ref TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS issuer_events (
     version INTEGER PRIMARY KEY CHECK(version >= 1),
     kind TEXT NOT NULL,
@@ -121,6 +132,42 @@ class PermitRefused(Exception):
             raise ValueError(f"unknown refusal code: {code}")
         super().__init__(code)
         self.code = code
+
+
+class OperatorAuthority(Protocol):
+    """Injected port that authenticates the operator acting for the authorized consumer scope."""
+
+    def authorize(self, operation: str, *, attempt_id: str, grant_id: str | None) -> str | None:
+        """Return a non-blank operator disposition reference, or None when not authorized.
+
+        ``operation`` is ``lookup``, ``abort`` or ``abandon``. A lookup only inspects and can
+        never authorize a release; an abort or abandon is a recorded, operator-owned decision.
+        """
+
+
+class OperatorRefused(Exception):
+    """The operator port did not authorize the call; nothing was read or written."""
+
+
+class AbandonRefused(Exception):
+    """A closed-vocabulary abandon refusal carrying its frozen ``code``."""
+
+    def __init__(self, code: str) -> None:
+        """Record the refusal code, which must belong to the abandon vocabulary."""
+        if code not in wire.ABANDON_REFUSAL_CODES:
+            raise ValueError(f"unknown abandon refusal code: {code}")
+        super().__init__(code)
+        self.code = code
+
+
+def _operator_ref(
+    operator: OperatorAuthority, operation: str, *, attempt_id: str, grant_id: str | None
+) -> str:
+    """Return the operator disposition reference or refuse before touching the database."""
+    reference = operator.authorize(operation, attempt_id=attempt_id, grant_id=grant_id)
+    if not isinstance(reference, str) or not reference.strip():
+        raise OperatorRefused(f"operator is not authorized to {operation}")
+    return reference
 
 
 def _normalize_sql(sql: str) -> str:
@@ -215,7 +262,10 @@ class SqliteDispatchPermitStore:
                 raise RuntimeError("dispatch permit store schema is incompatible")
             if name not in stored and require_all:
                 raise RuntimeError("dispatch permit store schema is incompatible")
-        expected = {"dispatch_permits": _COLUMNS, "issuer_events": _EVENT_COLUMNS}
+        expected = {
+            "dispatch_permits": _COLUMNS, "issuer_events": _EVENT_COLUMNS,
+            "abandon_attestations": _ATTESTATION_COLUMNS,
+        }
         existing = {
             row["name"] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
@@ -240,8 +290,14 @@ class SqliteDispatchPermitStore:
         with self._connection() as connection:
             return self._counter(connection)
 
-    def lookup_attempt(self, attempt_id: str) -> dict[str, object] | None:
-        """Return the stored row for an attempt id, or None (read-only)."""
+    def lookup_attempt(
+        self, attempt_id: str, *, operator: OperatorAuthority
+    ) -> dict[str, object] | None:
+        """Return the stored row for an attempt id, or None (read-only, operator-authenticated).
+
+        Inspection only: nothing returned here ever authorizes a release or an abandon.
+        """
+        _operator_ref(operator, "lookup", attempt_id=attempt_id, grant_id=None)
         with self._connection() as connection:
             row = self._row_by_attempt(connection, attempt_id)
         return None if row is None else dict(row)
@@ -288,17 +344,23 @@ class SqliteDispatchPermitStore:
         except wire.WireError:
             raise PermitRefused("permit.invalid_request") from None
         with self._write() as connection:
-            stored = self._admit_existing(connection, request)
+            stored, replaces = self._admit_existing(connection, request)
             if stored is not None:
                 return stored
             facts = self._check_grant(request, grants, now)
             counter = self._counter(connection)
             if counter < request["consumer_acked_through"]:
                 raise PermitRefused("permit.issuer_rolled_back")
-            return self._issue(connection, request, facts, signer, now, counter)
+            return self._issue(connection, request, facts, signer, now, counter, replaces)
 
-    def _admit_existing(self, connection: sqlite3.Connection, request: Mapping[str, object]) -> bytes | None:
-        """Resolve an existing attempt row or grant conflict; None when admission is fresh."""
+    def _admit_existing(
+        self, connection: sqlite3.Connection, request: Mapping[str, object]
+    ) -> tuple[bytes | None, str | None]:
+        """Resolve an attempt row or grant state: (stored bytes, None), or (None, predecessor).
+
+        The predecessor is the grant's ``abandoned`` permit with no successor, which makes the
+        request a successor request; it is None for a first issuance.
+        """
         row = self._row_by_attempt(connection, request["attempt_id"])
         if row is not None:
             if row["state"] == "aborted":
@@ -307,14 +369,17 @@ class SqliteDispatchPermitStore:
                 raise PermitRefused("permit.conflict")
             if self._counter(connection) < request["consumer_acked_through"]:
                 raise PermitRefused("permit.issuer_rolled_back")
-            return bytes(row["permit_bytes"])
-        other = connection.execute(
-            "SELECT 1 FROM dispatch_permits WHERE grant_id = ? AND state != 'aborted' LIMIT 1",
+            return bytes(row["permit_bytes"]), None
+        latest = connection.execute(
+            "SELECT permit_id, state FROM dispatch_permits WHERE grant_id = ? AND state != 'aborted'"
+            " ORDER BY row_id DESC LIMIT 1",
             (request["grant_id"],),
         ).fetchone()
-        if other is not None:
+        if latest is None:
+            return None, None
+        if latest["state"] != "abandoned":
             raise PermitRefused("permit.conflict")
-        return None
+        return None, str(latest["permit_id"])
 
     @staticmethod
     def _check_grant(
@@ -339,6 +404,7 @@ class SqliteDispatchPermitStore:
     def _issue(
         self, connection: sqlite3.Connection, request: Mapping[str, object],
         facts: GrantFacts, signer: IssuerSigner, now: datetime, counter: int,
+        replaces: str | None = None,
     ) -> bytes:
         """Build, sign and persist a new permit; return its wire bytes."""
         key_id = signer.active_key_id()
@@ -358,14 +424,14 @@ class SqliteDispatchPermitStore:
         connection.execute(
             "INSERT INTO dispatch_permits(permit_id, grant_id, attempt_id, state, binding_digest,"
             " ledger_store_id, reservation_id, request_digest, r_p, consumer_acked_through,"
-            " requested_at, issued_at, expires_at, permit_bytes, payload_digest, issuer_key_id)"
-            " VALUES(?,?,?,'issued',?,?,?,?,?,?,?,?,?,?,?,?)",
+            " requested_at, issued_at, expires_at, permit_bytes, payload_digest, issuer_key_id,"
+            " replaces_permit_id) VALUES(?,?,?,'issued',?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 body["permit_id"], request["grant_id"], request["attempt_id"],
                 wire.binding_digest(request), request["ledger_store_id"], request["reservation_id"],
                 request["request_digest"], counter, request["consumer_acked_through"],
                 request["requested_at"], body["issued_at"], body["expires_at"], permit_bytes,
-                wire.permit_payload_digest(body), key_id,
+                wire.permit_payload_digest(body), key_id, replaces,
             ),
         )
         return permit_bytes
@@ -489,9 +555,10 @@ class SqliteDispatchPermitStore:
         return final_bytes, self._envelope(connection, request["consumer_acked_through"], r_f)
 
     def abort(
-        self, attempt_id: str, grant_id: str, *, disposition_ref: str, now: datetime
+        self, attempt_id: str, grant_id: str, *, operator: OperatorAuthority, now: datetime
     ) -> tuple[str, bytes | None]:
-        """Serialize an abort against admission: exactly one of the two wins per attempt."""
+        """Serialize an operator-authenticated abort against admission: exactly one wins."""
+        disposition_ref = _operator_ref(operator, "abort", attempt_id=attempt_id, grant_id=grant_id)
         with self._write() as connection:
             row = self._row_by_attempt(connection, attempt_id)
             if row is None:
@@ -506,3 +573,72 @@ class SqliteDispatchPermitStore:
             if row["grant_id"] != grant_id:
                 raise PermitRefused("permit.conflict")
             return "abort.admission_won", bytes(row["permit_bytes"])
+
+    def abandon(
+        self, attestation: Mapping[str, object], *, operator: OperatorAuthority, now: datetime
+    ) -> tuple[str, dict[str, object]]:
+        """Record an operator-authenticated, attested abandon; an identical retry is idempotent.
+
+        The attestation is stored as audit evidence and is NOT verified: the issuer cannot see
+        the consumer's store, and safety does not rest on it (the consumer fences first and
+        consumes the grant's single use at step 4.3). The abandon applies only while the permit
+        is nonterminal and has no successor; later finalization of it is refused.
+
+        Nonterminal means ``issued`` or ``finalized`` (spec glossary: only ``abandoned`` and
+        ``aborted`` are terminal, and ``finalized`` stays retryable). Abandoning a ``finalized``
+        permit is intended: the abandon marks "the prior permit, and any finalization,
+        ``abandoned``". The finalization already committed here stays live at the issuer and is made
+        safe by the consumer, which refuses a fenced attempt at 4.3 and refuses any later permit for
+        a use it has already consumed, so a wrong attestation cannot cause a second dispatch.
+        """
+        try:
+            wire.validate_abandon_attestation(attestation)
+        except wire.WireError:
+            raise AbandonRefused("abandon.invalid_attestation") from None
+        attempt_id = str(attestation["attempt_id"])
+        disposition_ref = _operator_ref(operator, "abandon", attempt_id=attempt_id, grant_id=None)
+        digest = wire.attestation_digest(attestation)
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT * FROM dispatch_permits WHERE permit_id = ?", (attestation["permit_id"],)
+            ).fetchone()
+            if row is None:
+                raise AbandonRefused("abandon.permit_unknown")
+            if row["attempt_id"] != attempt_id:
+                raise AbandonRefused("abandon.attempt_mismatch")
+            stored = connection.execute(
+                "SELECT * FROM abandon_attestations WHERE permit_id = ?", (row["permit_id"],)
+            ).fetchone()
+            if row["state"] == "abandoned":
+                if stored is not None and stored["attestation_digest"] == digest:
+                    return "abandon.already_abandoned", self._abandon_record(stored)
+                raise AbandonRefused("abandon.conflict")
+            if connection.execute(
+                "SELECT 1 FROM dispatch_permits WHERE replaces_permit_id = ?", (row["permit_id"],)
+            ).fetchone() is not None:
+                raise AbandonRefused("abandon.permit_terminal")
+            connection.execute(
+                "UPDATE dispatch_permits SET state = 'abandoned' WHERE row_id = ?", (row["row_id"],)
+            )
+            connection.execute(
+                "INSERT INTO abandon_attestations(permit_id, attempt_id, attestation_digest,"
+                " attestation, disposition_ref, recorded_at) VALUES(?,?,?,?,?,?)",
+                (
+                    row["permit_id"], attempt_id, digest,
+                    wire.canonical_bytes(dict(attestation)).decode("utf-8"), disposition_ref,
+                    wire.timestamp(now),
+                ),
+            )
+            recorded = connection.execute(
+                "SELECT * FROM abandon_attestations WHERE permit_id = ?", (row["permit_id"],)
+            ).fetchone()
+            return "abandon.recorded", self._abandon_record(recorded)
+
+    @staticmethod
+    def _abandon_record(row: sqlite3.Row) -> dict[str, object]:
+        """Return the recorded abandon outcome as a plain dict."""
+        return {
+            "permit_id": row["permit_id"], "attempt_id": row["attempt_id"],
+            "attestation_digest": row["attestation_digest"],
+            "disposition_ref": row["disposition_ref"], "recorded_at": row["recorded_at"],
+        }

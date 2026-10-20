@@ -174,14 +174,43 @@ share one serialization domain; there is no lock-order problem to solve in slice
   file with weaker constraints). It adds no private-file-mode handling, as the existing writer store
   has none.
 
+## 8b. Slice 2 issuer notes (for reviewers; each is a choice to confirm)
+
+* **FREEZE-CHOICE 15, abandon attestation and vocabulary.** The consumer attestation has exactly eight
+  fields: `attempt_id`, `permit_id`, `cause` (`transient_delay`, `cancellation` or `loss`),
+  `consumer_fencing_epoch` (integer of at least 1), `fence_evidence`, `non_commit_evidence`,
+  `release_pending_record` (non-blank text) and `no_intent_exists` (must be `true`). The issuer stores it
+  as audit evidence and never claims to verify it; no safety property rests on it. Outcomes are
+  `abandon.recorded` and `abandon.already_abandoned` (an identical retry returns the recorded outcome).
+  Refusals are a separate closed set, not the permit or finalization refusals:
+  `abandon.invalid_attestation`, `abandon.permit_unknown`, `abandon.attempt_mismatch`,
+  `abandon.permit_terminal` (a nonterminal permit that already has a successor, reachable only through
+  a corrupted store) and `abandon.conflict` (a different attestation for an already abandoned permit).
+  Nonterminal means `issued` or `finalized`, as in the specification's glossary (only `abandoned` and
+  `aborted` are terminal). Abandoning a `finalized` permit is therefore intended, not a gap: the abandon
+  marks the prior permit "and any finalization" abandoned, the finalization stays live at the issuer, and
+  safety rests on the consumer (step 4.3 refuses a fenced attempt and any later permit for a consumed use).
+* **FREEZE-CHOICE 16, operator authority.** `abort`, `abandon` and `lookup_attempt` take a required
+  keyword `operator` implementing `OperatorAuthority.authorize(operation, attempt_id=, grant_id=)`, which
+  returns a non-blank disposition reference or None. A None or blank result raises `OperatorRefused`
+  before any read or write; there is no default, so a caller cannot forget it. A lookup only inspects and
+  never authorizes a release. The abort disposition recorded is the operator's reference. Wiring a real
+  authenticator is deferred.
+* **FREEZE-CHOICE 17, successor.** A request with a new `attempt_id` is a successor request exactly when
+  the grant's latest non-aborted permit is `abandoned`; it is validated as a fresh issuance (every 4.2
+  check) and records `replaces_permit_id` in the same transaction. A latest permit that is `issued` or
+  `finalized`, expired or not, remains `permit.conflict`. The unique `replaces_permit_id` and the
+  one-nonterminal-permit index are the database-level guards against two successors.
+* **Schema.** One additive table, `abandon_attestations`, created on open for a slice-1 database.
+
 ## 9. What is not in slice 1
 
 Deliberately deferred, so slice 1 is not mistaken for the whole ratified specification:
 
-* **Issuer:** the attested abandon and the successor request (an `abandoned` permit with no successor),
-  the operator lookup and operator authentication of abort and abandon (the store's abort method
-  trusts its caller), reconciliation, retention and checkpoints, and wiring the signer port to the
-  existing key registry.
+* **Issuer:** reconciliation as a bulk operator disposition, retention and checkpoints, and wiring the
+  signer port to the existing key registry and the operator port to a real authenticator. (The attested
+  abandon, the successor request, and operator authentication of abort, abandon and lookup are in
+  slice 2, section 8b.)
 * **Consumer client:** request-side validators (12 and 8 fields), catch-up envelope validation
   (contiguity, `from_version`, `through_version`, the 64-event bound; slice 1 ingests a bare event
   list), wiring the sender precondition at the effect boundary, a durable UTC high-water mark, the

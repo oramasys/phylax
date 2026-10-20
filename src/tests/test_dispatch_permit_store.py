@@ -88,6 +88,23 @@ class FakeSigner:
         return wire.sign_event(SEEDS[key_id], digest)
 
 
+class FakeOperator:
+    """Operator authority port: authorizes every operation with a fixed reference, or none."""
+
+    def __init__(self, reference: str | None = "op-1") -> None:
+        """Choose the disposition reference returned (None denies every call)."""
+        self.reference = reference
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    def authorize(self, operation: str, *, attempt_id: str, grant_id: str | None) -> str | None:
+        """Record the call and return the configured reference."""
+        self.calls.append((operation, attempt_id, grant_id))
+        return self.reference
+
+
+OPERATOR = FakeOperator()
+
+
 def public_key(key_id: str = "key-1") -> bytes:
     """Return the public key for a fixed test seed."""
     return crypto_sign_seed_keypair(SEEDS[key_id])[0]
@@ -235,7 +252,7 @@ def test_new_attempt_after_finalized_permit_conflicts(store, db, grants, signer)
 
 def test_aborted_then_admission_is_refused(store, db, grants, signer) -> None:
     """An aborted attempt id can never be admitted."""
-    assert store.abort("attempt-1", GRANT_ID, disposition_ref="op-1", now=NOW) == ("abort.recorded", None)
+    assert store.abort("attempt-1", GRANT_ID, operator=OPERATOR, now=NOW) == ("abort.recorded", None)
     assert refusal(admit, store, grants, signer) == "permit.attempt_aborted"
     assert row_count(db) == 1
 
@@ -243,16 +260,16 @@ def test_aborted_then_admission_is_refused(store, db, grants, signer) -> None:
 def test_admission_then_abort_admission_won_no_tombstone(store, db, grants, signer) -> None:
     """Abort after admission returns the permit and writes no tombstone."""
     permit = admit(store, grants, signer)
-    outcome = store.abort("attempt-1", GRANT_ID, disposition_ref="op-1", now=NOW)
+    outcome = store.abort("attempt-1", GRANT_ID, operator=OPERATOR, now=NOW)
     assert outcome == ("abort.admission_won", permit) and row_count(db) == 1
-    assert store.lookup_attempt("attempt-1")["state"] == "issued"
+    assert store.lookup_attempt("attempt-1", operator=OPERATOR)["state"] == "issued"
 
 
 def test_abort_twice_is_idempotent(store, grants, signer) -> None:
     """A second abort reports already_aborted."""
-    store.abort("attempt-1", GRANT_ID, disposition_ref="op-1", now=NOW)
+    store.abort("attempt-1", GRANT_ID, operator=OPERATOR, now=NOW)
     assert (
-        store.abort("attempt-1", GRANT_ID, disposition_ref="op-2", now=NOW)
+        store.abort("attempt-1", GRANT_ID, operator=FakeOperator("op-2"), now=NOW)
         == ("abort.already_aborted", None)
     )
 
@@ -260,12 +277,12 @@ def test_abort_twice_is_idempotent(store, grants, signer) -> None:
 def test_abort_with_other_grant_conflicts(store, grants, signer) -> None:
     """Aborting a live attempt under a different grant id is a conflict."""
     admit(store, grants, signer)
-    assert refusal(store.abort, "attempt-1", "grant-9", disposition_ref="x", now=NOW) == "permit.conflict"
+    assert refusal(store.abort, "attempt-1", "grant-9", operator=OPERATOR, now=NOW) == "permit.conflict"
 
 
 def test_abort_first_then_new_attempt_for_same_grant_is_admitted(store, db, grants, signer) -> None:
     """An aborted row does not hold the grant: a new attempt id is admitted."""
-    store.abort("attempt-1", GRANT_ID, disposition_ref="op-1", now=NOW)
+    store.abort("attempt-1", GRANT_ID, operator=OPERATOR, now=NOW)
     data = admit(store, grants, signer, permit_request(attempt_id="attempt-2"))
     assert json.loads(data)["attempt_id"] == "attempt-2" and row_count(db) == 2
 
@@ -328,7 +345,7 @@ def test_finalization_happy_path(store, db, grants, signer) -> None:
     assert event["previous_event_digest"] == wire.GENESIS_EVENT_DIGEST
     assert event["body"] == {"finalization_id": fin["finalization_id"]}
     assert envelope == {"events": [event], "from_version": 1, "through_version": 1}
-    assert store.lookup_attempt("attempt-1")["state"] == "finalized"
+    assert store.lookup_attempt("attempt-1", operator=OPERATOR)["state"] == "finalized"
     assert row_count(db, "issuer_events") == 1 and store.current_counter() == 1
 
 
@@ -447,7 +464,7 @@ def test_catchup_bound_exceeded_changes_nothing(store, db, grants, signer) -> No
     code = refusal(finalize, store, grants, signer, final_request(permit), catchup_max=3)
     assert code == "finalization.catchup_required"
     assert row_count(db, "issuer_events") == 3
-    assert store.lookup_attempt("attempt-1")["state"] == "issued"
+    assert store.lookup_attempt("attempt-1", operator=OPERATOR)["state"] == "issued"
     request = final_request(permit, consumer_acked_through=1)
     data, envelope = finalize(store, grants, signer, request, catchup_max=3)
     assert envelope["from_version"] == 2 and envelope["through_version"] == 4
@@ -646,9 +663,9 @@ def test_schema_guards(tmp_path: Path) -> None:
 
 def test_read_only_helpers(store, grants, signer) -> None:
     """lookup_attempt and events return plain data without writes."""
-    assert store.lookup_attempt("missing") is None and store.events(1, 5) == []
+    assert store.lookup_attempt("missing", operator=OPERATOR) is None and store.events(1, 5) == []
     admit(store, grants, signer)
-    assert store.lookup_attempt("attempt-1")["grant_id"] == GRANT_ID
+    assert store.lookup_attempt("attempt-1", operator=OPERATOR)["grant_id"] == GRANT_ID
 
 
 @pytest.mark.parametrize("iteration", range(30))
@@ -674,7 +691,7 @@ def test_threaded_admission_abort_race_has_one_winner(db, iteration) -> None:
     def do_abort() -> None:
         """Abort after the barrier."""
         barrier.wait()
-        results["abort"] = second.abort(attempt, f"g-{iteration}", disposition_ref="op", now=NOW)
+        results["abort"] = second.abort(attempt, f"g-{iteration}", operator=OPERATOR, now=NOW)
 
     grants.facts[f"g-{iteration}"] = grants.live()
     threads = [threading.Thread(target=do_admit), threading.Thread(target=do_abort)]
@@ -682,7 +699,7 @@ def test_threaded_admission_abort_race_has_one_winner(db, iteration) -> None:
         thread.start()
     for thread in threads:
         thread.join()
-    row = first.lookup_attempt(attempt)
+    row = first.lookup_attempt(attempt, operator=OPERATOR)
     admitted = isinstance(results["admit"], bytes)
     if admitted:
         assert results["abort"] == ("abort.admission_won", results["admit"])
