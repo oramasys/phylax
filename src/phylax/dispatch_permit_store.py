@@ -568,10 +568,10 @@ class SqliteDispatchPermitStore:
                     (grant_id, attempt_id, wire.timestamp(now), disposition_ref),
                 )
                 return "abort.recorded", None
-            if row["state"] == "aborted":
-                return "abort.already_aborted", None
             if row["grant_id"] != grant_id:
                 raise PermitRefused("permit.conflict")
+            if row["state"] == "aborted":
+                return "abort.already_aborted", None
             return "abort.admission_won", bytes(row["permit_bytes"])
 
     def abandon(

@@ -274,10 +274,47 @@ def test_abort_twice_is_idempotent(store, grants, signer) -> None:
     )
 
 
-def test_abort_with_other_grant_conflicts(store, grants, signer) -> None:
-    """Aborting a live attempt under a different grant id is a conflict."""
-    admit(store, grants, signer)
-    assert refusal(store.abort, "attempt-1", "grant-9", operator=OPERATOR, now=NOW) == "permit.conflict"
+@pytest.mark.parametrize("admitted", [False, True], ids=["aborted", "admitted"])
+@pytest.mark.parametrize("reopen", [False, True], ids=["same-store", "reopened"])
+def test_abort_with_other_grant_conflicts_without_mutation(store, db, grants, signer, admitted, reopen) -> None:
+    """Wrong-grant aborts cannot return success or change a durable attempt's binding or evidence."""
+    if admitted:
+        admit(store, grants, signer)
+    else:
+        store.abort("attempt-1", GRANT_ID, operator=FakeOperator("op-original"), now=NOW)
+    with open_db(db) as connection:
+        before = list(connection.iterdump())
+    if reopen:
+        store.close()
+        store = SqliteDispatchPermitStore(db)
+    try:
+        assert refusal(
+            store.abort, "attempt-1", "grant-9", operator=FakeOperator("op-retry"),
+            now=NOW + timedelta(seconds=5),
+        ) == "permit.conflict"
+        with open_db(db) as connection:
+            assert list(connection.iterdump()) == before
+    finally:
+        if reopen:
+            store.close()
+
+
+@pytest.mark.parametrize("admitted", [False, True], ids=["aborted", "admitted"])
+def test_same_grant_abort_retry_preserves_original_evidence(store, db, grants, signer, admitted) -> None:
+    """Authorized same-grant retries return the original outcome without replacing any evidence."""
+    if admitted:
+        permit = admit(store, grants, signer)
+        expected = ("abort.admission_won", permit)
+    else:
+        store.abort("attempt-1", GRANT_ID, operator=FakeOperator("op-original"), now=NOW)
+        expected = ("abort.already_aborted", None)
+    with open_db(db) as connection:
+        before = list(connection.iterdump())
+    assert store.abort(
+        "attempt-1", GRANT_ID, operator=FakeOperator("op-retry"), now=NOW + timedelta(seconds=5),
+    ) == expected
+    with open_db(db) as connection:
+        assert list(connection.iterdump()) == before
 
 
 def test_abort_first_then_new_attempt_for_same_grant_is_admitted(store, db, grants, signer) -> None:
