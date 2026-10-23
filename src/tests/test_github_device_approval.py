@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -48,7 +49,9 @@ class Runner:
         self._responses = iter(responses)
         self.calls: list[tuple[list[str], dict[str, str], bool]] = []
 
-    def __call__(self, command: list[str], *, env: dict[str, str], capture_output: bool) -> str:
+    def __call__(
+        self, command: list[str], *, env: dict[str, str], capture_output: bool, timeout: float,
+    ) -> str:
         self.calls.append((command, env, capture_output))
         return next(self._responses)
 
@@ -58,6 +61,7 @@ def no_ambient_github_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep ordinary adapter tests independent of workstation token exports."""
     for name in (
         "GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_COPILOT_PAT",
+        "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GITHUB_HOST", "GH_REPO",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -74,29 +78,36 @@ def marker(config_dir: Path, *, account: str = "operator", issued_at: int | None
     path.chmod(0o600)
 
 
+def account(*, login: str = "operator", user_id: int = 7) -> str:
+    """Return the stable identity response exposed by the GitHub API."""
+    return json.dumps({"login": login, "id": user_id})
+
+
 def comment(
-    launch: ModelLaunchIntent, *, account: str = "operator", body: str | None = None,
+    launch: ModelLaunchIntent, *, account: str = "operator", user_id: int = 7, body: str | None = None,
     created_at: str = "2026-10-23T00:00:00Z",
 ) -> str:
     """Return a minimal GitHub API comment response."""
     return json.dumps({
         "id": 17,
         "html_url": "https://github.com/acme/control/issues/7#issuecomment-17",
-        "user": {"login": account},
+        "user": {"login": account, "id": user_id},
         "body": body or approval_body(launch),
         "created_at": created_at,
         "updated_at": created_at,
     })
 
 
-def verifier(config_dir: Path, responses: list[str], *, now=NOW) -> tuple[GitHubCliModelApprovalVerifier, Runner]:
+def verifier(
+    config_dir: Path, responses: list[str], *, now: datetime = NOW,
+) -> tuple[GitHubCliModelApprovalVerifier, Runner]:
     """Create a real verifier around a fake subprocess seam."""
     runner = Runner(responses)
     return (
         GitHubCliModelApprovalVerifier(
             config_dir=config_dir,
             repository="acme/control",
-            approvers={"operator": "control-plane"},
+            approvers={7: "control-plane"},
             runner=runner,
             clock=lambda: now,
         ),
@@ -108,7 +119,7 @@ def test_fresh_cli_login_and_exact_comment_create_approved_p5_authority(tmp_path
     config_dir = tmp_path / "isolated"
     launch = intent()
     marker(config_dir)
-    adapter, runner = verifier(config_dir, ["operator\n", comment(launch)])
+    adapter, runner = verifier(config_dir, [account(), comment(launch)])
     authority = ModelLaunchApprovalAuthority(
         signing_key=b"test-key", store=SqliteP5ApprovalStore(str(tmp_path / "p5.db")),
         evidence_verifier=adapter, clock=lambda: NOW,
@@ -120,26 +131,28 @@ def test_fresh_cli_login_and_exact_comment_create_approved_p5_authority(tmp_path
 
     assert states(tmp_path / "p5.db") == ["approved"]
     assert receipt.approved_duration_seconds == 5_400
-    assert runner.calls[0][0] == ["gh", "api", "user", "--jq", ".login"]
-    assert runner.calls[1][0] == ["gh", "api", "repos/acme/control/issues/comments/17"]
+    assert runner.calls[0][0] == ["gh", "api", "--hostname", "github.com", "user"]
+    assert runner.calls[1][0] == [
+        "gh", "api", "--hostname", "github.com", "repos/acme/control/issues/comments/17",
+    ]
     assert all("GITHUB_TOKEN" not in environment for _, environment, _ in runner.calls)
     assert not (config_dir / MODEL_AUTH_MARKER).exists()
 
 
-@pytest.mark.parametrize("account,body,updated_at", [
-    ("other", None, "2026-10-23T00:00:00Z"),
-    ("operator", "different", "2026-10-23T00:00:00Z"),
-    ("operator", None, "2026-10-23T00:00:01Z"),
+@pytest.mark.parametrize("comment_login,comment_user_id,body,updated_at", [
+    ("other", 8, None, "2026-10-23T00:00:00Z"),
+    ("operator", 7, "different", "2026-10-23T00:00:00Z"),
+    ("operator", 7, None, "2026-10-23T00:00:01Z"),
 ])
 def test_only_allowlisted_unedited_exact_confirmation_creates_authority(
-    tmp_path: Path, account: str, body: str | None, updated_at: str,
+    tmp_path: Path, comment_login: str, comment_user_id: int, body: str | None, updated_at: str,
 ) -> None:
     config_dir = tmp_path / "isolated"
     launch = intent()
     marker(config_dir)
-    raw = json.loads(comment(launch, account=account, body=body))
+    raw = json.loads(comment(launch, account=comment_login, user_id=comment_user_id, body=body))
     raw["updated_at"] = updated_at
-    adapter, _ = verifier(config_dir, ["operator\n", json.dumps(raw)])
+    adapter, _ = verifier(config_dir, [account(), json.dumps(raw)])
     authority = ModelLaunchApprovalAuthority(
         signing_key=b"test-key", store=SqliteP5ApprovalStore(str(tmp_path / "p5.db")),
         evidence_verifier=adapter, clock=lambda: NOW,
@@ -151,6 +164,20 @@ def test_only_allowlisted_unedited_exact_confirmation_creates_authority(
         )
     assert states(tmp_path / "p5.db") == []
     assert not (config_dir / MODEL_AUTH_MARKER).exists()
+
+
+def test_authorization_uses_stable_numeric_id_not_mutable_login(tmp_path: Path) -> None:
+    config_dir = tmp_path / "isolated"
+    launch = intent()
+    marker(config_dir, account="renamed-operator")
+    adapter, _ = verifier(config_dir, [
+        account(login="renamed-operator"),
+        comment(launch, account="another-display-name"),
+    ])
+
+    verified = adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
+
+    assert verified.operator_principal == "control-plane"
 
 
 def test_marker_cannot_outlive_original_five_minute_review_window(tmp_path: Path) -> None:
@@ -202,7 +229,7 @@ def test_marker_is_spent_even_when_readback_fails(tmp_path: Path) -> None:
     config_dir = tmp_path / "isolated"
     launch = intent()
     marker(config_dir)
-    adapter, _ = verifier(config_dir, ["operator\n", "not-json"])
+    adapter, _ = verifier(config_dir, [account(), "not-json"])
 
     with pytest.raises(ValueError, match="GitHub comment"):
         adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
@@ -214,7 +241,7 @@ def test_comment_from_before_fresh_login_cannot_be_reused(tmp_path: Path) -> Non
     launch = intent()
     marker(config_dir)
     adapter, _ = verifier(config_dir, [
-        "operator\n", comment(launch, created_at="2026-10-22T23:59:59Z"),
+        account(), comment(launch, created_at="2026-10-22T23:59:59Z"),
     ])
 
     with pytest.raises(ValueError, match="predates"):
@@ -224,30 +251,107 @@ def test_comment_from_before_fresh_login_cannot_be_reused(tmp_path: Path) -> Non
 
 def test_begin_login_uses_new_isolated_config_without_capturing_device_code(tmp_path: Path) -> None:
     config_dir = tmp_path / "isolated"
-    runner = Runner(["", "operator\n"])
+    runner = Runner(["", account()])
 
-    account = begin_fresh_github_login(config_dir, runner=runner, clock=lambda: NOW)
+    login = begin_fresh_github_login(config_dir, runner=runner, clock=lambda: NOW)
 
-    assert account == "operator"
+    assert login == "operator"
     assert runner.calls[0][0] == [
         "gh", "auth", "login", "--web", "--hostname", "github.com", "--git-protocol", "https",
     ]
     assert runner.calls[0][2] is False
-    assert runner.calls[1][0] == ["gh", "api", "user", "--jq", ".login"]
+    assert runner.calls[1][0] == ["gh", "api", "--hostname", "github.com", "user"]
     saved = json.loads((config_dir / MODEL_AUTH_MARKER).read_text(encoding="utf-8"))
     assert saved == {"account": "operator", "issued_at": int(NOW.timestamp()), "schema": 1}
 
 
+@pytest.mark.parametrize("token_name", (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITHUB_PERSONAL_ACCESS_TOKEN",
+    "GITHUB_COPILOT_PAT",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+))
 def test_token_environment_is_refused_before_any_human_approval_readback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, token_name: str,
 ) -> None:
-    monkeypatch.setenv("GITHUB_TOKEN", "must-not-be-used")
+    monkeypatch.setenv(token_name, "must-not-be-used")
     config_dir = tmp_path / "isolated"
     launch = intent()
     marker(config_dir)
-    adapter, runner = verifier(config_dir, ["operator\n", comment(launch)])
+    adapter, runner = verifier(config_dir, [account(), comment(launch)])
 
     with pytest.raises(ValueError, match="token environment"):
         adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
     assert runner.calls == []
     assert (config_dir / MODEL_AUTH_MARKER).exists()
+
+
+def test_host_overrides_are_removed_and_public_github_is_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GH_HOST", "internal.example")
+    monkeypatch.setenv("GITHUB_HOST", "internal.example")
+    monkeypatch.setenv("GH_REPO", "internal/control")
+    config_dir = tmp_path / "isolated"
+    launch = intent()
+    marker(config_dir)
+    adapter, runner = verifier(config_dir, [account(), comment(launch)])
+
+    adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
+
+    for _command, environment, _captured in runner.calls:
+        assert environment["GH_HOST"] == "github.com"
+        assert "GITHUB_HOST" not in environment
+        assert "GH_REPO" not in environment
+
+
+@pytest.mark.parametrize("failure", [
+    subprocess.TimeoutExpired(["gh", "api"], 20),
+    subprocess.CalledProcessError(1, ["gh", "api"]),
+    FileNotFoundError("gh"),
+    OSError("runner failure"),
+])
+def test_cli_failures_are_normalized_and_spend_marker_after_account_readback(
+    tmp_path: Path, failure: BaseException,
+) -> None:
+    class FailingRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(
+            self, command: list[str], *, env: dict[str, str], capture_output: bool, timeout: float,
+        ) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return account()
+            raise failure
+
+    config_dir = tmp_path / "isolated"
+    marker(config_dir)
+    runner = FailingRunner()
+    adapter = GitHubCliModelApprovalVerifier(
+        config_dir=config_dir,
+        repository="acme/control",
+        approvers={7: "control-plane"},
+        runner=runner,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(ValueError, match="GitHub CLI invocation failed"):
+        adapter.verify(intent(), "https://github.com/acme/control/issues/7#issuecomment-17")
+    assert not (config_dir / MODEL_AUTH_MARKER).exists()
+
+
+def test_second_verify_of_the_same_marker_fails_closed_before_comment_readback(tmp_path: Path) -> None:
+    config_dir = tmp_path / "isolated"
+    launch = intent()
+    marker(config_dir)
+    adapter, runner = verifier(config_dir, [account(), comment(launch)])
+
+    adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
+    with pytest.raises(ValueError, match="already spent"):
+        adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
+
+    assert len(runner.calls) == 2

@@ -21,14 +21,31 @@ from typing import Callable, Mapping
 from .model_launch_approval import ModelLaunchIntent, VerifiedModelApproval
 
 _TOKEN_ENVIRONMENT = (
-    "GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_COPILOT_PAT",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITHUB_PERSONAL_ACCESS_TOKEN",
+    "GITHUB_COPILOT_PAT",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
 )
+_HOST_ENVIRONMENT = ("GH_HOST", "GITHUB_HOST", "GH_REPO")
+_GITHUB_HOST = "github.com"
+_GH_TIMEOUT_SECONDS = 20.0
 _COMMENT_REFERENCE = re.compile(
     r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/(\d+)#issuecomment-(\d+)$"
 )
 _SCHEMA = "oramasys-model-launch-approval: v1"
 _FRESH_TTL = timedelta(seconds=300)
 MODEL_AUTH_MARKER = "model-launch-fresh-auth.v1.json"
+_SPENT_MARKER_SUFFIX = ".spent"
+
+
+@dataclass(frozen=True, slots=True)
+class _GitHubAccount:
+    """Stable GitHub identity plus a login retained only for diagnostics."""
+
+    user_id: int
+    login: str
 
 
 def _utc_timestamp(value: datetime) -> int:
@@ -72,33 +89,73 @@ def _environment(config_dir: Path) -> dict[str, str]:
     if any(os.environ.get(name) for name in _TOKEN_ENVIRONMENT):
         raise ValueError("token environment variables are forbidden for human approval")
     result = os.environ.copy()
-    for name in _TOKEN_ENVIRONMENT:
+    for name in (*_TOKEN_ENVIRONMENT, *_HOST_ENVIRONMENT):
         result.pop(name, None)
     result["GH_CONFIG_DIR"] = str(config_dir)
+    result["GH_HOST"] = _GITHUB_HOST
     return result
 
 
-def _run(command: list[str], *, env: dict[str, str], capture_output: bool) -> str:
+def _run(
+    command: list[str], *, env: dict[str, str], capture_output: bool,
+    timeout: float = _GH_TIMEOUT_SECONDS,
+) -> str:
     """Run gh without a shell and return stdout only when requested."""
-    completed = subprocess.run(
-        command, env=env, check=True, text=True, capture_output=capture_output,
-    )
+    try:
+        completed = subprocess.run(
+            command, env=env, check=True, text=True, capture_output=capture_output,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        raise ValueError("GitHub CLI invocation failed") from exc
     return completed.stdout if capture_output else ""
 
 
-def _active_account(config_dir: Path, runner: Callable[..., str]) -> str:
-    """Ask the isolated GitHub CLI for the active account, never a token value."""
-    account = runner(
-        ["gh", "api", "user", "--jq", ".login"], env=_environment(config_dir), capture_output=True,
-    ).strip()
-    if not account:
+def _invoke(
+    runner: Callable[..., str], command: list[str], *, env: dict[str, str], capture_output: bool,
+) -> str:
+    """Normalize every GitHub CLI failure to the verifier's public error type."""
+    try:
+        return runner(command, env=env, capture_output=capture_output, timeout=_GH_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        raise ValueError("GitHub CLI invocation failed") from exc
+
+
+def _active_account(config_dir: Path, runner: Callable[..., str]) -> _GitHubAccount:
+    """Ask the isolated GitHub CLI for stable numeric account identity."""
+    raw = _invoke(
+        runner,
+        ["gh", "api", "--hostname", _GITHUB_HOST, "user"],
+        env=_environment(config_dir),
+        capture_output=True,
+    )
+    try:
+        account = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("fresh GitHub login did not identify an account") from exc
+    if not isinstance(account, dict):
         raise ValueError("fresh GitHub login did not identify an account")
-    return account
+    login, user_id = account.get("login"), account.get("id")
+    if (
+        not isinstance(login, str)
+        or not login
+        or isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id < 1
+    ):
+        raise ValueError("fresh GitHub login did not identify an account")
+    return _GitHubAccount(user_id=user_id, login=login)
 
 
 def _marker_path(config_dir: Path) -> Path:
     """Return the one-time local proof path for the isolated CLI configuration."""
     return config_dir / MODEL_AUTH_MARKER
+
+
+def _spent_marker_path(config_dir: Path) -> Path:
+    """Return the exclusive claim record that makes a marker single-use."""
+    marker = _marker_path(config_dir)
+    return marker.with_name(f"{marker.name}{_SPENT_MARKER_SUFFIX}")
 
 
 def _write_marker(config_dir: Path, *, account: str, issued_at: int) -> None:
@@ -111,6 +168,23 @@ def _write_marker(config_dir: Path, *, account: str, issued_at: int) -> None:
         raise ValueError("fresh GitHub login marker could not be created") from exc
     with os.fdopen(descriptor, "w", encoding="utf-8") as marker:
         marker.write(contents)
+
+
+def _spend_marker(config_dir: Path) -> None:
+    """Atomically claim and remove a marker before remote evidence readback."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(_spent_marker_path(config_dir), flags, 0o600)
+    except FileExistsError as exc:
+        raise ValueError("fresh GitHub login marker is already spent") from exc
+    except OSError as exc:
+        raise ValueError("fresh GitHub login marker could not be spent") from exc
+    with os.fdopen(descriptor, "w", encoding="utf-8") as spent:
+        spent.write("spent\n")
+    try:
+        _marker_path(config_dir).unlink()
+    except OSError as exc:
+        raise ValueError("fresh GitHub login marker could not be spent") from exc
 
 
 def begin_fresh_github_login(
@@ -126,13 +200,14 @@ def begin_fresh_github_login(
     if not config_dir.is_absolute() or config_dir.exists():
         raise ValueError("fresh GitHub config directory must be a new absolute path")
     config_dir.mkdir(mode=0o700, parents=True)
-    runner(
+    _invoke(
+        runner,
         ["gh", "auth", "login", "--web", "--hostname", "github.com", "--git-protocol", "https"],
         env=_environment(config_dir), capture_output=False,
     )
     account = _active_account(config_dir, runner)
-    _write_marker(config_dir, account=account, issued_at=_utc_timestamp(clock()))
-    return account
+    _write_marker(config_dir, account=account.login, issued_at=_utc_timestamp(clock()))
+    return account.login
 
 
 def approval_body(intent: ModelLaunchIntent, *, approved_duration_seconds: int = 5_400) -> str:
@@ -180,7 +255,7 @@ class GitHubCliModelApprovalVerifier:
 
     config_dir: Path
     repository: str
-    approvers: Mapping[str, str]
+    approvers: Mapping[int, str]
     runner: Callable[..., str] = _run
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
@@ -192,6 +267,8 @@ class GitHubCliModelApprovalVerifier:
         _environment(self.config_dir)
         now = self.clock()
         now_timestamp = _utc_timestamp(now)
+        if _spent_marker_path(self.config_dir).exists():
+            raise ValueError("fresh GitHub login marker is already spent")
         marker = _load_json(_marker_path(self.config_dir))
         if not isinstance(marker, dict) or marker.get("schema") != 1:
             raise ValueError("fresh GitHub login marker is invalid")
@@ -204,17 +281,19 @@ class GitHubCliModelApprovalVerifier:
         ):
             raise ValueError("fresh GitHub login marker is expired or invalid")
         account = _active_account(self.config_dir, self.runner)
-        if marker.get("account") != account:
+        if marker.get("account") != account.login:
             raise ValueError("fresh GitHub login marker is expired or invalid")
-        principal = self.approvers.get(account)
+        principal = self.approvers.get(account.user_id)
         if not isinstance(principal, str) or principal != intent.operator_principal:
             raise ValueError("GitHub account is not authorized for this model approval")
 
         # The fresh-login ceremony is one-use even if API readback fails.
-        _marker_path(self.config_dir).unlink()
-        raw = self.runner(
-            ["gh", "api", f"repos/{repository}/issues/comments/{comment_id}"],
-            env=_environment(self.config_dir), capture_output=True,
+        _spend_marker(self.config_dir)
+        raw = _invoke(
+            self.runner,
+            ["gh", "api", "--hostname", _GITHUB_HOST, f"repos/{repository}/issues/comments/{comment_id}"],
+            env=_environment(self.config_dir),
+            capture_output=True,
         )
         try:
             comment = json.loads(raw)
@@ -227,7 +306,7 @@ class GitHubCliModelApprovalVerifier:
             comment.get("id") != comment_id
             or comment.get("html_url") != evidence_ref
             or not isinstance(user, dict)
-            or user.get("login") != account
+            or user.get("id") != account.user_id
             or comment.get("body") != approval_body(intent)
             or comment.get("created_at") != comment.get("updated_at")
         ):
