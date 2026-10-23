@@ -80,3 +80,20 @@ jobs:
         run: python src/tests/interop/c2_interop_probe.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/oramasys-pinned"
       - name: Run the slice 2 interop probe
         run: python src/tests/interop/c2_slice2_probe.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/oramasys-pinned"
+      - name: Read the pinned Oramasys Part 3 events commit
+        id: events-pin
+        run: |
+          PIN="$(tr -d '[:space:]' < src/tests/interop/oramasys-events-pin.txt)"
+          echo "$PIN" | grep -Eq '^[0-9a-f]{40}$'
+          echo "commit=$PIN" >> "$GITHUB_OUTPUT"
+      - name: Check out Oramasys at the pinned Part 3 events commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: oramasys/oramasys
+          ref: ${{ steps.events-pin.outputs.commit }}
+          path: oramasys-events-pinned
+          persist-credentials: false
+      - name: Part 3 events probe copies must be byte-identical
+        run: cmp src/tests/interop/c2_part3_events_probe.py oramasys-events-pinned/src/tests/interop/c2_part3_events_probe.py
+      - name: Run the Part 3 events interop probe
+        run: python src/tests/interop/c2_part3_events_probe.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/oramasys-events-pinned"
