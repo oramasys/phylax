@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,7 +39,7 @@ def _utc_timestamp(value: datetime) -> int:
 
 
 def _load_json(path: Path) -> object:
-    """Load one JSON object without silently accepting duplicate fields."""
+    """Load a private regular marker without accepting duplicate fields."""
     def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
         for key, value in pairs:
@@ -48,15 +49,26 @@ def _load_json(path: Path) -> object:
         return result
 
     try:
-        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique)
-    except (OSError, json.JSONDecodeError) as exc:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, encoding="utf-8") as marker:
+            metadata = os.fstat(marker.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
+                raise ValueError("fresh GitHub login marker has unsafe permissions")
+            return json.loads(marker.read(), object_pairs_hook=unique)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError("fresh GitHub login marker is unreadable") from exc
 
 
 def _environment(config_dir: Path) -> dict[str, str]:
     """Return a credential-clean environment bound to one isolated gh config."""
-    if not config_dir.is_absolute() or not config_dir.is_dir():
-        raise ValueError("GitHub config directory must be an existing absolute directory")
+    if not config_dir.is_absolute():
+        raise ValueError("GitHub config directory must be a private absolute directory")
+    try:
+        metadata = config_dir.lstat()
+    except OSError as exc:
+        raise ValueError("GitHub config directory must be an existing absolute directory") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_mode & 0o077:
+        raise ValueError("GitHub config directory must be a private absolute directory")
     if any(os.environ.get(name) for name in _TOKEN_ENVIRONMENT):
         raise ValueError("token environment variables are forbidden for human approval")
     result = os.environ.copy()
@@ -89,6 +101,18 @@ def _marker_path(config_dir: Path) -> Path:
     return config_dir / MODEL_AUTH_MARKER
 
 
+def _write_marker(config_dir: Path, *, account: str, issued_at: int) -> None:
+    """Create the one-time marker privately without following a preexisting path."""
+    contents = json.dumps({"schema": 1, "account": account, "issued_at": issued_at}, sort_keys=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(_marker_path(config_dir), flags, 0o600)
+    except OSError as exc:
+        raise ValueError("fresh GitHub login marker could not be created") from exc
+    with os.fdopen(descriptor, "w", encoding="utf-8") as marker:
+        marker.write(contents)
+
+
 def begin_fresh_github_login(
     config_dir: Path, *, runner: Callable[..., str] = _run,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -107,11 +131,7 @@ def begin_fresh_github_login(
         env=_environment(config_dir), capture_output=False,
     )
     account = _active_account(config_dir, runner)
-    _marker_path(config_dir).write_text(
-        json.dumps({"schema": 1, "account": account, "issued_at": _utc_timestamp(clock())}, sort_keys=True),
-        encoding="utf-8",
-    )
-    os.chmod(_marker_path(config_dir), 0o600)
+    _write_marker(config_dir, account=account, issued_at=_utc_timestamp(clock()))
     return account
 
 
@@ -169,6 +189,7 @@ class GitHubCliModelApprovalVerifier:
         repository, _issue, comment_id = _comment_reference(evidence_ref)
         if repository != self.repository:
             raise ValueError("model approval comment targets another repository")
+        _environment(self.config_dir)
         now = self.clock()
         now_timestamp = _utc_timestamp(now)
         marker = _load_json(_marker_path(self.config_dir))

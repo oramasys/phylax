@@ -64,12 +64,14 @@ def no_ambient_github_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def marker(config_dir: Path, *, account: str = "operator", issued_at: int | None = None) -> None:
     """Write the proof produced after a human performs the fresh login."""
-    config_dir.mkdir()
-    (config_dir / MODEL_AUTH_MARKER).write_text(json.dumps({
+    config_dir.mkdir(mode=0o700)
+    path = config_dir / MODEL_AUTH_MARKER
+    path.write_text(json.dumps({
         "schema": 1,
         "account": account,
         "issued_at": int(NOW.timestamp()) if issued_at is None else issued_at,
     }), encoding="utf-8")
+    path.chmod(0o600)
 
 
 def comment(
@@ -159,6 +161,40 @@ def test_marker_cannot_outlive_original_five_minute_review_window(tmp_path: Path
 
     with pytest.raises(ValueError, match="fresh GitHub login"):
         adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("unsafe_marker", ("symlink", "broad"))
+def test_unsafe_marker_is_refused_before_cli_readback(
+    tmp_path: Path, unsafe_marker: str,
+) -> None:
+    config_dir = tmp_path / "isolated"
+    marker(config_dir)
+    path = config_dir / MODEL_AUTH_MARKER
+    if unsafe_marker == "symlink":
+        target = tmp_path / "other-marker.json"
+        target.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        target.chmod(0o600)
+        path.unlink()
+        path.symlink_to(target)
+    else:
+        path.chmod(0o644)
+    adapter, runner = verifier(config_dir, [])
+
+    with pytest.raises(ValueError, match="marker is unreadable"):
+        adapter.verify(intent(), "https://github.com/acme/control/issues/7#issuecomment-17")
+    assert runner.calls == []
+
+
+def test_symlinked_config_directory_is_refused_before_marker_readback(tmp_path: Path) -> None:
+    actual = tmp_path / "actual"
+    marker(actual)
+    alias = tmp_path / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+    adapter, runner = verifier(alias, [])
+
+    with pytest.raises(ValueError, match="config directory"):
+        adapter.verify(intent(), "https://github.com/acme/control/issues/7#issuecomment-17")
     assert runner.calls == []
 
 
