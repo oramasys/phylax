@@ -17,8 +17,19 @@ the RFC 8785 adjustment-grant wire format.
 It must authenticate the operator, establish fresh human confirmation, enforce
 the original request decision state, and return the server-owned approval ID
 bound to that exact intent. An access token or arbitrary evidence-reference
-string alone does not establish those facts. The test verifier is a stand-in,
-not a working GitHub integration.
+string alone does not establish those facts.
+
+`phylax.github_device_approval.GitHubCliModelApprovalVerifier` is the first
+concrete composition adapter. It reuses the established GitHub CLI ceremony:
+an operator starts `gh auth login
+--web` in a new isolated `GH_CONFIG_DIR`, enters GitHub's short-lived browser
+user code, then posts an exact confirmation comment for the immutable launch
+intent. The verifier rejects ambient token variables, checks the active account
+and local five-minute marker, spends that marker before API readback, and
+accepts only an allowlisted, unedited GitHub comment with the exact canonical
+body. It stores neither the browser code nor an access token. The local marker
+is procedural evidence, not independent cryptographic proof of a human MFA
+interaction; the read-back comment is the durable audit reference.
 
 `approve_model_launch` checks those facts before writing. It inserts an
 `approved` row directly under `BEGIN IMMEDIATE` in the native P5 table. The
@@ -48,8 +59,9 @@ handoff; it must not automatically recreate approval or resend paid work.
 
 ## Qualification remaining
 
-- Supply a real trusted human-evidence verifier, including qualified fresh-factor
-  evidence where policy requires it.
+- Bind the concrete GitHub CLI verifier through a protected operator-facing
+  composition root and an approved allowlist source. The adapter exists but is
+  not yet connected to a service endpoint or provider dispatcher.
 - Wire the verified decision into the Oramasys dispatch ledger and execution
   lease, without exposing issuer secrets to the serving consumer.
 - Bind request/decision audit projections and timeout races at that composition.
@@ -57,5 +69,6 @@ handoff; it must not automatically recreate approval or resend paid work.
 
 Local tests cover direct approved insertion, exact intent drift, original
 deadline, single-use and concurrent consume, domain separation, invalid fields,
-missing verifier, and compatibility with existing P5 behavior. They do not prove
-the absent production authentication or dispatch wiring.
+missing verifier, GitHub CLI marker freshness, exact-comment readback, token
+environment refusal, and compatibility with existing P5 behavior. They do not
+prove live GitHub identity, human MFA, or production dispatch wiring.
