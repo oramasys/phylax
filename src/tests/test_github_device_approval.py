@@ -362,6 +362,24 @@ def test_unsafe_config_parent_is_refused_before_cli_readback(tmp_path: Path) -> 
     assert runner.calls == []
 
 
+def test_sticky_config_parent_is_accepted(tmp_path: Path) -> None:
+    parent = tmp_path / "sticky-parent"
+    parent.mkdir(mode=0o700)
+    config_dir = parent / "isolated"
+    marker(config_dir)
+    parent.chmod(0o1777)
+    launch = intent()
+    adapter, _ = verifier(config_dir, [account(), comment(launch)])
+
+    try:
+        verified = adapter.verify(
+            launch, "https://github.com/acme/control/issues/7#issuecomment-17"
+        )
+    finally:
+        parent.chmod(0o700)
+    assert verified.operator_principal == "control-plane"
+
+
 @pytest.mark.parametrize("raw", [
     json.dumps({"login": "operator", "id": 7, "padding": "x" * 262_144}),
     '{"login":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":0}}}}}}}}}}}}}}}}},"id":7}',

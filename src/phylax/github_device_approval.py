@@ -130,7 +130,12 @@ def _environment(config_dir: Path) -> dict[str, str]:
     try:
         for parent in config_dir.parents:
             parent_metadata = parent.lstat()
-            if not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_mode & 0o022:
+            mode = parent_metadata.st_mode
+            writable_by_others = mode & 0o022
+            if (
+                not stat.S_ISDIR(mode)
+                or (writable_by_others and not mode & stat.S_ISVTX)
+            ):
                 raise ValueError("GitHub config directory has an unsafe parent")
     except OSError as exc:
         raise ValueError("GitHub config directory has an unsafe parent") from exc
