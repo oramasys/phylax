@@ -323,6 +323,73 @@ class SqliteDispatchPermitStore:
             for r in rows
         ]
 
+    def append_revocation(
+        self, subject_kind: str, subject_id: str, *, signer: IssuerSigner
+    ) -> dict[str, object]:
+        """Append a signed revocation event, or return the identical one already recorded.
+
+        The issuer records an authority fact only. It reads no consumer execution state and has no
+        parameter for any. A malformed body raises :class:`phylax.dispatch_wire.WireError` before
+        any row is written and consumes no version.
+        """
+        body: dict[str, object] = {"subject_kind": subject_kind, "subject_id": subject_id}
+        wire.validate_event_body("revocation", body)
+        with self._write() as connection:
+            existing = connection.execute(
+                "SELECT version FROM issuer_events WHERE kind = 'revocation' AND body = ?",
+                (wire.canonical_bytes(body).decode("utf-8"),),
+            ).fetchone()
+            if existing is not None:
+                return self._events(connection, existing["version"], existing["version"])[0]
+            return self._append_event(connection, "revocation", body, signer)
+
+    def append_cascade(
+        self,
+        approval_id: str,
+        grant_ids: list[str] | tuple[str, ...],
+        issuer_authority_version: int,
+        *,
+        signer: IssuerSigner,
+    ) -> dict[str, object]:
+        """Append a signed cascade event; each cascade is its own commit at its own version.
+
+        ``grant_ids`` must already be strictly ascending and duplicate-free: the body is refused,
+        never repaired. The list is copied, so later changes to the caller's list cannot alter
+        history. A malformed body raises :class:`phylax.dispatch_wire.WireError` before any write.
+        """
+        if not isinstance(grant_ids, (list, tuple)):
+            raise wire.WireError("grant_ids must be an array")
+        body: dict[str, object] = {
+            "approval_id": approval_id,
+            "grant_ids": list(grant_ids),
+            "issuer_authority_version": issuer_authority_version,
+        }
+        wire.validate_event_body("cascade", body)
+        with self._write() as connection:
+            return self._append_event(connection, "cascade", body, signer)
+
+    def _append_event(
+        self, connection: sqlite3.Connection, kind: str, body: dict[str, object], signer: IssuerSigner
+    ) -> dict[str, object]:
+        """Chain, digest, sign and store one validated event; return its wire dict."""
+        key_id = signer.active_key_id()
+        counter = self._counter(connection)
+        previous = connection.execute(
+            "SELECT event_digest FROM issuer_events WHERE version = ?", (counter,)
+        ).fetchone()
+        previous_digest = wire.GENESIS_EVENT_DIGEST if previous is None else previous["event_digest"]
+        version = counter + 1
+        digest = wire.event_digest(version, kind, body, previous_digest)
+        connection.execute(
+            "INSERT INTO issuer_events(version, kind, body, previous_event_digest, event_digest,"
+            " issuer_key_id, signature) VALUES(?,?,?,?,?,?,?)",
+            (
+                version, kind, wire.canonical_bytes(body).decode("utf-8"), previous_digest, digest,
+                key_id, signer.sign_event(key_id, digest),
+            ),
+        )
+        return self._events(connection, version, version)[0]
+
     @staticmethod
     def _row_by_attempt(connection: sqlite3.Connection, attempt_id: object) -> sqlite3.Row | None:
         """Fetch the row holding an attempt id."""

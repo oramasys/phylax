@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,10 @@ from phylax import dispatch_permit_store as store_module
 from phylax import dispatch_wire as wire
 from phylax.dispatch_permit_store import SqliteDispatchPermitStore
 
+sys.path.insert(0, str(Path(__file__).parent))
+import dispatch_event_vector_builder as builder  # noqa: E402  (helper beside this file)
+
+VECTORS = json.loads(builder.VECTOR_PATH.read_text(encoding="utf-8"))
 SEED = hashlib.sha256(b"phylax-event-body-test-key-1").digest()
 PUBLIC_KEY = crypto_sign_seed_keypair(SEED)[0]
 KEY_ID = "event-body-test-key-1"
@@ -153,7 +158,6 @@ def test_cascade_body_is_closed() -> None:
         ["grant-1", "grant-2", "grant-2"],
         ["grant-1", "grant-3", "grant-2"],
         "grant-1",
-        ("grant-1",),
         {"grant-1": 1},
         None,
         7,
@@ -162,6 +166,20 @@ def test_cascade_body_is_closed() -> None:
 def test_cascade_grant_ids_must_be_strictly_ascending(grants: object) -> None:
     """Locked rule 3: a duplicate, an unsorted pair or a non-array is malformed."""
     refused("cascade", cascade(grants=grants))
+
+
+def test_cascade_grant_ids_must_be_a_json_array_not_a_tuple() -> None:
+    """Locked rule 3: only an array is a valid ``grant_ids``; a tuple is not a JSON array."""
+    refused("cascade", {**cascade(), "grant_ids": ("grant-1",)})
+
+
+def test_append_cascade_refuses_a_bare_string_not_a_list_of_characters(
+    store: SqliteDispatchPermitStore,
+) -> None:
+    """A string must never be split into one-character grant ids, even when they sort cleanly."""
+    with pytest.raises(wire.WireError):
+        store.append_cascade("approval-1", "abc", 1, signer=Signer())  # type: ignore[arg-type]
+    assert store.current_counter() == 0
 
 
 def test_cascade_grant_ids_accept_empty_and_single() -> None:
@@ -313,3 +331,40 @@ def test_refusal_vocabulary_is_unchanged() -> None:
     assert store_module.PermitRefused("permit.conflict").code == "permit.conflict"
     with pytest.raises(ValueError):
         store_module.PermitRefused("event.malformed_body")
+
+
+def test_committed_event_vectors_equal_the_builder_output() -> None:
+    """The committed vector file is exactly what the wire module produces, so they cannot drift."""
+    assert builder.VECTOR_PATH.read_text(encoding="utf-8") == builder.render()
+
+
+def test_event_vectors_chain_verify_and_equal_the_oracle() -> None:
+    """The signed vector chain matches the oracle digests and verifies under the vector key."""
+    public_key = bytes.fromhex(VECTORS["public_key"])
+    previous = GENESIS
+    for event, expected in zip(VECTORS["events"], ORACLE_DIGESTS, strict=True):
+        assert event["event_digest"] == expected
+        assert event["event_digest"] == oracle_digest(
+            event["version"], event["kind"], event["body"], previous
+        )
+        assert event["previous_event_digest"] == previous
+        assert wire.verify_event(public_key, expected, event["signature"])
+        assert set(event) == set(wire.EVENT_WIRE_FIELDS)
+        previous = expected
+    assert VECTORS["canonical_bodies"] == [
+        wire.canonical_bytes(event["body"]).decode("utf-8") for event in VECTORS["events"]
+    ]
+
+
+@pytest.mark.parametrize("case", VECTORS["malformed"], ids=lambda case: case["name"])
+def test_every_malformed_vector_is_refused(case: dict[str, Any]) -> None:
+    """Each shared malformed body is refused by the issuer wire module (the consumer runs the same set)."""
+    refused(case["kind"], case["body"])
+
+
+def test_no_malformed_vector_is_also_a_valid_body() -> None:
+    """The malformed set has unique names and never contains one of the valid vector bodies."""
+    names = [case["name"] for case in VECTORS["malformed"]]
+    valid = [event["body"] for event in VECTORS["events"]]
+    assert len(names) == len(set(names))
+    assert all(case["body"] not in valid for case in VECTORS["malformed"])

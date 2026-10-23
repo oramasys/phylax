@@ -217,8 +217,10 @@ Deliberately deferred, so slice 1 is not mistaken for the whole ratified specifi
   15-second minimum finalization window, deadline accounting and bounded
   retries, the circuit breaker and alert, the recovery calls after the authority deadline, and the
   `dispatch.issuer_unavailable` status path.
-* **Both:** the body shapes of `revocation` and `cascade` events (not frozen; slice 1 treats them as
-  opaque and its revocation port is the consumer's abstraction of them), the effect grant v2 parser and `effect_class` registry (slice 1 reaches the signed grant
+* **Both:** the body shapes of `revocation` and `cascade` events (not frozen by this document;
+  slice 1 treats them as opaque and its revocation port is the consumer's abstraction of them; they
+  are proposed in E1 C2 Part 3 Sections 1-2, which the issuer validates in `dispatch_wire` pending
+  that operator decision, with signed vectors in `docs/vectors/dispatch-events-v1.json`), the effect grant v2 parser and `effect_class` registry (slice 1 reaches the signed grant
   through an injected lookup), and any pin change. None is enabled by this freeze.
 
 **Next actions (repeated).** Reviewers confirm or change each `FREEZE-CHOICE`; implementers build
