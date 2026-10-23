@@ -47,12 +47,12 @@ class Runner:
 
     def __init__(self, responses: list[str]) -> None:
         self._responses = iter(responses)
-        self.calls: list[tuple[list[str], dict[str, str], bool]] = []
+        self.calls: list[tuple[list[str], dict[str, str], bool, float | None]] = []
 
     def __call__(
-        self, command: list[str], *, env: dict[str, str], capture_output: bool, timeout: float,
+        self, command: list[str], *, env: dict[str, str], capture_output: bool, timeout: float | None,
     ) -> str:
-        self.calls.append((command, env, capture_output))
+        self.calls.append((command, env, capture_output, timeout))
         return next(self._responses)
 
 
@@ -62,17 +62,23 @@ def no_ambient_github_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_COPILOT_PAT",
         "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GITHUB_HOST", "GH_REPO",
+        "GH_PROMPT_DISABLED", "GH_NO_UPDATE_NOTIFIER", "GH_DEBUG", "GH_PAGER", "PAGER",
+        "CLICOLOR_FORCE", "NO_COLOR",
     ):
         monkeypatch.delenv(name, raising=False)
 
 
-def marker(config_dir: Path, *, account: str = "operator", issued_at: int | None = None) -> None:
+def marker(
+    config_dir: Path, *, account: str = "operator", account_id: int = 7,
+    issued_at: int | None = None,
+) -> None:
     """Write the proof produced after a human performs the fresh login."""
     config_dir.mkdir(mode=0o700)
     path = config_dir / MODEL_AUTH_MARKER
     path.write_text(json.dumps({
         "schema": 1,
         "account": account,
+        "account_id": account_id,
         "issued_at": int(NOW.timestamp()) if issued_at is None else issued_at,
     }), encoding="utf-8")
     path.chmod(0o600)
@@ -81,6 +87,14 @@ def marker(config_dir: Path, *, account: str = "operator", issued_at: int | None
 def account(*, login: str = "operator", user_id: int = 7) -> str:
     """Return the stable identity response exposed by the GitHub API."""
     return json.dumps({"login": login, "id": user_id})
+
+
+def fake_gh(directory: Path) -> Path:
+    """Create one absolute executable seam for GitHub CLI command tests."""
+    executable = directory / "gh"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    return executable
 
 
 def comment(
@@ -109,6 +123,7 @@ def verifier(
             repository="acme/control",
             approvers={7: "control-plane"},
             runner=runner,
+            gh_executable=fake_gh(config_dir.parent),
             clock=lambda: now,
         ),
         runner,
@@ -131,11 +146,12 @@ def test_fresh_cli_login_and_exact_comment_create_approved_p5_authority(tmp_path
 
     assert states(tmp_path / "p5.db") == ["approved"]
     assert receipt.approved_duration_seconds == 5_400
-    assert runner.calls[0][0] == ["gh", "api", "--hostname", "github.com", "user"]
-    assert runner.calls[1][0] == [
-        "gh", "api", "--hostname", "github.com", "repos/acme/control/issues/comments/17",
+    assert Path(runner.calls[0][0][0]).is_absolute()
+    assert runner.calls[0][0][1:] == ["api", "--hostname", "github.com", "user"]
+    assert runner.calls[1][0][1:] == [
+        "api", "--hostname", "github.com", "repos/acme/control/issues/comments/17",
     ]
-    assert all("GITHUB_TOKEN" not in environment for _, environment, _ in runner.calls)
+    assert all("GITHUB_TOKEN" not in environment for _, environment, _, _ in runner.calls)
     assert not (config_dir / MODEL_AUTH_MARKER).exists()
 
 
@@ -251,18 +267,28 @@ def test_comment_from_before_fresh_login_cannot_be_reused(tmp_path: Path) -> Non
 
 def test_begin_login_uses_new_isolated_config_without_capturing_device_code(tmp_path: Path) -> None:
     config_dir = tmp_path / "isolated"
+    executable = fake_gh(tmp_path)
     runner = Runner(["", account()])
 
-    login = begin_fresh_github_login(config_dir, runner=runner, clock=lambda: NOW)
+    login = begin_fresh_github_login(
+        config_dir, runner=runner, gh_executable=executable, clock=lambda: NOW,
+    )
 
     assert login == "operator"
     assert runner.calls[0][0] == [
-        "gh", "auth", "login", "--web", "--hostname", "github.com", "--git-protocol", "https",
+        str(executable), "auth", "login", "--web", "--hostname", "github.com", "--git-protocol", "https",
     ]
     assert runner.calls[0][2] is False
-    assert runner.calls[1][0] == ["gh", "api", "--hostname", "github.com", "user"]
+    assert runner.calls[0][3] is None
+    assert runner.calls[1][0] == [str(executable), "api", "--hostname", "github.com", "user"]
+    assert runner.calls[1][3] == 20.0
     saved = json.loads((config_dir / MODEL_AUTH_MARKER).read_text(encoding="utf-8"))
-    assert saved == {"account": "operator", "issued_at": int(NOW.timestamp()), "schema": 1}
+    assert saved == {
+        "account": "operator",
+        "account_id": 7,
+        "issued_at": int(NOW.timestamp()),
+        "schema": 1,
+    }
 
 
 @pytest.mark.parametrize("token_name", (
@@ -294,6 +320,12 @@ def test_host_overrides_are_removed_and_public_github_is_pinned(
     monkeypatch.setenv("GH_HOST", "internal.example")
     monkeypatch.setenv("GITHUB_HOST", "internal.example")
     monkeypatch.setenv("GH_REPO", "internal/control")
+    monkeypatch.setenv("GH_PROMPT_DISABLED", "1")
+    monkeypatch.setenv("GH_NO_UPDATE_NOTIFIER", "1")
+    monkeypatch.setenv("GH_DEBUG", "api")
+    monkeypatch.setenv("GH_PAGER", "cat")
+    monkeypatch.setenv("PAGER", "cat")
+    monkeypatch.setenv("CLICOLOR_FORCE", "1")
     config_dir = tmp_path / "isolated"
     launch = intent()
     marker(config_dir)
@@ -301,10 +333,47 @@ def test_host_overrides_are_removed_and_public_github_is_pinned(
 
     adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
 
-    for _command, environment, _captured in runner.calls:
+    for _command, environment, _captured, _timeout in runner.calls:
         assert environment["GH_HOST"] == "github.com"
         assert "GITHUB_HOST" not in environment
         assert "GH_REPO" not in environment
+        assert "GH_PROMPT_DISABLED" not in environment
+        assert "GH_NO_UPDATE_NOTIFIER" not in environment
+        assert "GH_DEBUG" not in environment
+        assert "GH_PAGER" not in environment
+        assert "PAGER" not in environment
+        assert "CLICOLOR_FORCE" not in environment
+        assert environment["NO_COLOR"] == "1"
+
+
+def test_unsafe_config_parent_is_refused_before_cli_readback(tmp_path: Path) -> None:
+    parent = tmp_path / "unsafe-parent"
+    parent.mkdir(mode=0o700)
+    config_dir = parent / "isolated"
+    marker(config_dir)
+    parent.chmod(0o770)
+    adapter, runner = verifier(config_dir, [])
+
+    try:
+        with pytest.raises(ValueError, match="unsafe parent"):
+            adapter.verify(intent(), "https://github.com/acme/control/issues/7#issuecomment-17")
+    finally:
+        parent.chmod(0o700)
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("raw", [
+    json.dumps({"login": "operator", "id": 7, "padding": "x" * 262_144}),
+    '{"login":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":{"nested":0}}}}}}}}}}}}}}}}},"id":7}',
+])
+def test_bounded_account_readback_is_refused_before_marker_spend(tmp_path: Path, raw: str) -> None:
+    config_dir = tmp_path / "isolated"
+    marker(config_dir)
+    adapter, _ = verifier(config_dir, [raw])
+
+    with pytest.raises(ValueError, match="did not identify"):
+        adapter.verify(intent(), "https://github.com/acme/control/issues/7#issuecomment-17")
+    assert (config_dir / MODEL_AUTH_MARKER).exists()
 
 
 @pytest.mark.parametrize("failure", [
@@ -321,7 +390,7 @@ def test_cli_failures_are_normalized_and_spend_marker_after_account_readback(
             self.calls = 0
 
         def __call__(
-            self, command: list[str], *, env: dict[str, str], capture_output: bool, timeout: float,
+            self, command: list[str], *, env: dict[str, str], capture_output: bool, timeout: float | None,
         ) -> str:
             self.calls += 1
             if self.calls == 1:
@@ -336,6 +405,7 @@ def test_cli_failures_are_normalized_and_spend_marker_after_account_readback(
         repository="acme/control",
         approvers={7: "control-plane"},
         runner=runner,
+        gh_executable=fake_gh(tmp_path),
         clock=lambda: NOW,
     )
 

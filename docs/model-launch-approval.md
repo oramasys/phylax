@@ -30,6 +30,10 @@ five-minute marker, spends that marker before API readback, and accepts only
 an allowlisted, unedited GitHub comment with the exact canonical body. It
 stores neither the browser code nor an access token. This implemented path is
 procedural evidence: a fresh isolated CLI login plus an exact operator comment.
+The interactive browser-login command has no wall-clock timeout: the marker is
+created only after that command returns, so its five-minute freshness interval
+starts at completed authentication. Subsequent non-interactive GitHub API
+readbacks are bounded.
 It is not an independently verifiable fresh factor or OTP attestation. That
 stronger evidence capability remains an open planned extension, not a banned
 or impossible design; the read-back comment is the durable audit reference.
