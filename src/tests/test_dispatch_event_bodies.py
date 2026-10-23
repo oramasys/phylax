@@ -202,15 +202,35 @@ def test_cascade_authority_version_bounds_are_accepted(good: int) -> None:
     wire.event_digest(1, "cascade", cascade(version=good), GENESIS)
 
 
-def test_event_body_size_is_bounded() -> None:
-    """Locked rule 4: the canonical body is at most 65,536 bytes."""
-    limit = wire.MAX_WIRE_BYTES
-    assert limit == 65_536
-    fits = [f"{i:04d}" + "x" * 1020 for i in range(60)]
-    wire.event_digest(1, "cascade", cascade(grants=fits), GENESIS)
-    too_big = [f"{i:04d}" + "x" * 1020 for i in range(70)]
-    assert len(wire.canonical_bytes(cascade(grants=too_big))) > limit
-    refused("cascade", cascade(grants=too_big))
+def _grants(count: int, width: int = 1020) -> list[str]:
+    """Return ``count`` strictly ascending identifiers of ``width + 4`` bytes each."""
+    return [f"{i:04d}" + "x" * width for i in range(count)]
+
+
+def test_event_wire_size_is_bounded(store: SqliteDispatchPermitStore) -> None:
+    """Locked rule 4: the complete canonical event is at most 65,536 bytes, checked before writing."""
+    assert wire.MAX_WIRE_BYTES == 65_536
+    signer = Signer()
+    fits = store.append_cascade("approval-1", _grants(60), 1, signer=signer)
+    assert len(wire.canonical_bytes(fits)) <= wire.MAX_WIRE_BYTES
+
+    with pytest.raises(wire.WireError):
+        store.append_cascade("approval-1", _grants(64), 1, signer=signer)
+
+    assert store.current_counter() == 1
+
+
+def test_event_wire_size_boundary_is_exact() -> None:
+    """An event of exactly 65,536 canonical bytes passes and one byte more is refused."""
+    base = {
+        "version": 1, "kind": "revocation", "body": {"subject_kind": "grant", "subject_id": "g"},
+        "previous_event_digest": GENESIS, "event_digest": GENESIS, "issuer_key_id": "",
+        "signature": "A" * 86,
+    }
+    pad = wire.MAX_WIRE_BYTES - len(wire.canonical_bytes(base))
+    wire.check_event_wire_size({**base, "issuer_key_id": "k" * pad})
+    with pytest.raises(wire.WireError):
+        wire.check_event_wire_size({**base, "issuer_key_id": "k" * (pad + 1)})
 
 
 def test_event_digest_still_refuses_unknown_kinds_and_keeps_finalization_exact() -> None:

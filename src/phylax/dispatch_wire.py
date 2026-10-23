@@ -39,7 +39,6 @@ SUBJECT_KINDS: Final = frozenset({"grant", "approval", "issuer"})
 REVOCATION_BODY_FIELDS: Final = ("subject_id", "subject_kind")
 CASCADE_BODY_FIELDS: Final = ("approval_id", "grant_ids", "issuer_authority_version")
 MAX_IDENTIFIER_BYTES: Final = 1_024
-MAX_EVENT_BODY_BYTES: Final = MAX_WIRE_BYTES
 
 PERMIT_LIFETIME_SECONDS: Final = 90
 ISSUER_AUTHORITY_VERSION: Final = 1
@@ -305,7 +304,7 @@ def validate_cascade_body(body: Mapping[str, object]) -> None:
 
 
 def validate_event_body(kind: str, body: Mapping[str, object]) -> None:
-    """Validate an event body for its kind; every kind has a closed shape and a bounded size."""
+    """Validate an event body for its kind; every kind has a closed shape."""
     if kind == "finalization":
         if set(body) != {"finalization_id"}:
             raise WireError("a finalization event body is exactly {finalization_id}")
@@ -317,8 +316,17 @@ def validate_event_body(kind: str, body: Mapping[str, object]) -> None:
         validate_cascade_body(body)
     else:
         raise WireError("unknown event kind")
-    if len(canonical_bytes(body)) > MAX_EVENT_BODY_BYTES:
-        raise WireError(f"event body exceeds {MAX_EVENT_BODY_BYTES} bytes")
+
+
+def check_event_wire_size(event: Mapping[str, object]) -> None:
+    """Require the canonical JSON of the complete seven-field event to fit ``MAX_WIRE_BYTES``.
+
+    The bound is on the whole event, not the body alone, because that is the object the consumer
+    receives and size-checks; an event the issuer accepted but the consumer had to refuse would
+    stall the chain.
+    """
+    if len(canonical_bytes(event)) > MAX_WIRE_BYTES:
+        raise WireError(f"event exceeds {MAX_WIRE_BYTES} bytes")
 
 
 def event_digest(version: int, kind: str, body: Mapping[str, object], previous_event_digest: str) -> str:

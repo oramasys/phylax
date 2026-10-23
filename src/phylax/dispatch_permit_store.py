@@ -380,12 +380,18 @@ class SqliteDispatchPermitStore:
         previous_digest = wire.GENESIS_EVENT_DIGEST if previous is None else previous["event_digest"]
         version = counter + 1
         digest = wire.event_digest(version, kind, body, previous_digest)
+        event: dict[str, object] = {
+            "version": version, "kind": kind, "body": body,
+            "previous_event_digest": previous_digest, "event_digest": digest,
+            "issuer_key_id": key_id, "signature": signer.sign_event(key_id, digest),
+        }
+        wire.check_event_wire_size(event)
         connection.execute(
             "INSERT INTO issuer_events(version, kind, body, previous_event_digest, event_digest,"
             " issuer_key_id, signature) VALUES(?,?,?,?,?,?,?)",
             (
                 version, kind, wire.canonical_bytes(body).decode("utf-8"), previous_digest, digest,
-                key_id, signer.sign_event(key_id, digest),
+                key_id, event["signature"],
             ),
         )
         return self._events(connection, version, version)[0]
