@@ -24,12 +24,15 @@ concrete composition adapter. It reuses the established GitHub CLI ceremony:
 an operator starts `gh auth login
 --web` in a new isolated `GH_CONFIG_DIR`, enters GitHub's short-lived browser
 user code, then posts an exact confirmation comment for the immutable launch
-intent. The verifier rejects ambient token variables, checks the active account
-and local five-minute marker, spends that marker before API readback, and
-accepts only an allowlisted, unedited GitHub comment with the exact canonical
-body. It stores neither the browser code nor an access token. The local marker
-is procedural evidence, not independent cryptographic proof of a human MFA
-interaction; the read-back comment is the durable audit reference.
+intent. The verifier rejects ambient token and host overrides, pins GitHub
+public-host calls, checks the active numeric GitHub account ID and local
+five-minute marker, spends that marker before API readback, and accepts only
+an allowlisted, unedited GitHub comment with the exact canonical body. It
+stores neither the browser code nor an access token. This implemented path is
+procedural evidence: a fresh isolated CLI login plus an exact operator comment.
+It is not an independently verifiable fresh factor or OTP attestation. That
+stronger evidence capability remains an open planned extension, not a banned
+or impossible design; the read-back comment is the durable audit reference.
 
 `approve_model_launch` checks those facts before writing. It inserts an
 `approved` row directly under `BEGIN IMMEDIATE` in the native P5 table. The
@@ -65,6 +68,8 @@ handoff; it must not automatically recreate approval or resend paid work.
 - Wire the verified decision into the Oramasys dispatch ledger and execution
   lease, without exposing issuer secrets to the serving consumer.
 - Bind request/decision audit projections and timeout races at that composition.
+- Design and validate an independently verifiable fresh-factor adapter before
+  claiming MFA-grade proof from the GitHub CLI procedure.
 - Verify the complete producer-to-consumer path before enabling gated execution.
 
 Local tests cover direct approved insertion, exact intent drift, original
