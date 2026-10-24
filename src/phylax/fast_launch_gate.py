@@ -31,6 +31,12 @@ def authorize_direct_xai_fast(
 ) -> P5ApprovalDecision:
     """Spend one receipt for the exact fast launch, or refuse without side effects.
 
+    ``operator_principal`` and ``caller_principal`` are both supplied by the
+    dispatcher.  The same-principal check is only as strong as that source, so
+    the dispatcher must derive ``caller_principal`` from an authenticated
+    context (never from request fields) and ``operator_principal`` from the
+    approval record it trusts.
+
     ``launch`` must be the dispatcher's own canonical launch fields, never a
     caller-supplied intent: the intent is rebuilt here, so the receipt's signed
     digest binds model, normalized effort, fast flag, scope, expiry and request
