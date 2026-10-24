@@ -51,6 +51,11 @@ authorization in GitHub's authorized OAuth applications settings. Local cleanup
 still prevents this adapter from reusing its local evidence; it is not remote
 credential revocation.
 
+If local cleanup itself fails while verification is already failing, the original
+verification error is the one reported and the throwaway configuration directory
+may still hold a token: remove that directory by hand and revoke the matching
+authorization in GitHub, as above.
+
 The interactive browser-login command has no wall-clock timeout: the marker is
 created only after that command returns, so its five-minute freshness interval
 starts at completed authentication. Subsequent non-interactive GitHub API

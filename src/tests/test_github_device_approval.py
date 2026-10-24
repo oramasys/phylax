@@ -563,6 +563,49 @@ def test_cleanup_failure_does_not_mask_the_original_readback_failure(
         adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
 
 
+def test_cleanup_failure_after_success_is_reported_even_inside_a_callers_except_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller already handling an error must not hide a failed disposal after a good readback."""
+    config_dir = tmp_path / "isolated"
+    launch = intent()
+    marker(config_dir)
+    adapter, _ = verifier(config_dir, [account(), comment(launch)])
+
+    def fail_cleanup(_config_dir: Path) -> None:
+        """Model a local filesystem failure while the token should be removed."""
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(github_device_approval, "_discard_cli_credentials", fail_cleanup)
+
+    try:
+        raise RuntimeError("unrelated error being handled by the caller")
+    except RuntimeError:
+        with pytest.raises(OSError, match="cleanup failed"):
+            adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
+
+
+def test_discard_continues_past_a_stubborn_entry_then_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One undeletable directory must not leave the other credential files behind."""
+    config_dir = tmp_path / "isolated"
+    marker(config_dir)
+    (config_dir / "hosts.yml").write_text("synthetic\n", encoding="utf-8")
+    (config_dir / "stubborn").mkdir()
+
+    def fail_rmtree(_path: Path) -> None:
+        """Model a directory that cannot be removed."""
+        raise OSError("rmtree failed")
+
+    monkeypatch.setattr(github_device_approval.shutil, "rmtree", fail_rmtree)
+
+    with pytest.raises(OSError, match="rmtree failed"):
+        github_device_approval._discard_cli_credentials(config_dir)
+
+    assert not (config_dir / "hosts.yml").exists()
+
+
 def test_cli_credentials_are_discarded_when_the_account_is_refused(tmp_path: Path) -> None:
     """An unauthorized account ends the ceremony: the credential is removed, the marker is not spent."""
     config_dir = tmp_path / "isolated"

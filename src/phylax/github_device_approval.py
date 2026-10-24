@@ -12,7 +12,6 @@ import json
 import os
 import shutil
 import stat
-import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -293,13 +292,20 @@ def _discard_cli_credentials(config_dir: Path) -> None:
     GitHub (neither does ``gh auth logout``).
     """
     keep = {MODEL_AUTH_MARKER, _spent_marker_path(config_dir).name}
+    first_failure: BaseException | None = None
     for entry in config_dir.iterdir():
         if entry.name in keep:
             continue
-        if entry.is_dir() and not entry.is_symlink():
-            shutil.rmtree(entry)
-        else:
-            entry.unlink()
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except OSError as exc:
+            # Keep removing the other entries: one stubborn file must not leave the rest.
+            first_failure = first_failure or exc
+    if first_failure is not None:
+        raise first_failure
 
 
 def begin_fresh_github_login(
@@ -408,6 +414,7 @@ class GitHubCliModelApprovalVerifier:
         issued_at = _require_fresh_marker(marker.get("issued_at"), now_timestamp)
         executable = self.gh_executable
         assert executable is not None
+        verification_failed = False
         try:
             account = _active_account(self.config_dir, self.runner, executable)
             if marker.get("account_id") != account.user_id:
@@ -435,16 +442,20 @@ class GitHubCliModelApprovalVerifier:
                 env=_environment(self.config_dir),
                 capture_output=True,
             )
+        except BaseException:
+            verification_failed = True
+            raise
         finally:
             # Once the CLI has been used, this ceremony is over whatever the outcome.
             # Do not let best-effort local credential disposal replace the failure that
             # caused verification to abort. On a successful readback, disposal remains
-            # mandatory and any failure is reported to the caller.
-            primary_error = sys.exception()
+            # mandatory and any failure is reported to the caller. The flag is explicit
+            # because sys.exception() is also set when a caller invokes verify() from
+            # inside its own except block, which would wrongly swallow a success-path failure.
             try:
                 _discard_cli_credentials(self.config_dir)
             except BaseException:
-                if primary_error is None:
+                if not verification_failed:
                     raise
         comment = _json_object(raw, error="GitHub comment readback is invalid")
         user = comment.get("user")
