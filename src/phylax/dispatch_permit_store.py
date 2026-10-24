@@ -379,7 +379,7 @@ class SqliteDispatchPermitStore:
         """Chain, digest, sign and store one validated event; return its wire dict."""
         if key_id is None:
             key_id = signer.active_key_id()
-        wire.validate_identifier("issuer_key_id", key_id)
+        wire.validate_key_id(key_id)
         counter = self._counter(connection)
         previous = connection.execute(
             "SELECT event_digest FROM issuer_events WHERE version = ?", (counter,)
@@ -488,7 +488,7 @@ class SqliteDispatchPermitStore:
     ) -> bytes:
         """Build, sign and persist a new permit; return its wire bytes."""
         key_id = signer.active_key_id()
-        wire.validate_identifier("issuer_key_id", key_id)
+        wire.validate_key_id(key_id)
         expires = min(now + _LIFETIME, facts.expires_at)
         body = {
             "schema_version": wire.SCHEMA_VERSION,

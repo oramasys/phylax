@@ -421,18 +421,51 @@ def test_cascade_over_the_event_cap_is_refused_before_any_write(store, db, signe
     assert row_count(db, "issuer_events") == 0 and store.current_counter() == 0
 
 
-def test_permit_issuance_refuses_a_noncanonical_issuer_key_id(store, grants, signer) -> None:
-    """Issuer key identifiers are bounded before a permit can be signed or persisted."""
+@pytest.mark.parametrize(
+    "bad_key_id", ["", "   ", "k" * 1_025, "é" * 513],
+    ids=["empty", "blank", "too-long-ascii", "too-long-utf8"],
+)
+def test_permit_issuance_refuses_an_invalid_issuer_key_id(store, grants, signer, bad_key_id) -> None:
+    """Blank or over-long issuer key identifiers are refused before a permit is signed or persisted."""
     class InvalidKeySigner(FakeSigner):
-        """Return an identifier that violates the frozen wire grammar."""
+        """Return an identifier that violates the frozen text grammar."""
 
         def active_key_id(self) -> str:
             """Return an invalid value that must be rejected before signing."""
-            return "key with space"
+            return bad_key_id
 
     with pytest.raises(wire.WireError, match="issuer_key_id"):
         admit(store, grants, InvalidKeySigner())
     assert store.current_counter() == 0
+
+
+@pytest.mark.parametrize(
+    "key_id", ["clé-1", "key 1", "k" * 1_024], ids=["non-ascii", "space", "max-length"]
+)
+def test_permit_issuance_accepts_any_nonblank_utf8_issuer_key_id(store, grants, signer, key_id) -> None:
+    """The frozen grammar is non-blank UTF-8 up to 1,024 bytes, not the ASCII identifier grammar."""
+    class OddKeySigner(FakeSigner):
+        """Return a legal but non-ASCII or spaced key name."""
+
+        def active_key_id(self) -> str:
+            """Return a key identifier that the contract allows."""
+            return key_id
+
+        def sign_permit(self, key_id: str, body: dict) -> str:
+            """Sign with the fixture seed whatever the key name is."""
+            return super().sign_permit("key-1", body)
+
+        def sign_finalization(self, key_id: str, body: dict) -> str:
+            """Sign with the fixture seed whatever the key name is."""
+            return super().sign_finalization("key-1", body)
+
+        def sign_event(self, key_id: str, digest: str) -> str:
+            """Sign with the fixture seed whatever the key name is."""
+            return super().sign_event("key-1", digest)
+
+    permit = json.loads(admit(store, grants, OddKeySigner()))
+
+    assert permit["issuer_key_id"] == key_id
 
 
 def test_revocation_dedupe_index_is_created(store, db) -> None:

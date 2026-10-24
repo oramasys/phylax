@@ -265,6 +265,11 @@ def finalization_wire_bytes(body: Mapping[str, object], signature: str) -> bytes
     return data
 
 
+def validate_key_id(value: object) -> None:
+    """Require an ``issuer_key_id``: non-blank UTF-8 text, at most 1,024 bytes (the frozen contract)."""
+    _require_text("issuer_key_id", value)
+
+
 def validate_identifier(name: str, value: object) -> None:
     """Require a canonical identifier: printable ASCII without space, 1 to 1024 bytes."""
     if not isinstance(value, str) or _IDENTIFIER_RE.fullmatch(value) is None:
