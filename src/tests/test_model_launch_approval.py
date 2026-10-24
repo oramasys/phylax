@@ -63,6 +63,7 @@ def states(path: Path) -> list[str]:
 
 
 def test_missing_verifier_cannot_create_an_approval(tmp_path: Path) -> None:
+    """Without an evidence verifier, no model approval is written."""
     path = tmp_path / "p5.db"
     policy = authority(path)
     with pytest.raises(ValueError, match="verifier"):
@@ -71,6 +72,7 @@ def test_missing_verifier_cannot_create_an_approval(tmp_path: Path) -> None:
 
 
 def test_model_approval_is_created_approved_and_consumed_once(tmp_path: Path) -> None:
+    """A verified model approval is stored as approved and can be consumed exactly once."""
     path = tmp_path / "p5.db"
     policy = authority(path, EvidenceVerifier())
     receipt = policy.approve_model_launch(intent(), evidence_ref="opaque-human-evidence")
@@ -85,6 +87,7 @@ def test_model_approval_is_created_approved_and_consumed_once(tmp_path: Path) ->
 
 
 def test_model_cannot_create_a_pending_preview(tmp_path: Path) -> None:
+    """Model launches have no pending-preview path; issuing one is refused without a write."""
     path = tmp_path / "p5.db"
     policy = authority(path, EvidenceVerifier())
     with pytest.raises(ValueError, match="human"):
@@ -93,6 +96,7 @@ def test_model_cannot_create_a_pending_preview(tmp_path: Path) -> None:
 
 
 def test_human_decision_does_not_restart_request_deadline(tmp_path: Path) -> None:
+    """The receipt keeps the request's original deadline; approving does not extend it."""
     policy = authority(tmp_path / "p5.db", EvidenceVerifier())
     requested = intent(expires_in=20)
     receipt = policy.approve_model_launch(requested, evidence_ref="opaque-human-evidence")
@@ -100,8 +104,11 @@ def test_human_decision_does_not_restart_request_deadline(tmp_path: Path) -> Non
 
 
 def test_verified_evidence_must_match_exact_intent(tmp_path: Path) -> None:
+    """Evidence verified for a different request digest creates no approval."""
     class WrongDigest(EvidenceVerifier):
+        """Verifier that reports a digest for some other intent."""
         def verify(self, requested: ModelLaunchIntent, evidence_ref: str) -> VerifiedModelApproval:
+            """Return otherwise valid evidence with a mismatched request digest."""
             return replace(super().verify(requested, evidence_ref), request_digest="0" * 64)
 
     path = tmp_path / "p5.db"
@@ -111,6 +118,7 @@ def test_verified_evidence_must_match_exact_intent(tmp_path: Path) -> None:
 
 
 def test_payload_drift_does_not_spend_valid_model_receipt(tmp_path: Path) -> None:
+    """Consuming with a drifted intent is refused and leaves the receipt usable for the exact intent."""
     policy = authority(tmp_path / "p5.db", EvidenceVerifier())
     receipt = policy.approve_model_launch(intent(), evidence_ref="opaque")
     with pytest.raises(ValueError, match="intent mismatch"):
@@ -119,11 +127,13 @@ def test_payload_drift_does_not_spend_valid_model_receipt(tmp_path: Path) -> Non
 
 
 def test_concurrent_consumers_admit_one_model_launch(tmp_path: Path) -> None:
+    """Two concurrent consumers of one receipt admit exactly one launch."""
     path = tmp_path / "p5.db"
     policy = authority(path, EvidenceVerifier())
     receipt = policy.approve_model_launch(intent(), evidence_ref="opaque")
 
     def consume() -> bool:
+        """Try to consume the receipt in a fresh authority; report whether it was admitted."""
         try:
             authority(path).consume(receipt, intent())
             return True
@@ -135,6 +145,7 @@ def test_concurrent_consumers_admit_one_model_launch(tmp_path: Path) -> None:
 
 
 def test_base_authority_also_rejects_pending_model_intents(tmp_path: Path) -> None:
+    """The base P5 authority also refuses a pending preview for a model intent."""
     policy = P5ApprovalAuthority(
         signing_key=b"test-only-secret", store=SqliteP5ApprovalStore(str(tmp_path / "p5.db"))
     )
@@ -143,10 +154,13 @@ def test_base_authority_also_rejects_pending_model_intents(tmp_path: Path) -> No
 
 
 def test_human_verification_happens_before_first_authority_write(tmp_path: Path) -> None:
+    """Human evidence is verified before the authority writes anything."""
     path = tmp_path / "p5.db"
 
     class InspectBeforeVerify(EvidenceVerifier):
+        """Verifier that asserts the store is still empty when it runs."""
         def verify(self, requested: ModelLaunchIntent, evidence_ref: str) -> VerifiedModelApproval:
+            """Assert no row exists yet, then verify normally."""
             assert states(path) == []
             return super().verify(requested, evidence_ref)
 
@@ -155,6 +169,7 @@ def test_human_verification_happens_before_first_authority_write(tmp_path: Path)
 
 
 def test_model_receipt_uses_its_own_exact_hmac_domain(tmp_path: Path) -> None:
+    """Model receipts are MACed under their own domain; a swarm-domain MAC is refused."""
     policy = authority(tmp_path / "p5.db", EvidenceVerifier())
     receipt = policy.approve_model_launch(intent(), evidence_ref="opaque")
     encoded_body, encoded_mac = receipt.approval_token.split(".")
@@ -171,6 +186,7 @@ def test_model_receipt_uses_its_own_exact_hmac_domain(tmp_path: Path) -> None:
 
 
 def test_expired_model_request_cannot_be_issued_or_consumed(tmp_path: Path) -> None:
+    """An expired request can be neither approved nor, once expired, consumed."""
     path = tmp_path / "p5.db"
     policy = authority(path, EvidenceVerifier())
     with pytest.raises(ValueError, match="expired"):
@@ -186,6 +202,7 @@ def test_expired_model_request_cannot_be_issued_or_consumed(tmp_path: Path) -> N
 
 
 def test_repeated_evidence_cannot_create_two_approvals(tmp_path: Path) -> None:
+    """The same approval ID cannot be created twice."""
     policy = authority(tmp_path / "p5.db", EvidenceVerifier())
     policy.approve_model_launch(intent(), evidence_ref="opaque")
     with pytest.raises(ValueError, match="already exists"):
@@ -194,6 +211,7 @@ def test_repeated_evidence_cannot_create_two_approvals(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("field,value", [("fast", True), ("effort", "xhigh"), ("review_expires_at", True)])
 def test_model_intent_rejects_unsafe_or_ambiguous_types(field: str, value: object) -> None:
+    """Booleans or unknown values in typed intent fields are refused."""
     payload = intent().preview_payload()
     payload[field] = value
     with pytest.raises(ValueError):
@@ -212,8 +230,11 @@ def test_model_intent_rejects_unsafe_or_ambiguous_types(field: str, value: objec
 def test_invalid_human_evidence_never_creates_authority(
     tmp_path: Path, field: str, value: object,
 ) -> None:
+    """Evidence with a wrong principal, task, time, expiry or duration creates no authority."""
     class InvalidEvidence(EvidenceVerifier):
+        """Verifier that corrupts one evidence field."""
         def verify(self, requested: ModelLaunchIntent, evidence_ref: str) -> VerifiedModelApproval:
+            """Return valid evidence with the parametrized field replaced."""
             return replace(super().verify(requested, evidence_ref), **{field: value})
 
     path = tmp_path / "p5.db"
@@ -223,6 +244,7 @@ def test_invalid_human_evidence_never_creates_authority(
 
 
 def test_receipt_ttl_cannot_be_raised_above_policy_limit(tmp_path: Path) -> None:
+    """A receipt TTL above the 300-second policy limit is refused at construction."""
     with pytest.raises(ValueError, match="300 seconds"):
         ModelLaunchApprovalAuthority(
             signing_key=b"test-only-secret", store=SqliteP5ApprovalStore(str(tmp_path / "p5.db")),

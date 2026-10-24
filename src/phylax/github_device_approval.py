@@ -74,6 +74,7 @@ def _json_object(raw: str, *, error: str) -> dict[str, object]:
         raise ValueError(error)
 
     def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        """Build the object, refusing any duplicate key."""
         result: dict[str, object] = {}
         for key, value in pairs:
             if key in result:
@@ -269,6 +270,37 @@ def _spend_marker(config_dir: Path) -> None:
         raise ValueError("fresh GitHub login marker could not be spent") from exc
 
 
+def _require_fresh_marker(issued_at: object, now_timestamp: int) -> int:
+    """Return the marker's issue time when it lies within the five-minute window at ``now``."""
+    if (
+        isinstance(issued_at, bool)
+        or not isinstance(issued_at, int)
+        or issued_at > now_timestamp
+        or now_timestamp - issued_at > int(_FRESH_TTL.total_seconds())
+    ):
+        raise ValueError("fresh GitHub login marker is expired or invalid")
+    return issued_at
+
+
+def _discard_cli_credentials(config_dir: Path) -> None:
+    """Remove everything the CLI wrote to the isolated config, keeping only Phylax markers.
+
+    Login uses ``--insecure-storage``, so the OAuth token lives only in this directory and never
+    in the operating-system credential store or another ``gh`` login. Deleting the CLI's files
+    removes that token locally without touching any other login; the spent marker stays so a
+    second verification still fails closed as already spent. This does not revoke the token at
+    GitHub (neither does ``gh auth logout``).
+    """
+    keep = {MODEL_AUTH_MARKER, _spent_marker_path(config_dir).name}
+    for entry in config_dir.iterdir():
+        if entry.name in keep:
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+
+
 def begin_fresh_github_login(
     config_dir: Path, *, runner: Callable[..., str] = _run,
     gh_executable: Path | None = None,
@@ -278,21 +310,30 @@ def begin_fresh_github_login(
 
     The caller must be an operator-facing command. This function intentionally
     does not capture login output, so a transient GitHub user code is neither
-    persisted nor returned to Phylax.
+    persisted nor returned to Phylax. ``--insecure-storage`` keeps the token in
+    the new config directory only. If login, account readback or marker creation
+    fails, the directory this call created is removed with everything in it.
     """
     if not config_dir.is_absolute() or config_dir.exists():
         raise ValueError("fresh GitHub config directory must be a new absolute path")
     config_dir.mkdir(mode=0o700, parents=True)
-    resolved_gh = _resolve_gh(gh_executable)
-    _invoke(
-        runner,
-        [str(resolved_gh), "auth", "login", "--web", "--hostname", "github.com", "--git-protocol", "https"],
-        env=_environment(config_dir),
-        capture_output=False,
-        timeout=None,
-    )
-    account = _active_account(config_dir, runner, resolved_gh)
-    _write_marker(config_dir, account=account, issued_at=_utc_timestamp(clock()))
+    try:
+        resolved_gh = _resolve_gh(gh_executable)
+        _invoke(
+            runner,
+            [
+                str(resolved_gh), "auth", "login", "--web", "--hostname", "github.com",
+                "--git-protocol", "https", "--insecure-storage",
+            ],
+            env=_environment(config_dir),
+            capture_output=False,
+            timeout=None,
+        )
+        account = _active_account(config_dir, runner, resolved_gh)
+        _write_marker(config_dir, account=account, issued_at=_utc_timestamp(clock()))
+    except BaseException:
+        shutil.rmtree(config_dir, ignore_errors=True)
+        raise
     return account.login
 
 
@@ -363,37 +404,39 @@ class GitHubCliModelApprovalVerifier:
         marker = _load_json(_marker_path(self.config_dir))
         if not isinstance(marker, dict) or marker.get("schema") != 1:
             raise ValueError("fresh GitHub login marker is invalid")
-        issued_at = marker.get("issued_at")
-        if (
-            isinstance(issued_at, bool)
-            or not isinstance(issued_at, int)
-            or issued_at > now_timestamp
-            or now_timestamp - issued_at > int(_FRESH_TTL.total_seconds())
-        ):
-            raise ValueError("fresh GitHub login marker is expired or invalid")
+        issued_at = _require_fresh_marker(marker.get("issued_at"), now_timestamp)
         executable = self.gh_executable
         assert executable is not None
-        account = _active_account(self.config_dir, self.runner, executable)
-        if marker.get("account_id") != account.user_id:
-            raise ValueError("fresh GitHub login marker is expired or invalid")
-        principal = self.approvers.get(account.user_id)
-        if not isinstance(principal, str) or principal != intent.operator_principal:
-            raise ValueError("GitHub account is not authorized for this model approval")
+        try:
+            account = _active_account(self.config_dir, self.runner, executable)
+            if marker.get("account_id") != account.user_id:
+                raise ValueError("fresh GitHub login marker is expired or invalid")
+            principal = self.approvers.get(account.user_id)
+            if not isinstance(principal, str) or principal != intent.operator_principal:
+                raise ValueError("GitHub account is not authorized for this model approval")
 
-        # The fresh-login ceremony is one-use even if API readback fails.
-        _spend_marker(self.config_dir)
-        raw = _invoke(
-            self.runner,
-            [
-                str(executable),
-                "api",
-                "--hostname",
-                _GITHUB_HOST,
-                f"repos/{repository}/issues/comments/{comment_id}",
-            ],
-            env=_environment(self.config_dir),
-            capture_output=True,
-        )
+            # Account readback is a network call: read the clock again so a marker that
+            # expired meanwhile is refused before it is spent, and judge the comment then.
+            now = self.clock()
+            now_timestamp = _utc_timestamp(now)
+            _require_fresh_marker(issued_at, now_timestamp)
+            # The fresh-login ceremony is one-use even if API readback fails.
+            _spend_marker(self.config_dir)
+            raw = _invoke(
+                self.runner,
+                [
+                    str(executable),
+                    "api",
+                    "--hostname",
+                    _GITHUB_HOST,
+                    f"repos/{repository}/issues/comments/{comment_id}",
+                ],
+                env=_environment(self.config_dir),
+                capture_output=True,
+            )
+        finally:
+            # Once the CLI has been used, this ceremony is over whatever the outcome.
+            _discard_cli_credentials(self.config_dir)
         comment = _json_object(raw, error="GitHub comment readback is invalid")
         user = comment.get("user")
         if (

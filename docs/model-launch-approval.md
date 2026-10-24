@@ -27,8 +27,19 @@ user code, then posts an exact confirmation comment for the immutable launch
 intent. The verifier rejects ambient token and host overrides, pins GitHub
 public-host calls, checks the active numeric GitHub account ID and local
 five-minute marker, spends that marker before API readback, and accepts only
-an allowlisted, unedited GitHub comment with the exact canonical body. It
-stores neither the browser code nor an access token. This implemented path is
+an allowlisted, unedited GitHub comment with the exact canonical body. The
+marker's freshness is checked again, on a new clock reading, after account
+readback and immediately before the marker is spent.
+
+Phylax stores neither the browser code nor an access token. The CLI does: login
+runs with `--insecure-storage`, so `gh` keeps the OAuth token only in the
+isolated config directory, never in the operating-system credential store or
+another `gh` login. When a verification has used the CLI, whatever its outcome,
+the adapter deletes everything `gh` wrote there and keeps only its own spent
+marker, so the ceremony stays one-use. If login setup fails, the new directory is
+removed. Deleting the local copy does not revoke the token at GitHub, and
+neither would `gh auth logout`; revocation, when required, is an operator action
+in GitHub's authorized OAuth applications settings. This implemented path is
 procedural evidence: a fresh isolated CLI login plus an exact operator comment.
 The interactive browser-login command has no wall-clock timeout: the marker is
 created only after that command returns, so its five-minute freshness interval
