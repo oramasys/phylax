@@ -23,6 +23,7 @@ sys.path[:0] = [str(PHYLAX / "src"), str(ORAMASYS / "src")]
 from nacl.bindings import crypto_sign_seed_keypair  # noqa: E402
 from orama.graph.dispatch_attempts import (  # noqa: E402
     AuthorizationRefused, EventRefused, ExpectedBinding, SqliteAttemptStore,
+    VerifiedDispatchGrant,
 )
 from orama.graph.effect_proposals import EffectScope  # noqa: E402
 from phylax import dispatch_wire as W  # noqa: E402
@@ -152,7 +153,13 @@ class World:
             "consumer_acked_through": self.consumer.acked_through(ISSUER), "attempt_id": attempt,
             "requested_at": W.timestamp(self.t),
         }
-        self.consumer.create_attempt(attempt, grant, reservation, second_approval_ref=approval_ref)
+        if approval_ref is None:
+            # This one vector models a migrated row with an undeclared binding.
+            self.consumer._create_attempt(attempt, grant, reservation)
+        else:
+            self.consumer.create_attempt(
+                attempt, VerifiedDispatchGrant(grant, approval_ref), reservation
+            )
         self.consumer.propose(f"proposal-{self.n}", SCOPE, self.t)
         self.consumer.reserve(reservation, f"proposal-{self.n}", SCOPE, self.t + timedelta(hours=1), self.t)
         self.consumer.mark_transmitted(attempt)
