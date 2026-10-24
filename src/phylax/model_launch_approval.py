@@ -24,6 +24,9 @@ from .p5_approval import (
 )
 
 _MODEL_DOMAIN = b"phylax-p5-model-launch-approval-v1\x00"
+_FAST_DOMAIN = b"phylax-p5-direct-xai-fast-approval-v1\x00"
+LAUNCH_ACTION = "model.launch"
+FAST_LAUNCH_ACTION = "model.launch.fast"
 _TEXT_FIELDS = frozenset({
     "request_id", "task_id", "run_id", "operation_id", "harness_path",
     "model_id", "effort", "scope", "mode", "policy_revision",
@@ -35,13 +38,18 @@ _FIELDS = _TEXT_FIELDS | {"fast", "budget_cap", "review_expires_at"}
 class ModelLaunchIntent(P5ApprovalIntent):
     """Version-one immutable model intent, independent of the swarm preview shape."""
 
-    action: str = "model.launch"
+    action: str = LAUNCH_ACTION
 
     def __post_init__(self) -> None:
-        """Validate exact keys, types and policy-independent intent invariants."""
+        """Validate exact keys, types and policy-independent intent invariants.
+
+        ``model.launch`` always means fast off.  Fast mode is a separate,
+        domain-separated action that exists only for the direct-xAI operator
+        exception, so an ordinary launch receipt can never authorize it.
+        """
         if not isinstance(self.operator_principal, str) or not self.operator_principal.strip():
             raise ValueError("operator_principal is required")
-        if self.action != "model.launch":
+        if self.action not in (LAUNCH_ACTION, FAST_LAUNCH_ACTION):
             raise ValueError("model launch action is required")
         try:
             payload = json.loads(self.canonical_preview_json)
@@ -55,8 +63,14 @@ class ModelLaunchIntent(P5ApprovalIntent):
             raise ValueError("model launch text fields must be nonempty strings")
         if payload["effort"] not in ("medium", "high") or payload["mode"] not in ("standard", "ultracode"):
             raise ValueError("model launch effort or mode is unsupported")
-        if payload["fast"] is not False:
-            raise ValueError("model launch requires explicit fast off")
+        fast_action = self.action == FAST_LAUNCH_ACTION
+        if payload["fast"] is not fast_action:
+            raise ValueError(
+                "fast approval requires explicit fast on" if fast_action
+                else "model launch requires explicit fast off"
+            )
+        if fast_action and (payload["harness_path"] != "direct_xai" or payload["effort"] != "medium"):
+            raise ValueError("fast approval is limited to direct_xai at medium effort")
         if payload["budget_cap"] is not None and (
             not isinstance(payload["budget_cap"], str) or not payload["budget_cap"].strip()
         ):
@@ -68,9 +82,14 @@ class ModelLaunchIntent(P5ApprovalIntent):
         """Freeze named fields with the existing native P5 canonical JSON encoder."""
         return cls(operator_principal, _canonical_bytes(payload).decode("utf-8"))
 
+    @classmethod
+    def from_fast_launch(cls, operator_principal: str, payload: dict[str, object]) -> ModelLaunchIntent:
+        """Freeze the direct-xAI fast-mode exception under its own action and domain."""
+        return cls(operator_principal, _canonical_bytes(payload).decode("utf-8"), FAST_LAUNCH_ACTION)
+
     def signature_domain(self) -> bytes:
         """Separate model receipts from all existing swarm and grant receipts."""
-        return _MODEL_DOMAIN
+        return _FAST_DOMAIN if self.action == FAST_LAUNCH_ACTION else _MODEL_DOMAIN
 
 
 @dataclass(frozen=True, slots=True)

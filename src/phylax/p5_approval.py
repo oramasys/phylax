@@ -495,7 +495,7 @@ class SqliteP5ApprovalStore:
         try:
             intent_data = json.loads(row[1])
             intent_type = P5ApprovalIntent
-            if intent_data.get("action") == "model.launch":
+            if str(intent_data.get("action", "")).startswith("model.launch"):
                 from .model_launch_approval import ModelLaunchIntent
                 intent_type = ModelLaunchIntent
             intent = intent_type(
@@ -544,7 +544,7 @@ class P5ApprovalAuthority:
 
     def issue_preview(self, intent: P5ApprovalIntent) -> P5ApprovalPreview:
         """Mint and persist a preview; no caller boolean can bypass this step."""
-        if intent.action == "model.launch":
+        if intent.action.startswith("model.launch"):
             raise ValueError("model approval requires verified human evidence before creation")
         now = self._now()
         preview = P5ApprovalPreview(token_urlsafe(24), intent, now + self._preview_ttl)
