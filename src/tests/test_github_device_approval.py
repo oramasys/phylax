@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import phylax.github_device_approval as github_device_approval
 from phylax.github_device_approval import (
     GitHubCliModelApprovalVerifier,
     MODEL_AUTH_MARKER,
@@ -517,6 +518,49 @@ def test_cli_credentials_are_discarded_after_readback_but_the_spent_marker_stays
     with pytest.raises(ValueError, match="already spent"):
         adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
     assert len(runner.calls) == 2
+
+
+def test_cleanup_failure_does_not_mask_the_original_readback_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed local cleanup preserves the readback failure that caused it."""
+    class FailingReadbackRunner:
+        """Return identity once, then fail during the protected API readback."""
+
+        def __init__(self) -> None:
+            """Start before identity has been read."""
+            self.calls = 0
+
+        def __call__(
+            self, command: list[str], *, env: dict[str, str], capture_output: bool,
+            timeout: float | None,
+        ) -> str:
+            """Fail exactly where verification has entered its cleanup guard."""
+            self.calls += 1
+            if self.calls == 1:
+                return account()
+            raise OSError("readback failed")
+
+    config_dir = tmp_path / "isolated"
+    launch = intent()
+    marker(config_dir)
+    adapter = GitHubCliModelApprovalVerifier(
+        config_dir=config_dir,
+        repository="acme/control",
+        approvers={7: "control-plane"},
+        runner=FailingReadbackRunner(),
+        gh_executable=fake_gh(tmp_path),
+        clock=lambda: NOW,
+    )
+
+    def fail_cleanup(_config_dir: Path) -> None:
+        """Model an unexpected local filesystem cleanup failure."""
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(github_device_approval, "_discard_cli_credentials", fail_cleanup)
+
+    with pytest.raises(ValueError, match="GitHub CLI invocation failed"):
+        adapter.verify(launch, "https://github.com/acme/control/issues/7#issuecomment-17")
 
 
 def test_cli_credentials_are_discarded_when_the_account_is_refused(tmp_path: Path) -> None:

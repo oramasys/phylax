@@ -41,6 +41,16 @@ removed. Deleting the local copy does not revoke the token at GitHub, and
 neither would `gh auth logout`; revocation, when required, is an operator action
 in GitHub's authorized OAuth applications settings. This implemented path is
 procedural evidence: a fresh isolated CLI login plus an exact operator comment.
+
+### Revoking a compromised or no-longer-needed credential
+
+Removing the isolated local configuration directory, its marker, or the local
+CLI credential files does **not** revoke the OAuth credential held by GitHub.
+An operator who must revoke that credential must separately revoke the matching
+authorization in GitHub's authorized OAuth applications settings. Local cleanup
+still prevents this adapter from reusing its local evidence; it is not remote
+credential revocation.
+
 The interactive browser-login command has no wall-clock timeout: the marker is
 created only after that command returns, so its five-minute freshness interval
 starts at completed authentication. Subsequent non-interactive GitHub API

@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -436,7 +437,15 @@ class GitHubCliModelApprovalVerifier:
             )
         finally:
             # Once the CLI has been used, this ceremony is over whatever the outcome.
-            _discard_cli_credentials(self.config_dir)
+            # Do not let best-effort local credential disposal replace the failure that
+            # caused verification to abort. On a successful readback, disposal remains
+            # mandatory and any failure is reported to the caller.
+            primary_error = sys.exception()
+            try:
+                _discard_cli_credentials(self.config_dir)
+            except BaseException:
+                if primary_error is None:
+                    raise
         comment = _json_object(raw, error="GitHub comment readback is invalid")
         user = comment.get("user")
         if (
