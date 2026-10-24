@@ -205,6 +205,17 @@ def refuses(call) -> bool:
     return False
 
 
+def wrapper_digest(version: int, kind: str, body: object, previous_event_digest: str) -> str:
+    """SHA-256 of the canonical event wrapper, computed with ``hashlib`` and no body checks.
+
+    The issuer's own ``event_digest`` refuses malformed bodies, so X2 hashes the wrapper directly. A
+    consumer that checks the digest then sees a correct digest and a valid signature, and can only
+    refuse an X2 event because of its body.
+    """
+    wrapper = {"body": body, "kind": kind, "previous_event_digest": previous_event_digest, "version": version}
+    return hashlib.sha256(json.dumps(wrapper, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 def main() -> int:
     """Run scenarios X1-X8 and return 0 only when every scenario passes."""
     worlds: list[World] = []
@@ -220,10 +231,14 @@ def main() -> int:
            and len(facts["revocations"]) == 3 and len(facts["cascades"]) == 1,
            f"sha256={hashlib.sha256(phylax_bytes).hexdigest()[:16]} acked={w.consumer.acked_through(ISSUER)}")
 
-    # X2 every shared malformed body is refused by the issuer AND by the consumer (real signature).
-    misses = []
+    # X2 every shared malformed body is refused by the issuer AND by the consumer. Each event carries
+    # the correct wrapper digest and a real signature, so only its body can cause the refusal.
+    first = vectors["events"][0]
+    args = (first["version"], first["kind"], first["body"], first["previous_event_digest"])
+    helper_ok = wrapper_digest(*args) == W.event_digest(*args) == first["event_digest"]
+    misses = [] if helper_ok else ["wrapper_digest disagrees with the issuer digest on a valid event"]
     for case in vectors["malformed"]:
-        digest = hashlib.sha256(case["name"].encode()).hexdigest()
+        digest = wrapper_digest(1, case["kind"], case["body"], W.GENESIS_EVENT_DIGEST)
         event = {"version": 1, "kind": case["kind"], "body": case["body"], "previous_event_digest": W.GENESIS_EVENT_DIGEST,
                  "event_digest": digest, "issuer_key_id": KEY, "signature": W.sign_event(SEED, digest)}
         issuer_refused = refuses(lambda: W.event_digest(1, case["kind"], case["body"], W.GENESIS_EVENT_DIGEST))
