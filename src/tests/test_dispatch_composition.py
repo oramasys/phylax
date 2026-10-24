@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 from nacl.bindings import crypto_sign_seed_keypair
@@ -17,16 +18,19 @@ from phylax.p5_approval import InMemoryP5ApprovalStore, P5ApprovalAuthority
 
 _SEED = b"D" * 32
 _KEY_ID = "issuer-1"
+_NEXT_SEED = b"E" * 32
+_NEXT_KEY_ID = "issuer-2"
 
 
 class _Seeds:
-    """Fixed private seed source for a narrow adapter test."""
+    """Synthetic private seed source keyed by opaque reference."""
 
     def load_seed(self, seed_ref: str) -> bytes:
-        """Return the test seed only for the expected opaque reference."""
-        if seed_ref != _KEY_ID:
+        """Return the synthetic seed only for a known opaque reference."""
+        seeds = {_KEY_ID: _SEED, _NEXT_KEY_ID: _NEXT_SEED}
+        if seed_ref not in seeds:
             raise ValueError("unexpected seed reference")
-        return _SEED
+        return seeds[seed_ref]
 
 
 def _signer(tmp_path: Path) -> DispatchIssuerSigner:
@@ -80,3 +84,40 @@ def test_dispatch_signer_refuses_a_stale_or_substituted_key_id(tmp_path: Path) -
 
     with pytest.raises(ValueError, match="not the active issuer key"):
         signer.sign_permit("other-issuer", permit)
+
+
+def test_dispatch_signer_adopts_a_rotation_made_by_another_keyring(tmp_path: Path) -> None:
+    """A stale worker refuses the retired id and signs all three domains with the new key."""
+    store = SqliteGrantAuthorityStore(tmp_path / "grants.sqlite3")
+    first = RotatingIssuerKeyring(
+        key_id=_KEY_ID, seed_ref=_KEY_ID, seed_provider=_Seeds(), store=store
+    )
+    second = RotatingIssuerKeyring(
+        key_id=_KEY_ID, seed_ref=_KEY_ID, seed_provider=_Seeds(), store=store
+    )
+    stale = DispatchIssuerSigner(second)
+    assert stale.active_key_id() == _KEY_ID
+
+    first.rotate(key_id=_NEXT_KEY_ID, seed_ref=_NEXT_KEY_ID, now=datetime.now(UTC))
+
+    vectors = _vectors()
+    permit = vectors["permit"]["body"]
+    finalization = vectors["finalization"]["body"]
+    digest = "a" * 64
+    for refused in (
+        lambda: stale.sign_permit(_KEY_ID, permit),
+        lambda: stale.sign_finalization(_KEY_ID, finalization),
+        lambda: stale.sign_event(_KEY_ID, digest),
+    ):
+        with pytest.raises(ValueError, match="not the active issuer key"):
+            refused()
+
+    public_key, _private = crypto_sign_seed_keypair(_NEXT_SEED)
+    assert stale.active_key_id() == _NEXT_KEY_ID
+    assert dispatch_wire.verify_permit(
+        public_key, permit, stale.sign_permit(_NEXT_KEY_ID, permit)
+    )
+    assert dispatch_wire.verify_finalization(
+        public_key, finalization, stale.sign_finalization(_NEXT_KEY_ID, finalization)
+    )
+    assert dispatch_wire.verify_event(public_key, digest, stale.sign_event(_NEXT_KEY_ID, digest))

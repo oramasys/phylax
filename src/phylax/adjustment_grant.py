@@ -598,8 +598,9 @@ class RotatingIssuerKeyring:
 
     def sign(self, body: bytes) -> tuple[str, str]:
         """Sign one canonical body with the current active Ed25519ph key."""
-        _public_key, signature = _sign(self._active.seed, body)
-        return self._active.key_id, _b64encode(signature)
+        key = self._active
+        _public_key, signature = _sign(key.seed, body)
+        return key.key_id, _b64encode(signature)
 
     def dispatch_active_key_id(self) -> str:
         """Return the current dispatch-signing key after validating its frozen wire grammar.
@@ -608,10 +609,19 @@ class RotatingIssuerKeyring:
         domain-separated signatures.  They may reuse the durable issuer-key
         registry, but never the adjustment-grant signature framing.
         """
+        return self._current_dispatch_key().key_id
+
+    def _current_dispatch_key(self) -> _IssuerKey:
+        """Refresh durable state and return one immutable snapshot of the active key.
+
+        Callers read the identifier and seed from this single object, so a
+        concurrent ``rotate`` can never pair one generation's identifier with
+        another generation's seed.
+        """
         self.ensure_current()
-        key_id = self._active.key_id
-        dispatch_wire.validate_key_id(key_id)
-        return key_id
+        key = self._active
+        dispatch_wire.validate_key_id(key.key_id)
+        return key
 
     def sign_dispatch_permit(self, key_id: str, body: Mapping[str, object]) -> str:
         """Sign one validated dispatch-permit body with the active durable key only."""
@@ -632,10 +642,10 @@ class RotatingIssuerKeyring:
         key lookup and its signature request fail closed rather than minting a
         permit under a retired generation.
         """
-        active_key_id = self.dispatch_active_key_id()
-        if key_id != active_key_id:
+        key = self._current_dispatch_key()
+        if key_id != key.key_id:
             raise ValueError("dispatch signing key is not the active issuer key")
-        return self._active.seed
+        return key.seed
 
     def verify(self, grant: AdjustmentGrant, *, now: datetime) -> bool:
         """Verify a signed grant against its exact key id without trial verification."""
