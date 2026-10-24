@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS issuer_events (
     issuer_key_id TEXT NOT NULL,
     signature TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS issuer_events_by_kind_body ON issuer_events(kind, body);
+CREATE INDEX IF NOT EXISTS issuer_events_by_kind_body ON issuer_events(body) WHERE kind = 'revocation';
 """
 
 
