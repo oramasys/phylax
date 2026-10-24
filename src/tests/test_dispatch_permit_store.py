@@ -406,6 +406,21 @@ def test_finalization_checks_its_event_size_before_persistence(
     assert observed == ["finalization"]
 
 
+def test_cascade_over_the_event_cap_is_refused_before_any_write(store, db, signer) -> None:
+    """Through the store, a cascade whose whole event exceeds 64 KiB is refused and persists nothing.
+
+    The exact 65,536/65,537 boundary stays pinned at ``check_event_wire_size``; this proves the
+    store applies that gate before the write rather than after.
+    """
+    grant_ids = [f"g{index:04d}" + "x" * 1018 for index in range(70)]
+    assert grant_ids == sorted(grant_ids)
+
+    with pytest.raises(wire.WireError, match="exceeds"):
+        store.append_cascade("approval-1", grant_ids, 1, signer=signer)
+
+    assert row_count(db, "issuer_events") == 0 and store.current_counter() == 0
+
+
 def test_permit_issuance_refuses_a_noncanonical_issuer_key_id(store, grants, signer) -> None:
     """Issuer key identifiers are bounded before a permit can be signed or persisted."""
     class InvalidKeySigner(FakeSigner):

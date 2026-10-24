@@ -6,6 +6,9 @@
    `docs/vectors/dispatch-permit-v1.json`, and report every `FREEZE-CHOICE` they disagree with.
 2. Implementers build only against this contract. A change to a frozen item needs a new review.
 3. Nothing here enables grant serving, issuance or a pin change. `ORAMA_GRANT_SERVING` stays unset.
+   "Pin change" means promoting a production dependency pin. The interop test pins
+   (`src/tests/interop/oramasys-*-pin.txt`) are test fixtures that name the partner commit the
+   shared probes run against; they are updated with the probes and promote nothing.
 
 ## 1. Authority and scope
 
