@@ -386,6 +386,49 @@ def test_finalization_happy_path(store, db, grants, signer) -> None:
     assert row_count(db, "issuer_events") == 1 and store.current_counter() == 1
 
 
+def test_finalization_checks_its_event_size_before_persistence(
+    store, grants, signer, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The finalization event uses the same pre-persistence size gate as other events."""
+    observed: list[str] = []
+    original = wire.check_event_wire_size
+
+    def checked(event: object) -> None:
+        """Record the event type while retaining the real wire-size validation."""
+        assert isinstance(event, dict)
+        observed.append(str(event["kind"]))
+        original(event)
+
+    monkeypatch.setattr(wire, "check_event_wire_size", checked)
+    permit = admit(store, grants, signer)
+    finalize(store, grants, signer, final_request(permit))
+
+    assert observed == ["finalization"]
+
+
+def test_permit_issuance_refuses_a_noncanonical_issuer_key_id(store, grants, signer) -> None:
+    """Issuer key identifiers are bounded before a permit can be signed or persisted."""
+    class InvalidKeySigner(FakeSigner):
+        """Return an identifier that violates the frozen wire grammar."""
+
+        def active_key_id(self) -> str:
+            """Return an invalid value that must be rejected before signing."""
+            return "key with space"
+
+    with pytest.raises(wire.WireError, match="issuer_key_id"):
+        admit(store, grants, InvalidKeySigner())
+    assert store.current_counter() == 0
+
+
+def test_revocation_dedupe_index_is_created(store, db) -> None:
+    """Canonical revocation lookup has a durable kind/body index."""
+    del store
+    with open_db(db) as connection:
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list('issuer_events')")}
+
+    assert "issuer_events_by_kind_body" in indexes
+
+
 def test_event_chain_digests_verify(store, grants, signer) -> None:
     """Chained events recompute through dispatch_wire.event_digest."""
     for n in range(3):

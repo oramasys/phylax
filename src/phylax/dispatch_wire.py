@@ -265,7 +265,7 @@ def finalization_wire_bytes(body: Mapping[str, object], signature: str) -> bytes
     return data
 
 
-def _require_identifier(name: str, value: object) -> None:
+def validate_identifier(name: str, value: object) -> None:
     """Require a canonical identifier: printable ASCII without space, 1 to 1024 bytes."""
     if not isinstance(value, str) or _IDENTIFIER_RE.fullmatch(value) is None:
         raise WireError(f"{name} must be a canonical identifier")
@@ -284,18 +284,18 @@ def validate_revocation_body(body: Mapping[str, object]) -> None:
     kind = body["subject_kind"]
     if not isinstance(kind, str) or kind not in SUBJECT_KINDS:
         raise WireError("subject_kind must be grant, approval or issuer")
-    _require_identifier("subject_id", body["subject_id"])
+    validate_identifier("subject_id", body["subject_id"])
 
 
 def validate_cascade_body(body: Mapping[str, object]) -> None:
     """Require the closed cascade body with a strictly ascending, duplicate-free ``grant_ids`` list."""
     _require_exact_keys("cascade body", body, CASCADE_BODY_FIELDS)
-    _require_identifier("approval_id", body["approval_id"])
+    validate_identifier("approval_id", body["approval_id"])
     grant_ids = body["grant_ids"]
     if not isinstance(grant_ids, list):
         raise WireError("grant_ids must be an array")
     for grant_id in grant_ids:
-        _require_identifier("grant_ids element", grant_id)
+        validate_identifier("grant_ids element", grant_id)
     if any(earlier >= later for earlier, later in zip(grant_ids, grant_ids[1:])):
         raise WireError("grant_ids must be strictly ascending and duplicate-free")
     version = body["issuer_authority_version"]

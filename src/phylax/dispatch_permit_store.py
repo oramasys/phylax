@@ -33,7 +33,10 @@ _EVENT_COLUMNS = (
 _ATTESTATION_COLUMNS = (
     "permit_id", "attempt_id", "attestation_digest", "attestation", "disposition_ref", "recorded_at",
 )
-_INDEXES = ("one_original_permit_per_grant", "one_nonterminal_permit_per_grant")
+_INDEXES = (
+    "one_original_permit_per_grant", "one_nonterminal_permit_per_grant",
+    "issuer_events_by_kind_body",
+)
 _LIFETIME = timedelta(seconds=wire.PERMIT_LIFETIME_SECONDS)
 
 _SCHEMA = """
@@ -84,6 +87,7 @@ CREATE TABLE IF NOT EXISTS issuer_events (
     issuer_key_id TEXT NOT NULL,
     signature TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS issuer_events_by_kind_body ON issuer_events(kind, body);
 """
 
 
@@ -369,10 +373,13 @@ class SqliteDispatchPermitStore:
             return self._append_event(connection, "cascade", body, signer)
 
     def _append_event(
-        self, connection: sqlite3.Connection, kind: str, body: dict[str, object], signer: IssuerSigner
+        self, connection: sqlite3.Connection, kind: str, body: dict[str, object], signer: IssuerSigner,
+        *, key_id: str | None = None,
     ) -> dict[str, object]:
         """Chain, digest, sign and store one validated event; return its wire dict."""
-        key_id = signer.active_key_id()
+        if key_id is None:
+            key_id = signer.active_key_id()
+        wire.validate_identifier("issuer_key_id", key_id)
         counter = self._counter(connection)
         previous = connection.execute(
             "SELECT event_digest FROM issuer_events WHERE version = ?", (counter,)
@@ -481,6 +488,7 @@ class SqliteDispatchPermitStore:
     ) -> bytes:
         """Build, sign and persist a new permit; return its wire bytes."""
         key_id = signer.active_key_id()
+        wire.validate_identifier("issuer_key_id", key_id)
         expires = min(now + _LIFETIME, facts.expires_at)
         body = {
             "schema_version": wire.SCHEMA_VERSION,
@@ -593,22 +601,13 @@ class SqliteDispatchPermitStore:
     ) -> tuple[bytes, dict[str, object]]:
         """Append the finalization event, sign and store the finalization, and build the envelope."""
         key_id = row["issuer_key_id"]
-        r_f = counter + 1
-        previous = connection.execute(
-            "SELECT event_digest FROM issuer_events WHERE version = ?", (counter,)
-        ).fetchone()
-        previous_digest = wire.GENESIS_EVENT_DIGEST if previous is None else previous["event_digest"]
         finalization_id = "fin-" + secrets.token_hex(16)
-        digest = wire.finalization_event_digest(r_f, finalization_id, previous_digest)
         event_body = {"finalization_id": finalization_id}
-        connection.execute(
-            "INSERT INTO issuer_events(version, kind, body, previous_event_digest, event_digest,"
-            " issuer_key_id, signature) VALUES(?,?,?,?,?,?,?)",
-            (
-                r_f, "finalization", wire.canonical_bytes(event_body).decode("utf-8"),
-                previous_digest, digest, key_id, signer.sign_event(key_id, digest),
-            ),
+        event = self._append_event(
+            connection, "finalization", event_body, signer, key_id=key_id
         )
+        r_f = int(event["version"])
+        digest = str(event["event_digest"])
         permit_expiry = wire.parse_timestamp(row["expires_at"])
         body = {
             "schema_version": wire.SCHEMA_VERSION,
