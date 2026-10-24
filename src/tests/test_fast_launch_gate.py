@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -91,6 +93,42 @@ def test_exact_fast_launch_is_accepted_once_with_a_verified_receipt(tmp_path: Pa
     assert decision.intent.preview_payload()["fast"] is True
     with pytest.raises(FastLaunchRefused, match="already consumed"):
         _spend(authority, receipt)
+
+
+def test_concurrent_double_spend_of_one_fast_receipt_is_single_use(tmp_path: Path) -> None:
+    """Racing threads, each with its own authority and store on one file, spend one receipt once."""
+    workers = 8
+    db_path = tmp_path / "p5.db"
+    issuer, _ = _setup(tmp_path)
+    receipt = _approve(issuer)
+    barrier = threading.Barrier(workers)
+    outcomes: list[str] = [""] * workers
+
+    def race(index: int) -> None:
+        """Wait for every peer, then spend the receipt through a private authority and store."""
+        authority = ModelLaunchApprovalAuthority(
+            signing_key=b"synthetic-signing-key", store=SqliteP5ApprovalStore(str(db_path)),
+            evidence_verifier=_Verifier(), clock=_Clock(),
+        )
+        barrier.wait(timeout=30)
+        try:
+            _spend(authority, receipt)
+            outcomes[index] = "ok"
+        except FastLaunchRefused:
+            outcomes[index] = "refused"
+
+    threads = [threading.Thread(target=race, args=(i,)) for i in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not any(thread.is_alive() for thread in threads)
+    assert outcomes.count("ok") == 1
+    assert outcomes.count("refused") == workers - 1
+    with sqlite3.connect(db_path) as connection:
+        states = [row[0] for row in connection.execute("SELECT state FROM p5_approvals")]
+    connection.close()
+    assert states == ["consumed"]
 
 
 @pytest.mark.parametrize(
