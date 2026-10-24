@@ -42,15 +42,19 @@ class Signer:
     """Issuer signer port backed by the issuer wire module and the probe seed."""
 
     def active_key_id(self) -> str:
+        """Return the probe's one issuer key id."""
         return KEY
 
     def sign_permit(self, key_id: str, body) -> str:
+        """Sign a permit body with the probe seed."""
         return W.sign_permit(SEED, body)
 
     def sign_finalization(self, key_id: str, body) -> str:
+        """Sign a finalization body with the probe seed."""
         return W.sign_finalization(SEED, body)
 
     def sign_event(self, key_id: str, digest: str) -> str:
+        """Sign an event digest with the probe seed."""
         return W.sign_event(SEED, digest)
 
 
@@ -58,15 +62,19 @@ class Verifier:
     """Consumer verifier port: REAL Ed25519ph verification through the issuer's wire module."""
 
     def __init__(self, key_id: str = KEY, public: bytes = PUBLIC) -> None:
+        """Pin the trusted key id and public key."""
         self.key_id, self.public = key_id, public
 
     def verify_permit(self, key_id, body, signature) -> bool:
+        """Verify a permit signature under the pinned key."""
         return key_id == self.key_id and W.verify_permit(self.public, body, signature)
 
     def verify_finalization(self, key_id, body, signature) -> bool:
+        """Verify a finalization signature under the pinned key."""
         return key_id == self.key_id and W.verify_finalization(self.public, body, signature)
 
     def verify_event(self, key_id, digest, signature) -> bool:
+        """Verify an event signature under the pinned key."""
         return key_id == self.key_id and W.verify_event(self.public, digest, signature)
 
 
@@ -74,11 +82,14 @@ class Grants:
     """The issuer's injected grant facts: every grant is live (issuer admission is out of scope)."""
 
     def get(self, grant_id: str) -> GrantFacts:
+        """Return live grant facts bound to the probe's fixed digests."""
         return GrantFacts(D["gp"], f"op-{grant_id}", D["rq"], "probe-ledger", NOW + timedelta(hours=2), False, False)
 
 
 class Gates:
+    """Rule 6 gate port that always passes, so every refusal comes from Rule 4."""
     def check(self, **_kwargs) -> bool:
+        """Pass every gate check."""
         return True
 
 
@@ -86,6 +97,7 @@ class NoPortRevocations:
     """The legacy injected port says nothing is revoked, so every refusal below comes from the facts."""
 
     def revoked(self, *, grant_id: str, issuer_id: str) -> bool:
+        """Report nothing revoked through the legacy port."""
         return False
 
 
@@ -96,6 +108,7 @@ class World:
     """One issuer and one governed consumer, each in a private temp directory."""
 
     def __init__(self) -> None:
+        """Create a private issuer store, a governed consumer store and real crypto ports."""
         self.root = Path(tempfile.mkdtemp(prefix="c2-part3-"))
         self.issuer = SqliteDispatchPermitStore(self.root / "issuer" / "issuer.db")
         (self.root / "consumer").mkdir(mode=0o700)
@@ -104,6 +117,7 @@ class World:
         self.signer, self.verifier, self.n, self.t = Signer(), Verifier(), 0, NOW
 
     def tick(self) -> datetime:
+        """Advance the world clock by one second and return it."""
         self.t += timedelta(seconds=1)
         return self.t
 
@@ -114,14 +128,19 @@ class World:
             self.consumer.ingest_events(ISSUER, self.issuer.events(low, high), self.verifier)
 
     def reservations(self) -> list:
+        """Return the consumer's reservation rows, read-only and sorted."""
         connection = sqlite3.connect(f"file:{self.consumer_path}?mode=ro", uri=True)
         try:
             return sorted(connection.execute("SELECT * FROM reservations").fetchall(), key=repr)
         finally:
             connection.close()
 
-    def dispatch(self, grant_id: str | None = None, approval_ref: str | None = None):
-        """Run one full permit round for a grant; return None on success or (rule, reason)."""
+    def dispatch(self, grant_id: str | None = None, approval_ref: str | None = ""):
+        """Run one full permit round; return None on success or (rule, reason, untouched).
+
+        ``approval_ref`` is bound to the attempt at creation ("" single approval, None undeclared);
+        Step 4.3 reads it from there and takes no approval argument.
+        """
         self.n += 1
         grant = grant_id or f"grant-{self.n}"
         attempt, reservation = f"attempt-{self.n}", f"res-{self.n}"
@@ -133,7 +152,7 @@ class World:
             "consumer_acked_through": self.consumer.acked_through(ISSUER), "attempt_id": attempt,
             "requested_at": W.timestamp(self.t),
         }
-        self.consumer.create_attempt(attempt, grant, reservation)
+        self.consumer.create_attempt(attempt, grant, reservation, second_approval_ref=approval_ref)
         self.consumer.propose(f"proposal-{self.n}", SCOPE, self.t)
         self.consumer.reserve(reservation, f"proposal-{self.n}", SCOPE, self.t + timedelta(hours=1), self.t)
         self.consumer.mark_transmitted(attempt)
@@ -151,7 +170,6 @@ class World:
                 attempt, permit, json.loads(fin_bytes), self.tick(), verifier=self.verifier,
                 gates=Gates(), revocations=NoPortRevocations(), issuer_id=ISSUER,
                 expected=ExpectedBinding(D["rq"], D["ar"], 1, 1, "probe-ledger"), scope=SCOPE,
-                approval_ref=approval_ref,
             )
         except AuthorizationRefused as refusal:
             untouched = (
@@ -166,11 +184,13 @@ results: list[dict] = []
 
 
 def record(name: str, ok: bool, detail: str) -> None:
+    """Record and print one scenario outcome."""
     results.append({"scenario": name, "ok": bool(ok), "detail": detail})
     print(("PASS " if ok else "FAIL ") + name + " :: " + detail)
 
 
 def refuses(call) -> bool:
+    """Return True when the call is refused as malformed (wire or event refusal)."""
     try:
         call()
     except (W.WireError, EventRefused):
@@ -179,6 +199,7 @@ def refuses(call) -> bool:
 
 
 def main() -> int:
+    """Run scenarios X1-X8 and return 0 only when every scenario passes."""
     worlds: list[World] = []
 
     # X1 the published vectors are byte-identical in both repositories and verify for real.
@@ -212,13 +233,15 @@ def main() -> int:
     record("X3 duplicate/unsorted cascade rejected", all(bad) and w.issuer.current_counter() == 0,
            f"refused={bad} counter={w.issuer.current_counter()}")
 
-    # X4-X6 each revocation kind refuses dispatch under Rule 4 with nothing written.
+    # X4-X6 each revocation kind refuses dispatch under Rule 4 with nothing written. The approval
+    # binding is persisted on the attempt; the authorizing caller never supplies it.
     cases = (
-        ("X4 grant revocation", lambda w: w.issuer.append_revocation("grant", "grant-x", signer=w.signer), "grant-x", None, "grant_revoked"),
-        ("X5a approval revocation", lambda w: w.issuer.append_revocation("approval", APPROVAL, signer=w.signer), "grant-x", APPROVAL, "approval_revoked"),
-        ("X5b cascade lists the grant (no approval_ref)", lambda w: (w.issuer.append_revocation("approval", APPROVAL, signer=w.signer),
-            w.issuer.append_cascade(APPROVAL, ["grant-a", "grant-x"], 1, signer=w.signer)), "grant-x", None, "cascade_listed"),
-        ("X6 issuer revocation", lambda w: w.issuer.append_revocation("issuer", ISSUER, signer=w.signer), "grant-x", None, "issuer_revoked"),
+        ("X4 grant revocation", lambda w: w.issuer.append_revocation("grant", "grant-x", signer=w.signer), "grant-x", "", "grant_revoked"),
+        ("X5a approval revocation (bound on the attempt)", lambda w: w.issuer.append_revocation("approval", APPROVAL, signer=w.signer), "grant-x", APPROVAL, "approval_revoked"),
+        ("X5b cascade lists the grant (single-approval binding)", lambda w: (w.issuer.append_revocation("approval", APPROVAL, signer=w.signer),
+            w.issuer.append_cascade(APPROVAL, ["grant-a", "grant-x"], 1, signer=w.signer)), "grant-x", "", "cascade_listed"),
+        ("X5c undeclared binding fails closed on an approval revocation", lambda w: w.issuer.append_revocation("approval", APPROVAL, signer=w.signer), "grant-x", None, "approval_undeclared"),
+        ("X6 issuer revocation", lambda w: w.issuer.append_revocation("issuer", ISSUER, signer=w.signer), "grant-x", "", "issuer_revoked"),
     )
     for name, setup, grant, approval_ref, reason in cases:
         w = World(); worlds.append(w)
