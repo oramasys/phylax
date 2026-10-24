@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 
 from nacl.bindings import crypto_sign_seed_keypair
 
@@ -121,3 +122,39 @@ def test_dispatch_signer_adopts_a_rotation_made_by_another_keyring(tmp_path: Pat
         public_key, finalization, stale.sign_finalization(_NEXT_KEY_ID, finalization)
     )
     assert dispatch_wire.verify_event(public_key, digest, stale.sign_event(_NEXT_KEY_ID, digest))
+
+
+def test_dispatch_signature_matches_its_key_id_when_rotation_lands_mid_call(tmp_path: Path) -> None:
+    """A refresh between the id check and the seed read cannot pair an old id with a new seed.
+
+    ``validate_key_id`` runs after the active key is captured.  The hook rotates the
+    registry through a second keyring and refreshes this one there, which is exactly
+    what a concurrent worker's ``ensure_current`` does.  The signature must still
+    verify under the key id that was requested, never under the newly rotated key.
+    """
+    store = SqliteGrantAuthorityStore(tmp_path / "grants.sqlite3")
+    rotating = RotatingIssuerKeyring(
+        key_id=_KEY_ID, seed_ref=_KEY_ID, seed_provider=_Seeds(), store=store
+    )
+    worker = RotatingIssuerKeyring(
+        key_id=_KEY_ID, seed_ref=_KEY_ID, seed_provider=_Seeds(), store=store
+    )
+    signer = DispatchIssuerSigner(worker)
+    permit = _vectors()["permit"]["body"]
+    real_validate = dispatch_wire.validate_key_id
+    fired: list[bool] = []
+
+    def rotate_midway(value: object) -> None:
+        """Validate normally, then let another authority rotate and this one refresh once."""
+        real_validate(value)
+        if not fired:
+            fired.append(True)
+            rotating.rotate(key_id=_NEXT_KEY_ID, seed_ref=_NEXT_KEY_ID, now=datetime.now(UTC))
+            worker.ensure_current()
+
+    with mock.patch.object(dispatch_wire, "validate_key_id", rotate_midway):
+        signature = signer.sign_permit(_KEY_ID, permit)
+
+    assert fired
+    old_public_key, _private = crypto_sign_seed_keypair(_SEED)
+    assert dispatch_wire.verify_permit(old_public_key, permit, signature)
