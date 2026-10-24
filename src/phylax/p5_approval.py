@@ -115,6 +115,10 @@ class P5ApprovalIntent:
             "version": 1,
         }
 
+    def signature_domain(self) -> bytes:
+        """Preserve the original swarm/grant approval signing domain."""
+        return _DOMAIN
+
 
 @dataclass(frozen=True, slots=True)
 class P5ApprovalPreview:
@@ -166,6 +170,12 @@ class P5ApprovalStore(Protocol):
     def get(self, preview_id: str) -> _StoredPreview | None:
         """Return current state for a preview without mutating it."""
 
+    def put_approved(
+        self, preview: P5ApprovalPreview, receipt: P5ApprovalReceipt,
+        evidence_ref: str, approved_at: datetime, *, clock: Callable[[], datetime],
+    ) -> None:
+        """Insert already verified human authority atomically, without pending state."""
+
     def approve(
         self,
         preview_id: str,
@@ -200,6 +210,22 @@ class InMemoryP5ApprovalStore:
             if preview.preview_id in self._records:
                 raise ValueError("P5 preview_id already exists")
             self._records[preview.preview_id] = _StoredPreview(preview=preview)
+
+    def put_approved(
+        self, preview: P5ApprovalPreview, receipt: P5ApprovalReceipt,
+        evidence_ref: str, approved_at: datetime, *, clock: Callable[[], datetime],
+    ) -> None:
+        """Create one approved record after trusted evidence was verified."""
+        with self._lock:
+            if preview.preview_id in self._records:
+                raise ValueError("P5 approval already exists")
+            if _utc_timestamp(clock()) >= _utc_timestamp(preview.expires_at):
+                raise ValueError("P5 approval expired")
+            self._records[preview.preview_id] = _StoredPreview(
+                preview=preview, approval_token_digest=_token_digest(receipt.approval_token),
+                approved_duration_seconds=receipt.approved_duration_seconds,
+                operator_evidence_ref=evidence_ref, approved_at=approved_at,
+            )
 
     def get(self, preview_id: str) -> _StoredPreview | None:
         """Read preview state under the store lock."""
@@ -326,6 +352,36 @@ class SqliteP5ApprovalStore:
         except sqlite3.OperationalError as exc:
             raise ValueError("P5 store busy or locked") from exc
 
+    def put_approved(
+        self, preview: P5ApprovalPreview, receipt: P5ApprovalReceipt,
+        evidence_ref: str, approved_at: datetime, *, clock: Callable[[], datetime],
+    ) -> None:
+        """Insert approved model authority under the same durable one-use key."""
+        intent_json = _canonical_bytes({
+            "operator_principal": preview.intent.operator_principal,
+            "canonical_preview_json": preview.intent.canonical_preview_json,
+            "action": preview.intent.action,
+        }).decode("utf-8")
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if _utc_timestamp(clock()) >= _utc_timestamp(preview.expires_at):
+                    raise ValueError("P5 approval expired")
+                connection.execute(
+                    "INSERT INTO p5_approvals "
+                    "(preview_id, intent_json, expires_at, state, approval_token_digest, "
+                    "approved_duration_seconds, operator_evidence_ref, approved_at) "
+                    "VALUES (?, ?, ?, 'approved', ?, ?, ?, ?)",
+                    (preview.preview_id, intent_json, _utc_timestamp(preview.expires_at),
+                     _token_digest(receipt.approval_token), receipt.approved_duration_seconds,
+                     evidence_ref, _utc_timestamp(approved_at)),
+                )
+                connection.commit()
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("P5 approval already exists") from exc
+        except sqlite3.OperationalError as exc:
+            raise ValueError("P5 store busy or locked") from exc
+
     def get(self, preview_id: str) -> _StoredPreview | None:
         """Load current approval state without changing it."""
         try:
@@ -438,7 +494,11 @@ class SqliteP5ApprovalStore:
         """Reconstruct immutable approval state from one validated SQLite row."""
         try:
             intent_data = json.loads(row[1])
-            intent = P5ApprovalIntent(
+            intent_type = P5ApprovalIntent
+            if intent_data.get("action") == "model.launch":
+                from .model_launch_approval import ModelLaunchIntent
+                intent_type = ModelLaunchIntent
+            intent = intent_type(
                 operator_principal=intent_data["operator_principal"],
                 canonical_preview_json=intent_data["canonical_preview_json"],
                 action=intent_data.get("action", "swarm.launch"),
@@ -484,6 +544,8 @@ class P5ApprovalAuthority:
 
     def issue_preview(self, intent: P5ApprovalIntent) -> P5ApprovalPreview:
         """Mint and persist a preview; no caller boolean can bypass this step."""
+        if intent.action == "model.launch":
+            raise ValueError("model approval requires verified human evidence before creation")
         now = self._now()
         preview = P5ApprovalPreview(token_urlsafe(24), intent, now + self._preview_ttl)
         self._store.put(preview)
@@ -502,26 +564,35 @@ class P5ApprovalAuthority:
             )
         stored = self._require_live_preview(preview_id)
         now = self._now()
-        payload = {
-            "approved_at": _utc_timestamp(now),
-            "approved_duration_seconds": duration,
-            "expires_at": _utc_timestamp(stored.preview.expires_at),
-            "operator_evidence_digest": hashlib.sha256(operator_evidence_ref.encode("utf-8")).hexdigest(),
-            "approval_id": stored.preview.preview_id,
-            **stored.preview.intent.claims(),
-        }
-        body = _canonical_bytes(payload)
-        token = f"{_b64encode(body)}.{_b64encode(hmac.new(self._signing_key, _DOMAIN + body, hashlib.sha256).digest())}"
-        receipt = P5ApprovalReceipt(token, stored.preview.preview_id, stored.preview.expires_at, duration)
+        receipt = self._make_receipt(stored.preview, operator_evidence_ref, duration, now)
         if not self._store.approve(
             stored.preview.preview_id, receipt, operator_evidence_ref, now, clock=self._now
         ):
             raise ValueError("P5 preview is already approved or consumed")
         return receipt
 
+    def _make_receipt(
+        self, preview: P5ApprovalPreview, evidence_ref: str, duration: int, now: datetime,
+    ) -> P5ApprovalReceipt:
+        """Build a domain-separated receipt shared by approved-only and legacy creation."""
+        _require_positive_int(duration, "approved_duration_seconds")
+        if duration > self._max_duration:
+            raise ValueError("approved_duration_seconds exceeds the P5 issuance ceiling")
+        payload = {
+            "approved_at": _utc_timestamp(now),
+            "approved_duration_seconds": duration,
+            "expires_at": _utc_timestamp(preview.expires_at),
+            "operator_evidence_digest": hashlib.sha256(evidence_ref.encode("utf-8")).hexdigest(),
+            "approval_id": preview.preview_id,
+            **preview.intent.claims(),
+        }
+        body = _canonical_bytes(payload)
+        mac = hmac.new(self._signing_key, preview.intent.signature_domain() + body, hashlib.sha256).digest()
+        return P5ApprovalReceipt(f"{_b64encode(body)}.{_b64encode(mac)}", preview.preview_id, preview.expires_at, duration)
+
     def consume(self, receipt: P5ApprovalReceipt, intent: P5ApprovalIntent) -> P5ApprovalDecision:
         """Verify exact canonical claims and consume a receipt once, fail-closed."""
-        payload = self._verified_payload(receipt)
+        payload = self._verified_payload(receipt, intent=intent)
         self._validate_claims(payload, receipt, intent)
         stored = self._store.consume(
             receipt.preview_id, receipt.approval_token, clock=self._now
@@ -555,7 +626,7 @@ class P5ApprovalAuthority:
             raise ValueError("P5 preview expired")
         return stored
 
-    def _verified_payload(self, receipt: P5ApprovalReceipt) -> dict[str, object]:
+    def _verified_payload(self, receipt: P5ApprovalReceipt, *, intent: P5ApprovalIntent) -> dict[str, object]:
         """Verify token framing, HMAC, and canonical JSON before parsing claims."""
         try:
             encoded_body, encoded_mac = receipt.approval_token.split(".", 1)
@@ -563,7 +634,7 @@ class P5ApprovalAuthority:
             supplied_mac = _b64decode(encoded_mac)
         except (AttributeError, ValueError) as exc:
             raise ValueError("invalid P5 approval token") from exc
-        expected_mac = hmac.new(self._signing_key, _DOMAIN + body, hashlib.sha256).digest()
+        expected_mac = hmac.new(self._signing_key, intent.signature_domain() + body, hashlib.sha256).digest()
         if not hmac.compare_digest(expected_mac, supplied_mac):
             raise ValueError("invalid P5 approval token")
         try:
