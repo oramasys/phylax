@@ -510,7 +510,7 @@ class P5IssuanceAudit:
     approved_at: datetime
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class _IssuerKey:
     """Active signing seed held only for the current process."""
 
