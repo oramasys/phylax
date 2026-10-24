@@ -25,7 +25,9 @@ _spec = importlib.util.spec_from_file_location("c2_interop_probe", HERE / "c2_in
 probe = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(probe)  # reads the same argv, sets sys.path, runs S1-S7
 
-from orama.graph.dispatch_attempts import IssuerOutcomeRefused, SqliteAttemptStore  # noqa: E402
+from orama.graph.dispatch_attempts import (  # noqa: E402
+    IssuerOutcomeRefused, SqliteAttemptStore, VerifiedDispatchGrant,
+)
 from orama.graph.effect_proposals import EffectScope, ReservationRefused  # noqa: E402
 from phylax import dispatch_wire as W  # noqa: E402
 from phylax.dispatch_permit_store import GrantFacts, SqliteDispatchPermitStore  # noqa: E402
@@ -74,7 +76,9 @@ def abandon_scenarios() -> None:
     operator = Operator()
     req = world.request(ack=0)
     permit = json.loads(issuer.admit(req, grants=grants, signer=signer, now=NOW))
-    consumer.create_attempt(req["attempt_id"], req["grant_id"], req["reservation_id"])
+    consumer.create_attempt(
+        req["attempt_id"], VerifiedDispatchGrant(req["grant_id"]), req["reservation_id"]
+    )
     consumer.fence(req["attempt_id"])
     attestation = consumer.build_abandon_attestation(req["attempt_id"], permit["permit_id"], "loss", 1, NOW)
     try:
@@ -117,7 +121,9 @@ SCOPE = EffectScope("principal-1", "graph-1", "a" * 64, D["rq"], D["ar"], "dest-
 def scope_flow(world, label: str, reserved: EffectScope, presented: EffectScope):
     """Issue a real permit, reserve ``reserved``, then authorize presenting ``presented``."""
     req = world.request(ack=world.consumer.acked_through(ISSUER))
-    world.consumer.create_attempt(req["attempt_id"], req["grant_id"], req["reservation_id"])
+    world.consumer.create_attempt(
+        req["attempt_id"], VerifiedDispatchGrant(req["grant_id"]), req["reservation_id"]
+    )
     world.consumer.mark_transmitted(req["attempt_id"])
     world.consumer.propose(f"prop-{label}", reserved, world.tick())
     world.consumer.reserve(req["reservation_id"], f"prop-{label}", reserved,

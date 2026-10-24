@@ -33,7 +33,10 @@ _EVENT_COLUMNS = (
 _ATTESTATION_COLUMNS = (
     "permit_id", "attempt_id", "attestation_digest", "attestation", "disposition_ref", "recorded_at",
 )
-_INDEXES = ("one_original_permit_per_grant", "one_nonterminal_permit_per_grant")
+_INDEXES = (
+    "one_original_permit_per_grant", "one_nonterminal_permit_per_grant",
+    "issuer_events_by_kind_body",
+)
 _LIFETIME = timedelta(seconds=wire.PERMIT_LIFETIME_SECONDS)
 
 _SCHEMA = """
@@ -84,6 +87,7 @@ CREATE TABLE IF NOT EXISTS issuer_events (
     issuer_key_id TEXT NOT NULL,
     signature TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS issuer_events_by_kind_body ON issuer_events(body) WHERE kind = 'revocation';
 """
 
 
@@ -323,6 +327,82 @@ class SqliteDispatchPermitStore:
             for r in rows
         ]
 
+    def append_revocation(
+        self, subject_kind: str, subject_id: str, *, signer: IssuerSigner
+    ) -> dict[str, object]:
+        """Append a signed revocation event, or return the identical one already recorded.
+
+        The issuer records an authority fact only. It reads no consumer execution state and has no
+        parameter for any. A malformed body raises :class:`phylax.dispatch_wire.WireError` before
+        any row is written and consumes no version.
+        """
+        body: dict[str, object] = {"subject_kind": subject_kind, "subject_id": subject_id}
+        wire.validate_event_body("revocation", body)
+        with self._write() as connection:
+            existing = connection.execute(
+                "SELECT version FROM issuer_events WHERE kind = 'revocation' AND body = ?",
+                (wire.canonical_bytes(body).decode("utf-8"),),
+            ).fetchone()
+            if existing is not None:
+                return self._events(connection, existing["version"], existing["version"])[0]
+            return self._append_event(connection, "revocation", body, signer)
+
+    def append_cascade(
+        self,
+        approval_id: str,
+        grant_ids: list[str] | tuple[str, ...],
+        issuer_authority_version: int,
+        *,
+        signer: IssuerSigner,
+    ) -> dict[str, object]:
+        """Append a signed cascade event; each cascade is its own commit at its own version.
+
+        ``grant_ids`` must already be strictly ascending and duplicate-free: the body is refused,
+        never repaired. The list is copied, so later changes to the caller's list cannot alter
+        history. A malformed body raises :class:`phylax.dispatch_wire.WireError` before any write.
+        """
+        if not isinstance(grant_ids, (list, tuple)):
+            raise wire.WireError("grant_ids must be an array")
+        body: dict[str, object] = {
+            "approval_id": approval_id,
+            "grant_ids": list(grant_ids),
+            "issuer_authority_version": issuer_authority_version,
+        }
+        wire.validate_event_body("cascade", body)
+        with self._write() as connection:
+            return self._append_event(connection, "cascade", body, signer)
+
+    def _append_event(
+        self, connection: sqlite3.Connection, kind: str, body: dict[str, object], signer: IssuerSigner,
+        *, key_id: str | None = None,
+    ) -> dict[str, object]:
+        """Chain, digest, sign and store one validated event; return its wire dict."""
+        if key_id is None:
+            key_id = signer.active_key_id()
+        wire.validate_key_id(key_id)
+        counter = self._counter(connection)
+        previous = connection.execute(
+            "SELECT event_digest FROM issuer_events WHERE version = ?", (counter,)
+        ).fetchone()
+        previous_digest = wire.GENESIS_EVENT_DIGEST if previous is None else previous["event_digest"]
+        version = counter + 1
+        digest = wire.event_digest(version, kind, body, previous_digest)
+        event: dict[str, object] = {
+            "version": version, "kind": kind, "body": body,
+            "previous_event_digest": previous_digest, "event_digest": digest,
+            "issuer_key_id": key_id, "signature": signer.sign_event(key_id, digest),
+        }
+        wire.check_event_wire_size(event)
+        connection.execute(
+            "INSERT INTO issuer_events(version, kind, body, previous_event_digest, event_digest,"
+            " issuer_key_id, signature) VALUES(?,?,?,?,?,?,?)",
+            (
+                version, kind, wire.canonical_bytes(body).decode("utf-8"), previous_digest, digest,
+                key_id, event["signature"],
+            ),
+        )
+        return self._events(connection, version, version)[0]
+
     @staticmethod
     def _row_by_attempt(connection: sqlite3.Connection, attempt_id: object) -> sqlite3.Row | None:
         """Fetch the row holding an attempt id."""
@@ -408,6 +488,7 @@ class SqliteDispatchPermitStore:
     ) -> bytes:
         """Build, sign and persist a new permit; return its wire bytes."""
         key_id = signer.active_key_id()
+        wire.validate_key_id(key_id)
         expires = min(now + _LIFETIME, facts.expires_at)
         body = {
             "schema_version": wire.SCHEMA_VERSION,
@@ -520,22 +601,13 @@ class SqliteDispatchPermitStore:
     ) -> tuple[bytes, dict[str, object]]:
         """Append the finalization event, sign and store the finalization, and build the envelope."""
         key_id = row["issuer_key_id"]
-        r_f = counter + 1
-        previous = connection.execute(
-            "SELECT event_digest FROM issuer_events WHERE version = ?", (counter,)
-        ).fetchone()
-        previous_digest = wire.GENESIS_EVENT_DIGEST if previous is None else previous["event_digest"]
         finalization_id = "fin-" + secrets.token_hex(16)
-        digest = wire.finalization_event_digest(r_f, finalization_id, previous_digest)
         event_body = {"finalization_id": finalization_id}
-        connection.execute(
-            "INSERT INTO issuer_events(version, kind, body, previous_event_digest, event_digest,"
-            " issuer_key_id, signature) VALUES(?,?,?,?,?,?,?)",
-            (
-                r_f, "finalization", wire.canonical_bytes(event_body).decode("utf-8"),
-                previous_digest, digest, key_id, signer.sign_event(key_id, digest),
-            ),
+        event = self._append_event(
+            connection, "finalization", event_body, signer, key_id=key_id
         )
+        r_f = int(event["version"])
+        digest = str(event["event_digest"])
         permit_expiry = wire.parse_timestamp(row["expires_at"])
         body = {
             "schema_version": wire.SCHEMA_VERSION,

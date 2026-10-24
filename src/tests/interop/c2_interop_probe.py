@@ -22,7 +22,8 @@ sys.path[:0] = [str(PHYLAX / "src"), str(ORAMASYS / "src")]
 
 from nacl.bindings import crypto_sign_seed_keypair  # noqa: E402
 from orama.graph.dispatch_attempts import (  # noqa: E402
-    AuthorizationRefused, ExpectedBinding, SqliteAttemptStore, sender_precondition,
+    AuthorizationRefused, ExpectedBinding, SqliteAttemptStore, VerifiedDispatchGrant,
+    sender_precondition,
 )
 from phylax import dispatch_wire as W  # noqa: E402
 from phylax.dispatch_permit_store import GrantFacts, SqliteDispatchPermitStore  # noqa: E402
@@ -134,7 +135,9 @@ class World:
         )
 
     def begin(self, req: dict) -> None:
-        self.consumer.create_attempt(req["attempt_id"], req["grant_id"], req["reservation_id"])
+        self.consumer.create_attempt(
+            req["attempt_id"], VerifiedDispatchGrant(req["grant_id"]), req["reservation_id"]
+        )
         self.consumer.mark_transmitted(req["attempt_id"])
 
 

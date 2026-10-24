@@ -1,0 +1,419 @@
+{
+  "canonical_bodies": [
+    "{\"subject_id\":\"grant-vector-0001\",\"subject_kind\":\"grant\"}",
+    "{\"subject_id\":\"approval-vector-0001\",\"subject_kind\":\"approval\"}",
+    "{\"approval_id\":\"approval-vector-0001\",\"grant_ids\":[\"grant-vector-0002\",\"grant-vector-0003\"],\"issuer_authority_version\":1}",
+    "{\"subject_id\":\"issuer-vector-0001\",\"subject_kind\":\"issuer\"}"
+  ],
+  "events": [
+    {
+      "body": {
+        "subject_id": "grant-vector-0001",
+        "subject_kind": "grant"
+      },
+      "event_digest": "8bae016107341fde2b9d9241b1b450b66791018f913a0c62299de8e2bba1302f",
+      "issuer_key_id": "phylax-event-vector-key-1",
+      "kind": "revocation",
+      "previous_event_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "Rw1QaFCu-PVVOZGxtpQwcrcRSWohDm_VYsANSUaCzzpM8mXS12u1obfI20Fh8e5wjYjZLj2WUrVBYQFL1xCBBg",
+      "version": 1
+    },
+    {
+      "body": {
+        "subject_id": "approval-vector-0001",
+        "subject_kind": "approval"
+      },
+      "event_digest": "d6f41cebbb64a45186ccc4c0bcd1e0dd66ed37f0e0c1689cdcc7cf4856538aed",
+      "issuer_key_id": "phylax-event-vector-key-1",
+      "kind": "revocation",
+      "previous_event_digest": "8bae016107341fde2b9d9241b1b450b66791018f913a0c62299de8e2bba1302f",
+      "signature": "IjolKCif2YI8dW_XzWvziPz3iB4k9ZQi7aKI3tmZoyM_x-yZ4BpFuLNsIh6w_1CJVYgEwOD__TJAaXQrgRrrBQ",
+      "version": 2
+    },
+    {
+      "body": {
+        "approval_id": "approval-vector-0001",
+        "grant_ids": [
+          "grant-vector-0002",
+          "grant-vector-0003"
+        ],
+        "issuer_authority_version": 1
+      },
+      "event_digest": "36469ce85187f112ed8c0953a0ec9ecae7a1ed99075b82aeed7029d6cb90e466",
+      "issuer_key_id": "phylax-event-vector-key-1",
+      "kind": "cascade",
+      "previous_event_digest": "d6f41cebbb64a45186ccc4c0bcd1e0dd66ed37f0e0c1689cdcc7cf4856538aed",
+      "signature": "Bk60zYg3iw6QUIFiqmPOZW--HD2gkFwFdgSNXsi7oKzhOHOacUebdlVpkEtO5WsDXX-8iEymUTJBtiFvUKp0Dg",
+      "version": 3
+    },
+    {
+      "body": {
+        "subject_id": "issuer-vector-0001",
+        "subject_kind": "issuer"
+      },
+      "event_digest": "c32f896b4e5c05a24ba137ccde6f2fdd923feaf516d03fd0baee8a0ea09b0858",
+      "issuer_key_id": "phylax-event-vector-key-1",
+      "kind": "revocation",
+      "previous_event_digest": "36469ce85187f112ed8c0953a0ec9ecae7a1ed99075b82aeed7029d6cb90e466",
+      "signature": "sXAqA61mh1ZZDOFOHperYbsBToa7lTQtMf-1TD8TMY8F715J4bH0YvWbrDaFg7uHViKcew8wHbXUvXppbQZhBg",
+      "version": 4
+    }
+  ],
+  "genesis_event_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "issuer_key_id": "phylax-event-vector-key-1",
+  "malformed": [
+    {
+      "body": {
+        "disposition_ref": "x",
+        "subject_id": "grant-1",
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation extra field"
+    },
+    {
+      "body": {
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation missing subject_id"
+    },
+    {
+      "body": {
+        "subject_id": "grant-1"
+      },
+      "kind": "revocation",
+      "name": "revocation missing subject_kind"
+    },
+    {
+      "body": {
+        "subject_id": null,
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation null subject_id"
+    },
+    {
+      "body": {
+        "subject_id": "grant-1",
+        "subject_kind": "approvals"
+      },
+      "kind": "revocation",
+      "name": "revocation unknown kind"
+    },
+    {
+      "body": {
+        "subject_id": "grant-1",
+        "subject_kind": "Grant"
+      },
+      "kind": "revocation",
+      "name": "revocation wrong-case kind"
+    },
+    {
+      "body": {},
+      "kind": "revocation",
+      "name": "revocation empty body"
+    },
+    {
+      "body": {
+        "subject_id": "",
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation blank id"
+    },
+    {
+      "body": {
+        "subject_id": " ",
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation whitespace id"
+    },
+    {
+      "body": {
+        "subject_id": " grant-1",
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation padded id"
+    },
+    {
+      "body": {
+        "subject_id": "grant 1",
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation inner space id"
+    },
+    {
+      "body": {
+        "subject_id": "grant-\u00e9",
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation non-ascii id"
+    },
+    {
+      "body": {
+        "subject_id": "grant\u00001",
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation control id"
+    },
+    {
+      "body": {
+        "subject_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation overlong id"
+    },
+    {
+      "body": {
+        "subject_id": 7,
+        "subject_kind": "grant"
+      },
+      "kind": "revocation",
+      "name": "revocation numeric id"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "executed": true,
+        "grant_ids": [
+          "grant-1",
+          "grant-2"
+        ],
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade extra field"
+    },
+    {
+      "body": {
+        "grant_ids": [],
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade missing approval_id"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade missing grant_ids"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": []
+      },
+      "kind": "cascade",
+      "name": "cascade missing version"
+    },
+    {
+      "body": {
+        "approval_id": "",
+        "grant_ids": [
+          "grant-1",
+          "grant-2"
+        ],
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade blank approval"
+    },
+    {
+      "body": {
+        "approval_id": null,
+        "grant_ids": [
+          "grant-1",
+          "grant-2"
+        ],
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade null approval"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": "grant-1",
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade grant_ids string"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": null,
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade grant_ids null"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": {
+          "grant-1": 1
+        },
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade grant_ids object"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "grant-1",
+          2
+        ],
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade non-string element"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "grant-1",
+          ""
+        ],
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade blank element"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "grant-2",
+          "grant-1"
+        ],
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade unsorted"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "grant-1",
+          "grant-1"
+        ],
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade duplicate"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "a",
+          "b",
+          "b"
+        ],
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade duplicate tail"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "a",
+          "A"
+        ],
+        "issuer_authority_version": 1
+      },
+      "kind": "cascade",
+      "name": "cascade case order"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "grant-1",
+          "grant-2"
+        ],
+        "issuer_authority_version": 0
+      },
+      "kind": "cascade",
+      "name": "cascade version zero"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "grant-1",
+          "grant-2"
+        ],
+        "issuer_authority_version": -1
+      },
+      "kind": "cascade",
+      "name": "cascade version negative"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "grant-1",
+          "grant-2"
+        ],
+        "issuer_authority_version": true
+      },
+      "kind": "cascade",
+      "name": "cascade version boolean"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "grant-1",
+          "grant-2"
+        ],
+        "issuer_authority_version": 9007199254740992
+      },
+      "kind": "cascade",
+      "name": "cascade version unsafe"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "grant-1",
+          "grant-2"
+        ],
+        "issuer_authority_version": "1"
+      },
+      "kind": "cascade",
+      "name": "cascade version string"
+    },
+    {
+      "body": {
+        "approval_id": "approval-1",
+        "grant_ids": [
+          "grant-1",
+          "grant-2"
+        ],
+        "issuer_authority_version": 1.5
+      },
+      "kind": "cascade",
+      "name": "cascade version float"
+    }
+  ],
+  "public_key": "9d2177d793e423bc9def78cca26a1c925ae1cd56cce65345d878c0e117e25b91",
+  "schema": "phylax.issuer-event-bodies.conformance.v1"
+}

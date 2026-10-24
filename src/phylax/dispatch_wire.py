@@ -35,6 +35,10 @@ EVENT_DOMAIN: Final = b"phylax-issuer-event-v1\x00"
 GENESIS_EVENT_DIGEST: Final = "0" * 64
 
 EVENT_KINDS: Final = frozenset({"revocation", "cascade", "finalization"})
+SUBJECT_KINDS: Final = frozenset({"grant", "approval", "issuer"})
+REVOCATION_BODY_FIELDS: Final = ("subject_id", "subject_kind")
+CASCADE_BODY_FIELDS: Final = ("approval_id", "grant_ids", "issuer_authority_version")
+MAX_IDENTIFIER_BYTES: Final = 1_024
 
 PERMIT_LIFETIME_SECONDS: Final = 90
 ISSUER_AUTHORITY_VERSION: Final = 1
@@ -106,6 +110,7 @@ _POSITIVE_INTEGER_FIELDS: Final = frozenset({
 })
 _TIMESTAMP_FIELDS: Final = frozenset({"requested_at", "issued_at", "expires_at"})
 _DIGEST_RE: Final = re.compile(r"[0-9a-f]{64}")
+_IDENTIFIER_RE: Final = re.compile(r"[\x21-\x7e]{1,%d}" % MAX_IDENTIFIER_BYTES)
 _TIMESTAMP_RE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
 
 
@@ -260,12 +265,82 @@ def finalization_wire_bytes(body: Mapping[str, object], signature: str) -> bytes
     return data
 
 
+def validate_key_id(value: object) -> None:
+    """Require an ``issuer_key_id``: non-blank UTF-8 text, at most 1,024 bytes (the frozen contract)."""
+    _require_text("issuer_key_id", value)
+
+
+def validate_identifier(name: str, value: object) -> None:
+    """Require a canonical identifier: printable ASCII without space, 1 to 1024 bytes."""
+    if not isinstance(value, str) or _IDENTIFIER_RE.fullmatch(value) is None:
+        raise WireError(f"{name} must be a canonical identifier")
+
+
+def _require_exact_keys(name: str, body: Mapping[str, object], expected: tuple[str, ...]) -> None:
+    """Require exactly the expected keys: nothing missing, nothing extra."""
+    if set(body) != set(expected):
+        missing, extra = sorted(set(expected) - set(body)), sorted(set(body) - set(expected))
+        raise WireError(f"{name} fields differ: missing={missing} extra={extra}")
+
+
+def validate_revocation_body(body: Mapping[str, object]) -> None:
+    """Require the closed revocation body: a closed ``subject_kind`` and a canonical ``subject_id``."""
+    _require_exact_keys("revocation body", body, REVOCATION_BODY_FIELDS)
+    kind = body["subject_kind"]
+    if not isinstance(kind, str) or kind not in SUBJECT_KINDS:
+        raise WireError("subject_kind must be grant, approval or issuer")
+    validate_identifier("subject_id", body["subject_id"])
+
+
+def validate_cascade_body(body: Mapping[str, object]) -> None:
+    """Require the closed cascade body with a strictly ascending, duplicate-free ``grant_ids`` list."""
+    _require_exact_keys("cascade body", body, CASCADE_BODY_FIELDS)
+    validate_identifier("approval_id", body["approval_id"])
+    grant_ids = body["grant_ids"]
+    if not isinstance(grant_ids, list):
+        raise WireError("grant_ids must be an array")
+    for grant_id in grant_ids:
+        validate_identifier("grant_ids element", grant_id)
+    if any(earlier >= later for earlier, later in zip(grant_ids, grant_ids[1:])):
+        raise WireError("grant_ids must be strictly ascending and duplicate-free")
+    version = body["issuer_authority_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= MAX_SAFE_INTEGER:
+        raise WireError("issuer_authority_version must be a safe integer of at least 1")
+
+
+def validate_event_body(kind: str, body: Mapping[str, object]) -> None:
+    """Validate an event body for its kind; every kind has a closed shape."""
+    if kind == "finalization":
+        if set(body) != {"finalization_id"}:
+            raise WireError("a finalization event body is exactly {finalization_id}")
+        _require_text("finalization_id", body["finalization_id"])
+        return
+    if kind == "revocation":
+        validate_revocation_body(body)
+    elif kind == "cascade":
+        validate_cascade_body(body)
+    else:
+        raise WireError("unknown event kind")
+
+
+def check_event_wire_size(event: Mapping[str, object]) -> None:
+    """Require the canonical JSON of the complete seven-field event to fit ``MAX_WIRE_BYTES``.
+
+    The bound is on the whole event, not the body alone, because that is the object the consumer
+    receives and size-checks; an event the issuer accepted but the consumer had to refuse would
+    stall the chain.
+    """
+    if len(canonical_bytes(event)) > MAX_WIRE_BYTES:
+        raise WireError(f"event exceeds {MAX_WIRE_BYTES} bytes")
+
+
 def event_digest(version: int, kind: str, body: Mapping[str, object], previous_event_digest: str) -> str:
     """Return an issuer event's digest: SHA-256 of the canonical wrapper object.
 
-    The wrapper is ``{"body", "kind", "previous_event_digest", "version"}``. For a finalization
-    the body is exactly ``{"finalization_id": ...}``; ``finalization_id`` alone is never the
-    preimage. The signature is detached and is not part of the preimage.
+    The wrapper is ``{"body", "kind", "previous_event_digest", "version"}``. Each kind has a closed
+    body (see :func:`validate_event_body`): a finalization is exactly ``{"finalization_id": ...}``
+    and ``finalization_id`` alone is never the preimage. The signature is detached and is not part
+    of the preimage.
     """
     if not isinstance(kind, str) or kind not in EVENT_KINDS:
         raise WireError("unknown event kind")
@@ -275,10 +350,7 @@ def event_digest(version: int, kind: str, body: Mapping[str, object], previous_e
         raise WireError("previous_event_digest must be 64 lowercase hexadecimal characters")
     if not isinstance(body, Mapping):
         raise WireError("event body must be an object")
-    if kind == "finalization":
-        if set(body) != {"finalization_id"}:
-            raise WireError("a finalization event body is exactly {finalization_id}")
-        _require_text("finalization_id", body["finalization_id"])
+    validate_event_body(kind, body)
     return sha256_hex(canonical_bytes({
         "body": dict(body), "kind": kind,
         "previous_event_digest": previous_event_digest, "version": version,

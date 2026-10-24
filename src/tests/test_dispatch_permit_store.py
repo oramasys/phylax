@@ -386,6 +386,97 @@ def test_finalization_happy_path(store, db, grants, signer) -> None:
     assert row_count(db, "issuer_events") == 1 and store.current_counter() == 1
 
 
+def test_finalization_checks_its_event_size_before_persistence(
+    store, grants, signer, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The finalization event uses the same pre-persistence size gate as other events."""
+    observed: list[str] = []
+    original = wire.check_event_wire_size
+
+    def checked(event: object) -> None:
+        """Record the event type while retaining the real wire-size validation."""
+        assert isinstance(event, dict)
+        observed.append(str(event["kind"]))
+        original(event)
+
+    monkeypatch.setattr(wire, "check_event_wire_size", checked)
+    permit = admit(store, grants, signer)
+    finalize(store, grants, signer, final_request(permit))
+
+    assert observed == ["finalization"]
+
+
+def test_cascade_over_the_event_cap_is_refused_before_any_write(store, db, signer) -> None:
+    """Through the store, a cascade whose whole event exceeds 64 KiB is refused and persists nothing.
+
+    The exact 65,536/65,537 boundary stays pinned at ``check_event_wire_size``; this proves the
+    store applies that gate before the write rather than after.
+    """
+    grant_ids = [f"g{index:04d}" + "x" * 1018 for index in range(70)]
+    assert grant_ids == sorted(grant_ids)
+
+    with pytest.raises(wire.WireError, match="exceeds"):
+        store.append_cascade("approval-1", grant_ids, 1, signer=signer)
+
+    assert row_count(db, "issuer_events") == 0 and store.current_counter() == 0
+
+
+@pytest.mark.parametrize(
+    "bad_key_id", ["", "   ", "k" * 1_025, "é" * 513],
+    ids=["empty", "blank", "too-long-ascii", "too-long-utf8"],
+)
+def test_permit_issuance_refuses_an_invalid_issuer_key_id(store, grants, signer, bad_key_id) -> None:
+    """Blank or over-long issuer key identifiers are refused before a permit is signed or persisted."""
+    class InvalidKeySigner(FakeSigner):
+        """Return an identifier that violates the frozen text grammar."""
+
+        def active_key_id(self) -> str:
+            """Return an invalid value that must be rejected before signing."""
+            return bad_key_id
+
+    with pytest.raises(wire.WireError, match="issuer_key_id"):
+        admit(store, grants, InvalidKeySigner())
+    assert store.current_counter() == 0
+
+
+@pytest.mark.parametrize(
+    "key_id", ["clé-1", "key 1", "k" * 1_024], ids=["non-ascii", "space", "max-length"]
+)
+def test_permit_issuance_accepts_any_nonblank_utf8_issuer_key_id(store, grants, signer, key_id) -> None:
+    """The frozen grammar is non-blank UTF-8 up to 1,024 bytes, not the ASCII identifier grammar."""
+    class OddKeySigner(FakeSigner):
+        """Return a legal but non-ASCII or spaced key name."""
+
+        def active_key_id(self) -> str:
+            """Return a key identifier that the contract allows."""
+            return key_id
+
+        def sign_permit(self, key_id: str, body: dict) -> str:
+            """Sign with the fixture seed whatever the key name is."""
+            return super().sign_permit("key-1", body)
+
+        def sign_finalization(self, key_id: str, body: dict) -> str:
+            """Sign with the fixture seed whatever the key name is."""
+            return super().sign_finalization("key-1", body)
+
+        def sign_event(self, key_id: str, digest: str) -> str:
+            """Sign with the fixture seed whatever the key name is."""
+            return super().sign_event("key-1", digest)
+
+    permit = json.loads(admit(store, grants, OddKeySigner()))
+
+    assert permit["issuer_key_id"] == key_id
+
+
+def test_revocation_dedupe_index_is_created(store, db) -> None:
+    """Canonical revocation lookup has a durable kind/body index."""
+    del store
+    with open_db(db) as connection:
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list('issuer_events')")}
+
+    assert "issuer_events_by_kind_body" in indexes
+
+
 def test_event_chain_digests_verify(store, grants, signer) -> None:
     """Chained events recompute through dispatch_wire.event_digest."""
     for n in range(3):

@@ -6,6 +6,9 @@
    `docs/vectors/dispatch-permit-v1.json`, and report every `FREEZE-CHOICE` they disagree with.
 2. Implementers build only against this contract. A change to a frozen item needs a new review.
 3. Nothing here enables grant serving, issuance or a pin change. `ORAMA_GRANT_SERVING` stays unset.
+   "Pin change" means promoting a production dependency pin. The interop test pins
+   (`src/tests/interop/oramasys-*-pin.txt`) are test fixtures that name the partner commit the
+   shared probes run against; they are updated with the probes and promote nothing.
 
 ## 1. Authority and scope
 
@@ -217,8 +220,10 @@ Deliberately deferred, so slice 1 is not mistaken for the whole ratified specifi
   15-second minimum finalization window, deadline accounting and bounded
   retries, the circuit breaker and alert, the recovery calls after the authority deadline, and the
   `dispatch.issuer_unavailable` status path.
-* **Both:** the body shapes of `revocation` and `cascade` events (not frozen; slice 1 treats them as
-  opaque and its revocation port is the consumer's abstraction of them), the effect grant v2 parser and `effect_class` registry (slice 1 reaches the signed grant
+* **Both:** the body shapes of `revocation` and `cascade` events (not frozen by this document;
+  slice 1 treats them as opaque and its revocation port is the consumer's abstraction of them; they
+  are proposed in E1 C2 Part 3 Sections 1-2, which the issuer validates in `dispatch_wire` pending
+  that operator decision, with signed vectors in `docs/vectors/dispatch-events-v1.json`), the effect grant v2 parser and `effect_class` registry (slice 1 reaches the signed grant
   through an injected lookup), and any pin change. None is enabled by this freeze.
 
 **Next actions (repeated).** Reviewers confirm or change each `FREEZE-CHOICE`; implementers build

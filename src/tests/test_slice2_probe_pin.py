@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-EXPECTED_PROBE_SHA256 = "682129b1d1f359fa04548c75f2bb362f93648e5673bddb96390453d3b4d8d878"
+EXPECTED_PROBE_SHA256 = "3bf01b0a0052931fd8858b37862e3b05ec407ab62ab35f970062df75c7687df7"
 PROBE_PATH = Path(__file__).resolve().parent / "interop" / "c2_slice2_probe.py"
 
 
