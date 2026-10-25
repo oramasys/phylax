@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from .dispatch_composition import DispatchIssuerSigner
 
 _DOMAIN: Final = b"phylax-adjustment-grant-v1\x00"
+_EFFECT_GRANT_DOMAIN: Final = b"phylax-effect-grant-v2\x00"
 _SCHEMA_VERSION: Final = 1
 _FUTURE_ISSUANCE_SKEW: Final = timedelta(seconds=60)
 _UNIT_BASES: Final = frozenset({"steps", "elapsed_ms", "cost_microunits", "effect_attempts"})
@@ -600,6 +601,13 @@ class RotatingIssuerKeyring:
         """Sign one canonical body with the current active Ed25519ph key."""
         key = self._active
         _public_key, signature = _sign(key.seed, body)
+        return key.key_id, _b64encode(signature)
+
+    def sign_effect_grant(self, body: bytes) -> tuple[str, str]:
+        """Sign one v2 effect-grant body under its dedicated protocol domain."""
+        self.ensure_current()
+        key = self._active
+        _public_key, signature = _sign_message(key.seed, _EFFECT_GRANT_DOMAIN, body)
         return key.key_id, _b64encode(signature)
 
     def dispatch_active_key_id(self) -> str:

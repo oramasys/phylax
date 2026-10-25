@@ -31,6 +31,7 @@ from .adjustment_grant import (
     PhylaxGrantVerifier,
     RotatingIssuerKeyring,
 )
+from .effect_grant import EffectGrantVerifier, PhylaxEffectGrantVerifier
 from .grant_store import SqliteGrantAuthorityStore, SqliteGrantVerificationStore
 from .p5_approval import P5ApprovalAuthority, SqliteP5ApprovalStore
 
@@ -291,3 +292,29 @@ def open_grant_verifier(
         store=store, verifier_id=config.verifier_id, clock=clock
     )
     return PhylaxAdjustmentGrantVerifier(verifier)
+
+
+def open_effect_grant_verifier(
+    config: GrantVerifierConfig,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> PhylaxEffectGrantVerifier:
+    """Open only the read-only v2 effect verifier; seeds and P5 stay unreachable."""
+    state_dir = Path(config.state_dir)
+    _require_private(state_dir, directory=True)
+    database = state_dir / "grants.sqlite3"
+    _require_private(database, directory=False)
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = state_dir / (database.name + suffix)
+        try:
+            os.lstat(sidecar)
+        except FileNotFoundError:
+            continue
+        _require_private(sidecar, directory=False)
+    try:
+        store = SqliteGrantVerificationStore(database)
+    except FileNotFoundError as exc:
+        raise CompositionError("grants.sqlite3 does not exist") from exc
+    return PhylaxEffectGrantVerifier(
+        EffectGrantVerifier(store=store, verifier_id=config.verifier_id, clock=clock)
+    )
