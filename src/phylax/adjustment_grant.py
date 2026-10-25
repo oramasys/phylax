@@ -11,11 +11,12 @@ import base64
 import hashlib
 import json
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from secrets import token_urlsafe
-from typing import Callable, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Callable, Final, Literal, Protocol
 
 from nacl import exceptions as nacl_exceptions
 from nacl.bindings import (
@@ -34,7 +35,11 @@ from .p5_approval import (
     P5ApprovalIntent,
     P5ApprovalReceipt,
 )
+from . import dispatch_wire
 from .grant_store import IssuerKeyRecord, SqliteGrantAuthorityStore
+
+if TYPE_CHECKING:
+    from .dispatch_composition import DispatchIssuerSigner
 
 _DOMAIN: Final = b"phylax-adjustment-grant-v1\x00"
 _SCHEMA_VERSION: Final = 1
@@ -505,7 +510,7 @@ class P5IssuanceAudit:
     approved_at: datetime
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class _IssuerKey:
     """Active signing seed held only for the current process."""
 
@@ -593,8 +598,54 @@ class RotatingIssuerKeyring:
 
     def sign(self, body: bytes) -> tuple[str, str]:
         """Sign one canonical body with the current active Ed25519ph key."""
-        _public_key, signature = _sign(self._active.seed, body)
-        return self._active.key_id, _b64encode(signature)
+        key = self._active
+        _public_key, signature = _sign(key.seed, body)
+        return key.key_id, _b64encode(signature)
+
+    def dispatch_active_key_id(self) -> str:
+        """Return the current dispatch-signing key after validating its frozen wire grammar.
+
+        Dispatch permits, finalizations, and issuer events use their own
+        domain-separated signatures.  They may reuse the durable issuer-key
+        registry, but never the adjustment-grant signature framing.
+        """
+        return self._current_dispatch_key().key_id
+
+    def _current_dispatch_key(self) -> _IssuerKey:
+        """Refresh durable state and return one immutable snapshot of the active key.
+
+        Callers read the identifier and seed from this single object, so a
+        concurrent ``rotate`` can never pair one generation's identifier with
+        another generation's seed.
+        """
+        self.ensure_current()
+        key = self._active
+        dispatch_wire.validate_key_id(key.key_id)
+        return key
+
+    def sign_dispatch_permit(self, key_id: str, body: Mapping[str, object]) -> str:
+        """Sign one validated dispatch-permit body with the active durable key only."""
+        return dispatch_wire.sign_permit(self._dispatch_seed(key_id), body)
+
+    def sign_dispatch_finalization(self, key_id: str, body: Mapping[str, object]) -> str:
+        """Sign one validated dispatch-finalization body with the active durable key only."""
+        return dispatch_wire.sign_finalization(self._dispatch_seed(key_id), body)
+
+    def sign_dispatch_event(self, key_id: str, digest: str) -> str:
+        """Sign one validated issuer-event digest with the active durable key only."""
+        return dispatch_wire.sign_event(self._dispatch_seed(key_id), digest)
+
+    def _dispatch_seed(self, key_id: str) -> bytes:
+        """Return the active seed only for one exact dispatch signer operation.
+
+        Refreshing before the comparison makes a rotation between a caller's
+        key lookup and its signature request fail closed rather than minting a
+        permit under a retired generation.
+        """
+        key = self._current_dispatch_key()
+        if key_id != key.key_id:
+            raise ValueError("dispatch signing key is not the active issuer key")
+        return key.seed
 
     def verify(self, grant: AdjustmentGrant, *, now: datetime) -> bool:
         """Verify a signed grant against its exact key id without trial verification."""
@@ -716,6 +767,17 @@ class PhylaxGrantAuthority:
     def verifier_adapter(self) -> PhylaxAdjustmentGrantVerifier:
         """Return the narrow verify/revocation surface for composition wiring."""
         return PhylaxAdjustmentGrantVerifier(self._verifier)
+
+    def dispatch_signer_adapter(self) -> DispatchIssuerSigner:
+        """Return the narrow issuer signer for frozen dispatch wire domains.
+
+        This exposes no seed, adjustment-grant issuance, P5 receipt, or
+        revocation operation.  Grant admission remains the separately injected
+        ``SignedGrantLookup`` port of the dispatch-permit store.
+        """
+        from .dispatch_composition import DispatchIssuerSigner
+
+        return DispatchIssuerSigner(self._keyring)
 
     def issuance_audit(self, grant_id: str) -> P5IssuanceAudit | None:
         """Return the opaque P5 issuance evidence without exposing raw receipt tokens."""

@@ -27,6 +27,7 @@ from .grant_store import (
     SqliteGrantAuthorityStore,
     SqliteGrantVerificationStore,
 )
+from .dispatch_composition import DispatchIssuerSigner
 from .redaction import redact_details
 from .authorizer import PhylaxAuthorizer
 from .contracts import (
@@ -56,6 +57,7 @@ from .p5_approval import (
 
 __all__ = [
     "CompositionError",
+    "DispatchIssuerSigner",
     "FileSeedProvider",
     "GrantVerifierConfig",
     "GrantAuthorityConfig",
