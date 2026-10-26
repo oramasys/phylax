@@ -191,6 +191,11 @@ class _FailingStore:
         self._guard("is_revoked")
         return self._inner.is_revoked(grant_id)  # type: ignore[attr-defined]
 
+    def issued_wire(self, grant_id: str) -> bytes | None:
+        """Read issued wire data unless configured to fail."""
+        self._guard("issued_wire")
+        return self._inner.issued_wire(grant_id)  # type: ignore[attr-defined]
+
 
 @pytest.mark.parametrize("operation", ["key", "is_issued", "is_revoked"])
 @pytest.mark.parametrize("error", [OSError("disk gone"), sqlite3.OperationalError("unable to open")])
@@ -203,6 +208,20 @@ def test_store_failures_are_verifier_unavailable_not_malformed(tmp_path: Path, o
     verifier = EffectGrantVerifier(store=_FailingStore(store, {operation}, error), clock=lambda: NOW)
     with pytest.raises(EffectGrantRefusal) as refusal:
         verifier.verify(grant.to_wire())
+    assert refusal.value.reason is EffectGrantRefusalReason.VERIFIER_UNAVAILABLE
+
+
+@pytest.mark.parametrize("error", [OSError("disk gone"), sqlite3.OperationalError("unable to open")])
+def test_lookup_issued_wire_failures_are_verifier_unavailable(tmp_path: Path, error: Exception) -> None:
+    """A durable-wire lookup failure must retain the verifier's closed refusal."""
+    from phylax.effect_grant import EffectGrantLookup, EffectGrantRefusal, EffectGrantRefusalReason, EffectGrantVerifier
+
+    authority, _keyring, store, _p5 = _build(tmp_path)
+    grant = authority.issue(_request(), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+    failing_store = _FailingStore(store, {"issued_wire"}, error)
+    lookup = EffectGrantLookup(failing_store, EffectGrantVerifier(store=store, clock=lambda: NOW))  # type: ignore[arg-type]
+    with pytest.raises(EffectGrantRefusal) as refusal:
+        lookup.get(grant.grant_id)
     assert refusal.value.reason is EffectGrantRefusalReason.VERIFIER_UNAVAILABLE
 
 
