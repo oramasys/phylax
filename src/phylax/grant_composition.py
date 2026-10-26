@@ -273,21 +273,7 @@ def open_grant_verifier(
     guarantee still assumes a state directory private to one user, which
     ``_require_private`` enforces.
     """
-    state_dir = Path(config.state_dir)
-    _require_private(state_dir, directory=True)
-    database = state_dir / "grants.sqlite3"
-    _require_private(database, directory=False)
-    for suffix in ("-wal", "-shm", "-journal"):
-        sidecar = state_dir / (database.name + suffix)
-        try:
-            os.lstat(sidecar)
-        except FileNotFoundError:
-            continue
-        _require_private(sidecar, directory=False)
-    try:
-        store = SqliteGrantVerificationStore(database)
-    except FileNotFoundError as exc:
-        raise CompositionError("grants.sqlite3 does not exist") from exc
+    store = _open_grant_verification_store(config)
     verifier = PhylaxGrantVerifier(
         store=store, verifier_id=config.verifier_id, clock=clock
     )
@@ -300,6 +286,14 @@ def open_effect_grant_verifier(
     clock: Callable[[], datetime] | None = None,
 ) -> PhylaxEffectGrantVerifier:
     """Open only the read-only v2 effect verifier; seeds and P5 stay unreachable."""
+    store = _open_grant_verification_store(config)
+    return PhylaxEffectGrantVerifier(
+        EffectGrantVerifier(store=store, verifier_id=config.verifier_id, clock=clock)
+    )
+
+
+def _open_grant_verification_store(config: GrantVerifierConfig) -> SqliteGrantVerificationStore:
+    """Validate existing grant state and open its read-only verification store."""
     state_dir = Path(config.state_dir)
     _require_private(state_dir, directory=True)
     database = state_dir / "grants.sqlite3"
@@ -312,9 +306,6 @@ def open_effect_grant_verifier(
             continue
         _require_private(sidecar, directory=False)
     try:
-        store = SqliteGrantVerificationStore(database)
+        return SqliteGrantVerificationStore(database)
     except FileNotFoundError as exc:
         raise CompositionError("grants.sqlite3 does not exist") from exc
-    return PhylaxEffectGrantVerifier(
-        EffectGrantVerifier(store=store, verifier_id=config.verifier_id, clock=clock)
-    )
