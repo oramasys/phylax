@@ -428,3 +428,227 @@ def test_open_effect_grant_verifier_real_store_without_seed_access(tmp_path: Pat
     database.touch(mode=0o600)
     database.chmod(0o600)
     _verify_persisted_issuance(tmp_path, state, _Seeds())
+
+
+def _issue(authority) -> object:  # type: ignore[no-untyped-def]
+    """Issue one standard grant from the fixture authority."""
+    return authority.issue(_request(), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+
+
+def _reason(verifier, wire: bytes):  # type: ignore[no-untyped-def]
+    """Return the refusal reason ``verifier.verify`` raises for ``wire``."""
+    from phylax.effect_grant import EffectGrantRefusal
+
+    with pytest.raises(EffectGrantRefusal) as refusal:
+        verifier.verify(wire)
+    return refusal.value.reason
+
+
+def _row_counts(store) -> dict[str, int]:  # type: ignore[no-untyped-def]
+    """Count rows in every authority table, so a refusal can prove it wrote nothing."""
+    with store._connection() as connection:
+        return {
+            name: connection.execute("SELECT COUNT(*) FROM " + name).fetchone()[0]
+            for name in ("issuer_keys", "issued_grants", "grant_revocations", "issuance_audit")
+        }
+
+
+def test_open_effect_verification_store_is_public_and_the_private_name_still_works() -> None:
+    """The opener is a documented, exported public name; the old private alias is kept."""
+    import phylax
+    from phylax import grant_composition
+
+    assert "open_effect_verification_store" in phylax.__all__
+    assert phylax.open_effect_verification_store is grant_composition.open_effect_verification_store
+    assert grant_composition._open_grant_verification_store is grant_composition.open_effect_verification_store
+    assert grant_composition.open_effect_verification_store.__doc__
+
+
+def test_public_opener_is_the_one_both_verifiers_open_through(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """open_grant_verifier and open_effect_grant_verifier route via the public opener."""
+    from phylax import grant_composition
+
+    calls: list[object] = []
+
+    def _stop(config: object):  # type: ignore[no-untyped-def]
+        """Record the call and stop before touching any state."""
+        calls.append(config)
+        raise grant_composition.CompositionError("stop")
+
+    monkeypatch.setattr(grant_composition, "open_effect_verification_store", _stop)
+    config = grant_composition.GrantVerifierConfig(state_dir=tmp_path)
+    for opener in (grant_composition.open_grant_verifier, grant_composition.open_effect_grant_verifier):
+        with pytest.raises(grant_composition.CompositionError, match="stop"):
+            opener(config)
+    assert len(calls) == 2
+
+
+def test_admission_verification_is_private_to_the_lookup(tmp_path: Path) -> None:
+    """No public verifier exposes expired-tolerant verification; only the lookup uses it."""
+    from phylax.effect_grant import EffectGrantAuthority, EffectGrantLookup, EffectGrantVerifier, PhylaxEffectGrantVerifier
+
+    for cls in (EffectGrantVerifier, PhylaxEffectGrantVerifier, EffectGrantAuthority):
+        assert not hasattr(cls, "verify_for_admission")
+    assert hasattr(EffectGrantVerifier, "_verify_for_admission")
+    authority, _keyring, store, _p5 = _build(tmp_path)
+    grant = _issue(authority)
+    lookup = EffectGrantLookup(store, EffectGrantVerifier(store=store, clock=lambda: NOW))
+    assert lookup.get(grant.grant_id).payload_digest == grant.payload_digest
+
+
+def _issue_legacy_with_second_approval(keyring, store, reference: str = "approval-legacy-1"):  # type: ignore[no-untyped-def]
+    """Persist a validly signed grant carrying a second approval, as pre-e3e954a issuers could."""
+    import hashlib
+
+    from phylax.adjustment_grant import P5IssuanceAudit
+    from phylax.effect_grant import EffectGrant, _body
+
+    keyring.ensure_current()
+    request, grant_id = _request(second_approval_ref=reference), "legacy-grant-1"
+    issued_at, expires_at = NOW, NOW + timedelta(seconds=300)
+    body, key_id, signature = keyring.sign_effect_grant_snapshot(
+        lambda issuer_key_id: _body(request, grant_id=grant_id, issued_at=issued_at, expires_at=expires_at, issuer_key_id=issuer_key_id)
+    )
+    grant = EffectGrant(request, grant_id, issued_at, expires_at, key_id, hashlib.sha256(body).hexdigest(), signature)
+    store.record_issued(grant, P5IssuanceAudit(grant_id, "preview-1", "0" * 64, "1" * 64, 300, NOW))
+    return grant
+
+
+def test_legacy_second_approval_grants_never_verify(tmp_path: Path) -> None:
+    """A signed, issued, unrevoked grant with a second approval reference is GRANT_MALFORMED."""
+    from phylax.effect_grant import EffectGrantLookup, EffectGrantRefusal, EffectGrantRefusalReason, EffectGrantVerifier
+
+    authority, keyring, store, _p5 = _build(tmp_path)
+    legacy = _issue_legacy_with_second_approval(keyring, store)
+    assert store.is_issued(legacy.grant_id, legacy.payload_digest, legacy.to_wire())
+    verifier = EffectGrantVerifier(store=store, clock=lambda: NOW)
+    assert _reason(verifier, legacy.to_wire()) is EffectGrantRefusalReason.GRANT_MALFORMED
+    assert _reason(authority._verifier, legacy.to_wire()) is EffectGrantRefusalReason.GRANT_MALFORMED
+    with pytest.raises(EffectGrantRefusal) as lookup_refusal:
+        EffectGrantLookup(store, verifier).get(legacy.grant_id)
+    assert lookup_refusal.value.reason is EffectGrantRefusalReason.GRANT_MALFORMED
+    assert verifier.verify(_issue(authority).to_wire()).second_approval_ref == ""
+
+
+def test_revocation_never_masks_key_or_signature_failures(tmp_path: Path) -> None:
+    """A revoked grant under an unusable key or bad signature raises that failure, not revoked facts."""
+    import hashlib
+
+    from phylax.adjustment_grant import P5IssuanceAudit
+    from phylax.effect_grant import EffectGrant, EffectGrantLookup, EffectGrantRefusal, EffectGrantRefusalReason, EffectGrantVerifier, _body
+
+    seeds = _Seeds({"seed-1": b"e" * 32, "seed-2": b"f" * 32})
+    authority, keyring, store, _p5 = _build(tmp_path, seeds=seeds)
+    verifier = EffectGrantVerifier(store=store, clock=lambda: NOW)
+    lookup = EffectGrantLookup(store, verifier)
+
+    # Bad signature: issued and revoked, but signed under the wrong domain.
+    good = _issue(authority)
+    body = _body(good.request, grant_id="forged-1", issued_at=good.issued_at, expires_at=good.expires_at, issuer_key_id=good.issuer_key_id)
+    _key_id, wrong = keyring.sign(body)
+    forged = EffectGrant(good.request, "forged-1", good.issued_at, good.expires_at, good.issuer_key_id, hashlib.sha256(body).hexdigest(), wrong)
+    store.record_issued(forged, P5IssuanceAudit("forged-1", "preview-x", "0" * 64, "1" * 64, 300, NOW))
+    store.revoke("forged-1", revoked_at=NOW)
+    assert store.is_revoked("forged-1")
+    assert _reason(verifier, forged.to_wire()) is EffectGrantRefusalReason.GRANT_SIGNATURE_INVALID
+    with pytest.raises(EffectGrantRefusal) as bad_sig:
+        lookup.get("forged-1")
+    assert bad_sig.value.reason is EffectGrantRefusalReason.GRANT_SIGNATURE_INVALID
+
+    # Revoked key: the grant is validly signed and revoked, yet its key is no longer trusted.
+    authority.revoke(good.grant_id)
+    assert _reason(verifier, good.to_wire()) is EffectGrantRefusalReason.GRANT_REVOKED
+    keyring.rotate(key_id="issuer-2", seed_ref="seed-2", now=NOW)
+    store.revoke_key("issuer-1")
+    assert _reason(verifier, good.to_wire()) is EffectGrantRefusalReason.GRANT_KEY_UNKNOWN
+    with pytest.raises(EffectGrantRefusal) as dead_key:
+        lookup.get(good.grant_id)
+    assert dead_key.value.reason is EffectGrantRefusalReason.GRANT_KEY_UNKNOWN
+
+    # Unknown key: the key record is gone entirely.
+    with store._connection() as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DELETE FROM issuer_keys WHERE key_id = 'issuer-1'")
+    assert _reason(verifier, good.to_wire()) is EffectGrantRefusalReason.GRANT_KEY_UNKNOWN
+
+
+def test_revoked_and_expired_grant_is_revoked_for_lookup_and_expired_for_verify(tmp_path: Path) -> None:
+    """Strict verify refuses expiry first; the lookup still reports revocation and the expiry."""
+    from phylax.effect_grant import EffectGrantLookup, EffectGrantRefusalReason, EffectGrantVerifier
+
+    authority, _keyring, store, _p5 = _build(tmp_path)
+    grant = _issue(authority)
+    authority.revoke(grant.grant_id)
+    later = grant.expires_at + timedelta(seconds=1)
+    verifier = EffectGrantVerifier(store=store, clock=lambda: later)
+    assert _reason(verifier, grant.to_wire()) is EffectGrantRefusalReason.GRANT_EXPIRED
+    facts = EffectGrantLookup(store, verifier).get(grant.grant_id)
+    assert (facts.revoked, facts.expires_at) == (True, grant.expires_at)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"second_approval_ref": "approval-1"}, {"effect_class": "shell.execute"}],
+    ids=["second-approval", "unqualified-class"],
+)
+def test_issue_refusals_leave_nothing_consumed_or_written(tmp_path: Path, overrides: dict[str, object]) -> None:
+    """Refusals precede approval, key creation, signing and persistence."""
+    authority, _keyring, store, p5 = _build(tmp_path)
+    before = _row_counts(store)
+    with pytest.raises(ValueError):
+        authority.issue(_request(**overrides), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+    with pytest.raises(ValueError):
+        authority.issue(_request(**overrides), authenticated_principal="someone-else", operator_evidence_ref="trusted-ui://1")
+    assert _row_counts(store) == before
+    assert [before[name] for name in ("issued_grants", "grant_revocations", "issuance_audit")] == [0, 0, 0]
+    assert p5._store._records == {}
+
+
+def _admit_at(tmp_path: Path, grant, keyring, when):  # type: ignore[no-untyped-def]
+    """Build the permit store, request and signer for admitting ``grant`` at ``when``."""
+    from phylax import dispatch_wire
+    from phylax.dispatch_composition import DispatchIssuerSigner
+    from phylax.dispatch_permit_store import SqliteDispatchPermitStore
+
+    request = dict(grant_id=grant.grant_id, grant_payload_digest=grant.payload_digest, operation_id="operation-1", request_digest="a" * 64, artifact_digest="b" * 64, reservation_id="res-1", ledger_store_id="ledger-1", configuration_policy_epoch=1, authority_epoch=1, consumer_acked_through=0, attempt_id="attempt-1", requested_at=dispatch_wire.timestamp(when))
+    permits = SqliteDispatchPermitStore(tmp_path / "permits.sqlite")
+    return permits, request, DispatchIssuerSigner(keyring)
+
+
+def _permit_rows(permits) -> list[str]:  # type: ignore[no-untyped-def]
+    """Return the stored expiry stamps of every permit row."""
+    connection = sqlite3.connect(permits.path)
+    try:
+        return [row[0] for row in connection.execute("SELECT expires_at FROM dispatch_permits")]
+    finally:
+        connection.close()
+
+
+def test_permit_admitted_just_before_grant_expiry_is_capped_at_grant_expiry(tmp_path: Path) -> None:
+    """A permit never outlives its grant, even when admitted one second before expiry."""
+    from phylax import dispatch_wire
+    from phylax.effect_grant import EffectGrantLookup, EffectGrantVerifier
+
+    authority, keyring, store, _p5 = _build(tmp_path)
+    grant = _issue(authority)
+    when = grant.expires_at - timedelta(seconds=1)
+    lookup = EffectGrantLookup(store, EffectGrantVerifier(store=store, clock=lambda: when))
+    permits, request, signer = _admit_at(tmp_path, grant, keyring, when)
+    permits.admit(request, grants=lookup, signer=signer, now=when)
+    assert _permit_rows(permits) == [dispatch_wire.timestamp(grant.expires_at)]
+
+
+def test_expired_lookup_leaves_the_permit_store_empty(tmp_path: Path) -> None:
+    """An expired grant is refused by admission and nothing is persisted."""
+    from phylax.dispatch_permit_store import PermitRefused
+    from phylax.effect_grant import EffectGrantLookup, EffectGrantVerifier
+
+    authority, keyring, store, _p5 = _build(tmp_path)
+    grant = _issue(authority)
+    when = grant.expires_at + timedelta(seconds=1)
+    lookup = EffectGrantLookup(store, EffectGrantVerifier(store=store, clock=lambda: when))
+    permits, request, signer = _admit_at(tmp_path, grant, keyring, when)
+    with pytest.raises(PermitRefused) as refused:
+        permits.admit(request, grants=lookup, signer=signer, now=when)
+    assert refused.value.code == "permit.grant_expired"
+    assert _permit_rows(permits) == []

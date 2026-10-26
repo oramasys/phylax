@@ -221,8 +221,12 @@ class EffectGrantVerifier:
         """Verify live consumer authority; expired grants always refuse."""
         return self._verify(wire, allow_expired=False)
 
-    def verify_for_admission(self, wire: bytes) -> VerifiedEffectGrant:
-        """Authenticate durable grant facts while leaving expiry disposition to the permit store."""
+    def _verify_for_admission(self, wire: bytes) -> VerifiedEffectGrant:
+        """Authenticate durable grant facts while leaving expiry disposition to the permit store.
+
+        Private on purpose: the result is not live authority (it may be expired), so only
+        ``EffectGrantLookup`` in this module may call it and no public verifier exposes it.
+        """
         return self._verify(wire, allow_expired=True)
 
     def _verify(self, wire: bytes, *, allow_expired: bool) -> VerifiedEffectGrant:
@@ -245,6 +249,11 @@ class EffectGrantVerifier:
                 raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_KEY_UNKNOWN)
             if not _verify_message(key.public_key, _b64decode(grant.issuer_signature), _EFFECT_GRANT_DOMAIN, grant.canonical_body()):
                 raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_SIGNATURE_INVALID)
+            if grant.request.second_approval_ref:
+                # Grants issued before e3e954a could carry a second-approval reference that
+                # nothing verified. This release qualifies none, so they never verify; the
+                # closed vocabulary keeps the reason GRANT_MALFORMED.
+                raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_MALFORMED)
             if grant.issued_at > now + _FUTURE_ISSUANCE_SKEW:
                 raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_FUTURE_DATED)
             if not allow_expired and now >= grant.expires_at:
@@ -347,7 +356,7 @@ class EffectGrantLookup:
         if wire is None:
             return None
         try:
-            grant = self._verifier.verify_for_admission(wire)
+            grant = self._verifier._verify_for_admission(wire)
         except EffectGrantRefusal as error:
             if error.reason is not EffectGrantRefusalReason.GRANT_REVOKED:
                 raise
