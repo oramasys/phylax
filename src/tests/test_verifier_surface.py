@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -802,3 +803,68 @@ def test_real_read_only_open_serves_both_versions_and_mutates_nothing(
     assert hits == []
     assert database.read_bytes() == before
     assert sorted(p.name for p in state.iterdir() if not p.name.endswith(("-wal", "-shm"))) == names
+
+
+# --- store-failure and second-approval paths ----------------------------------------------
+
+
+@pytest.mark.parametrize("method", ["key", "is_issued", "is_revoked"])
+@pytest.mark.parametrize("exc", [OSError("/home/op/state"), sqlite3.OperationalError("disk")])
+def test_every_v2_store_read_failure_is_unavailable_and_redacted(
+    env: Env, monkeypatch, method: str, exc: Exception
+) -> None:
+    """Each store read on the v2 path maps a store failure to verifier_unavailable."""
+    effects_enabled(monkeypatch)
+
+    def boom(*args: object, **kwargs: object) -> object:
+        """Raise the injected store failure."""
+        raise exc
+
+    monkeypatch.setattr(env.store, method, boom)
+    with pytest.raises(VerifierDenied) as info:
+        env.surface().verify_effect(env.v2.to_wire(), caller="consumer", capability_record=None)
+    assert info.value.code is PublicDenial.VERIFIER_UNAVAILABLE
+    assert "op" not in repr(info.value.body()).replace("operation", "") and info.value.__cause__ is None
+
+
+def test_a_grant_carrying_a_second_approval_ref_is_malformed_not_served(
+    env: Env, monkeypatch
+) -> None:
+    """A verified v2 grant with a non-empty second_approval_ref denies as malformed."""
+    import dataclasses
+
+    effects_enabled(monkeypatch)
+    surface = env.surface()
+    real = surface._v2.verify
+    monkeypatch.setattr(
+        surface._v2, "verify",
+        lambda wire: dataclasses.replace(real(wire), second_approval_ref="approval-2"),
+    )
+    assert denial(
+        lambda: surface.verify_effect(env.v2.to_wire(), caller="consumer", capability_record=None)
+    ) is PublicDenial.MALFORMED_GRANT
+    monkeypatch.undo()
+    effects_enabled(monkeypatch)
+    assert surface.verify_effect(env.v2.to_wire(), caller="consumer", capability_record=None)
+
+
+def test_the_surface_never_exposes_admission_verification(env: Env) -> None:
+    """verify_for_admission is not reachable from the surface or its public names."""
+    surface = env.surface()
+    assert not hasattr(surface, "verify_for_admission")
+    source = Path(phylax.verifier_surface.__file__).read_text(encoding="utf-8")
+    assert "verify_for_admission" not in source.replace("``verify_for_admission``", "")
+
+
+def test_an_unknown_internal_failure_is_unavailable(env: Env, monkeypatch) -> None:
+    """An exception outside the closed vocabulary fails closed as verifier_unavailable."""
+    effects_enabled(monkeypatch)
+
+    def boom(*args: object, **kwargs: object) -> object:
+        """Raise an unclassified failure."""
+        raise RuntimeError("unclassified")
+
+    monkeypatch.setattr(env.store, "is_issued", boom)
+    assert denial(
+        lambda: env.surface().verify_effect(env.v2.to_wire(), caller="consumer", capability_record=None)
+    ) is PublicDenial.VERIFIER_UNAVAILABLE

@@ -37,7 +37,6 @@ from .grant_composition import (
     open_grant_authority,
     open_grant_verifier,
     open_effect_grant_verifier,
-    open_verification_store,
 )
 from .effect_grant import (
     EffectGrant,
@@ -134,7 +133,6 @@ __all__ = [
     "SqliteGrantAuthorityStore",
     "SqliteGrantVerificationStore",
     "VerifiedGrant",
-    "open_verification_store",
     "CAPABILITY_RECORD_SCHEMA",
     "EffectiveCapabilities",
     "parse_capability_record",
