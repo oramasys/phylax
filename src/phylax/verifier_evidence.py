@@ -30,9 +30,16 @@ class ExportOutcome:
 class EvidenceLog:
     """Bounded in-memory event log producing redacted window summaries."""
 
-    def __init__(self) -> None:
-        """Start empty; failures of the sink are counted in ``export_failures``."""
-        self._events: deque[tuple[datetime, str, str]] = deque(maxlen=_MAX_EVENTS)
+    def __init__(self, max_events: int = _MAX_EVENTS) -> None:
+        """Start empty; failures of the sink are counted in ``export_failures``.
+
+        ``max_events`` bounds memory; events evicted past it are counted, and a summary
+        whose window may have lost events says so instead of looking complete.
+        """
+        self._max_events = max_events
+        self._events: deque[tuple[datetime, str, str]] = deque()
+        self._dropped = 0
+        self._last_dropped_at: datetime | None = None
         self._lock = threading.Lock()
         self.export_failures = 0
 
@@ -41,18 +48,34 @@ class EvidenceLog:
         if scope not in _SCOPES:
             return
         with self._lock:
+            if len(self._events) >= self._max_events:
+                evicted_at = self._events.popleft()[0]
+                self._dropped += 1
+                if self._last_dropped_at is None or evicted_at > self._last_dropped_at:
+                    self._last_dropped_at = evicted_at
             self._events.append((at, scope, str(code)))
 
     def summary(self, start: datetime, end: datetime) -> dict[str, object]:
-        """Return counts by scope and code for events with ``start <= at < end``."""
+        """Return counts by scope and code for events with ``start <= at < end``.
+
+        ``complete`` is false when an event at or after ``start`` has been evicted, so
+        ``total`` and ``counts`` are then a lower bound. ``dropped_total`` is the lifetime
+        eviction count and ``retained_from`` the oldest retained event time (or None).
+        """
         with self._lock:
             events = [e for e in self._events if start <= e[0] < end]
+            dropped = self._dropped
+            complete = self._last_dropped_at is None or self._last_dropped_at < start
+            retained_from = self._events[0][0].isoformat() if self._events else None
         counts: Counter[tuple[str, str]] = Counter((s, c) for _, s, c in events)
         return {
             "schema": EVIDENCE_SCHEMA,
             "window_start": start.isoformat(),
             "window_end": end.isoformat(),
             "total": len(events),
+            "complete": complete,
+            "dropped_total": dropped,
+            "retained_from": retained_from,
             "counts": {f"{s}:{c}": n for (s, c), n in sorted(counts.items())},
         }
 

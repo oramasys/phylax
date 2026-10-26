@@ -190,6 +190,20 @@ class VerifierSurface:
         self._note(scope, "ok")
         return result
 
+    def _recheck_freshness(
+        self, observation: RevocationObservation | None, started: datetime
+    ) -> None:
+        """Re-judge freshness after verification so a slow read cannot outlive its proof.
+
+        A supplied observation is judged again against the clock now. With none, the live
+        durable read must have finished within the maximum age since ``started``.
+        """
+        now = self._now()
+        if observation is not None:
+            check_revocation_fresh(observation, now)
+        elif now - started > timedelta(seconds=REVOCATION_MAX_AGE_SECONDS):
+            raise GrantRefusal(GrantRefusalReason.REVOCATION_STALE)
+
     @staticmethod
     def _match_observation(observation: RevocationObservation | None, grant_id: str) -> None:
         """An observation about another grant proves nothing about this one: stale."""
@@ -212,10 +226,13 @@ class VerifierSurface:
         """Verify a v1 adjustment grant; an optional observation must be fresh."""
 
         def action() -> VerifiedGrant:
+            """Run the guarded action for this scope."""
             self._authorize(caller)
             self._check_observation(observation)
+            started = self._now()
             verified = self._v1.verify(wire)
             self._match_observation(observation, verified.grant_id)
+            self._recheck_freshness(observation, started)
             return verified
 
         return self._run("adjustment", action)  # type: ignore[no-any-return]
@@ -235,13 +252,16 @@ class VerifierSurface:
         """
 
         def action() -> VerifiedEffectGrant:
+            """Run the guarded action for this scope."""
             self._authorize(caller)
             caps = self.capabilities(capability_record)
             if not (caps.valid and caps.effects):
                 raise VerifierDenied(PublicDenial.MISSING_CAPABILITY_RECORD)
             self._check_observation(observation)
+            started = self._now()
             verified = self._v2.verify(wire)
             self._match_observation(observation, verified.grant_id)
+            self._recheck_freshness(observation, started)
             return verified
 
         return self._run("effect", action)  # type: ignore[no-any-return]
@@ -252,18 +272,20 @@ class VerifierSurface:
         """Return a fresh revocation observation, or deny as stale / unavailable.
 
         Without ``observation`` the durable index is read now (v1 and v2 share the one
-        store, so the path is identical). A supplied observation is only judged for age.
+        store, so the path is identical). A supplied observation must be about ``grant_id`` and is judged for age.
         The observation time is taken before the read and judged after it, so a read that
         stalls past 60 s is stale.
         """
 
         def action() -> RevocationObservation:
+            """Run the guarded action for this scope."""
             self._authorize(caller)
-            if observation is not None:
-                check_revocation_fresh(observation, self._now())
-                return observation
             if not isinstance(grant_id, str) or not grant_id.strip():
                 raise GrantRefusal(GrantRefusalReason.GRANT_MALFORMED)
+            if observation is not None:
+                self._match_observation(observation, grant_id)
+                check_revocation_fresh(observation, self._now())
+                return observation
             started = self._now()
             try:
                 revoked = self._store.is_revoked(grant_id)

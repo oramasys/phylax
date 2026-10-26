@@ -13,6 +13,7 @@ import pytest
 import phylax
 from phylax import grant_composition, grant_store
 from phylax.adjustment_grant import (
+    GrantRefusal,
     GrantRefusalReason,
     PhylaxGrantAuthority,
     RevocationObservation,
@@ -55,14 +56,18 @@ class Clock:
     """Mutable UTC clock."""
 
     def __init__(self) -> None:
+        """Initialize the test helper."""
         self.now = T0
 
     def __call__(self) -> datetime:
+        """Return the current value."""
         return self.now
 
 
 class Seeds:
+    """Test double: Seeds."""
     def load_seed(self, seed_ref: str) -> bytes:
+        """Return a fixed test seed."""
         return b"e" * 32
 
 
@@ -81,6 +86,7 @@ class Env:
     """One authority store with a v1 and a v2 grant, and a verifier surface over it."""
 
     def __init__(self, directory: Path) -> None:
+        """Initialize the test helper."""
         self.clock = Clock()
         self.store = SqliteGrantAuthorityStore(directory / "grants.sqlite3")
         keyring = RotatingIssuerKeyring(
@@ -109,12 +115,14 @@ class Env:
         )
 
     def surface(self, **kw: object) -> VerifierSurface:
+        """Build a verifier surface over this environment's store."""
         kw.setdefault("caller_check", lambda caller: caller == "consumer")
         return VerifierSurface(store=self.store, clock=self.clock, **kw)  # type: ignore[arg-type]
 
 
 @pytest.fixture
 def env(tmp_path: Path) -> Env:
+    """Return a fresh environment."""
     return Env(tmp_path)
 
 
@@ -129,6 +137,7 @@ def effects_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def denial(call) -> PublicDenial:  # type: ignore[no-untyped-def]
+    """Return the public denial code raised by ``call``."""
     with pytest.raises(VerifierDenied) as info:
         call()
     return info.value.code
@@ -138,6 +147,7 @@ def denial(call) -> PublicDenial:  # type: ignore[no-untyped-def]
 
 
 def test_valid_all_false_record_is_valid_and_denies_everything() -> None:
+    """Valid all false record is valid and denies everything."""
     caps = parse_capability_record(json.dumps(record()))
     assert caps.valid and caps.reason == "capability.ok"
     assert caps.as_dict() == {name: False for name in CAPABILITY_BITS}
@@ -145,6 +155,7 @@ def test_valid_all_false_record_is_valid_and_denies_everything() -> None:
 
 @pytest.mark.parametrize("bit", CAPABILITY_BITS)
 def test_any_true_bit_is_refused_unsigned_and_nothing_is_inferred(bit: str) -> None:
+    """Any true bit is refused unsigned and nothing is inferred."""
     caps = parse_capability_record(record(**{bit: True}))
     assert not caps.valid and caps.reason == "capability.unsigned_enablement"
     assert not any(caps.as_dict().values())
@@ -153,17 +164,20 @@ def test_any_true_bit_is_refused_unsigned_and_nothing_is_inferred(bit: str) -> N
 
 
 def test_serving_true_never_implies_effects() -> None:
+    """Serving true never implies effects."""
     caps = parse_capability_record(record(serving=True))
     assert caps.serving is False and caps.effects is False
 
 
 def _without(bit: str) -> dict:
+    """Without."""
     data = record()
     data["capabilities"].pop(bit)
     return data
 
 
 def _with_caps(**changes: object) -> dict:
+    """With caps."""
     data = record()
     data["capabilities"].update(changes)
     return data
@@ -196,12 +210,14 @@ def _with_caps(**changes: object) -> dict:
     ],
 )
 def test_invalid_records_deny_every_bit_with_a_reason(raw: object, reason: str) -> None:
+    """Invalid records deny every bit with a reason."""
     caps = parse_capability_record(raw)  # type: ignore[arg-type]
     assert caps.reason == reason and not caps.valid
     assert not any(caps.as_dict().values())
 
 
 def test_digest_mismatch_denies() -> None:
+    """Digest mismatch denies."""
     other = "sha256:" + "b" * 64
     assert parse_capability_record(record(), expected_binary_digest=DIGEST).valid
     assert parse_capability_record(record(), expected_binary_digest=other).reason == (
@@ -213,16 +229,21 @@ def test_digest_mismatch_denies() -> None:
 
 
 def test_a_hostile_mapping_never_raises() -> None:
+    """A hostile mapping never raises."""
     from collections.abc import Mapping
 
     class Boom(Mapping):
+        """Test double: Boom."""
         def __getitem__(self, key: object) -> object:
+            """Raise to simulate a hostile mapping."""
             raise RuntimeError("boom")
 
         def __iter__(self):  # type: ignore[no-untyped-def]
+            """Raise to simulate a hostile mapping."""
             raise RuntimeError("boom")
 
         def __len__(self) -> int:
+            """Raise to simulate a hostile mapping."""
             return 1
 
     assert parse_capability_record(Boom()).reason == "capability.record_unreadable"
@@ -232,6 +253,7 @@ def test_a_hostile_mapping_never_raises() -> None:
 
 
 def test_the_public_vocabulary_is_exactly_the_seven_contract_codes() -> None:
+    """The public vocabulary is exactly the seven contract codes."""
     assert {c.value for c in PublicDenial} == {
         "deny.revocation_stale", "deny.unknown_key", "deny.malformed_grant",
         "deny.revoked_grant", "deny.missing_capability_record",
@@ -240,6 +262,7 @@ def test_the_public_vocabulary_is_exactly_the_seven_contract_codes() -> None:
 
 
 def test_every_internal_reason_of_both_enums_maps_to_a_public_code() -> None:
+    """Every internal reason of both enums maps to a public code."""
     expected = {
         "revocation.stale": "deny.revocation_stale", "grant.key_unknown": "deny.unknown_key",
         "grant.malformed": "deny.malformed_grant", "grant.schema_unsupported": "deny.malformed_grant",
@@ -253,6 +276,7 @@ def test_every_internal_reason_of_both_enums_maps_to_a_public_code() -> None:
 
 
 def test_denial_body_is_code_and_correlation_id_only() -> None:
+    """Denial body is code and correlation id only."""
     denied = VerifierDenied(PublicDenial.REVOKED_GRANT)
     assert set(denied.body()) == {"error"}
     assert set(denied.body()["error"]) == {"code", "correlation_id"}
@@ -268,22 +292,26 @@ def test_denial_body_is_code_and_correlation_id_only() -> None:
     [(0, True), (60, True), (61, False), (3600, False), (-5, True), (-6, False)],
 )
 def test_freshness_boundaries(age: int, fresh: bool) -> None:
+    """Freshness boundaries."""
     obs = RevocationObservation("g", False, T0 - timedelta(seconds=age))
     if fresh:
         check_revocation_fresh(obs, T0)
     else:
-        with pytest.raises(Exception) as info:
+        with pytest.raises(GrantRefusal) as info:
             check_revocation_fresh(obs, T0)
-        assert info.value.reason is GrantRefusalReason.REVOCATION_STALE  # type: ignore[attr-defined]
+        assert info.value.reason is GrantRefusalReason.REVOCATION_STALE
     assert REVOCATION_MAX_AGE_SECONDS == 60
 
 
 def test_naive_observation_time_is_stale() -> None:
-    with pytest.raises(Exception):
+    """Naive observation time is stale."""
+    with pytest.raises(GrantRefusal) as info:
         check_revocation_fresh(RevocationObservation("g", False, datetime(2026, 10, 25, 12)), T0)
+    assert info.value.reason is GrantRefusalReason.REVOCATION_STALE
 
 
 def test_stale_observation_denies_on_the_v1_path(env: Env) -> None:
+    """Stale observation denies on the v1 path."""
     surface = env.surface()
     stale = RevocationObservation(env.v1.grant_id, False, T0 - timedelta(seconds=61))
     assert denial(lambda: surface.verify_adjustment(
@@ -293,6 +321,7 @@ def test_stale_observation_denies_on_the_v1_path(env: Env) -> None:
 
 
 def test_stale_and_future_observation_deny_on_the_v2_path(env: Env, monkeypatch) -> None:
+    """Stale and future observation deny on the v2 path."""
     effects_enabled(monkeypatch)
     surface = env.surface()
     for delta in (-61, 10):
@@ -306,6 +335,7 @@ def test_stale_and_future_observation_deny_on_the_v2_path(env: Env, monkeypatch)
 
 
 def test_observation_for_another_grant_is_stale_and_revoked_observation_denies(env: Env) -> None:
+    """Observation for another grant is stale and revoked observation denies."""
     surface = env.surface()
     other = RevocationObservation("someone-else", False, T0)
     assert denial(lambda: surface.verify_adjustment(
@@ -316,6 +346,7 @@ def test_observation_for_another_grant_is_stale_and_revoked_observation_denies(e
 
 
 def test_revocation_freshness_reads_now_and_reports_revocation(env: Env) -> None:
+    """Revocation freshness reads now and reports revocation."""
     surface = env.surface()
     seen = surface.revocation_freshness(env.v2.grant_id, caller="consumer")
     assert seen.revoked is False and seen.observed_at == T0
@@ -328,9 +359,50 @@ def test_revocation_freshness_reads_now_and_reports_revocation(env: Env) -> None
         "  ", caller="consumer")) is PublicDenial.MALFORMED_GRANT
 
 
+def test_revocation_freshness_rejects_an_observation_for_another_grant(env: Env) -> None:
+    """A fresh observation about grant B is not a freshness proof for grant A."""
+    surface = env.surface()
+    other = RevocationObservation(env.v2.grant_id, False, T0)
+    assert denial(lambda: surface.revocation_freshness(
+        env.v1.grant_id, caller="consumer", observation=other)) is PublicDenial.REVOCATION_STALE
+    assert denial(lambda: surface.revocation_freshness(
+        "  ", caller="consumer", observation=other)) is PublicDenial.MALFORMED_GRANT
+    mine = RevocationObservation(env.v1.grant_id, False, T0)
+    assert surface.revocation_freshness(env.v1.grant_id, caller="consumer", observation=mine) is mine
+
+
+def test_verification_that_outlives_the_observation_is_stale(env: Env) -> None:
+    """An observation that expires while verification runs, or a slow live read, denies."""
+    surface = env.surface()
+    obs = RevocationObservation(env.v1.grant_id, False, T0 - timedelta(seconds=59))
+    real = surface._v1.verify
+
+    def slow(wire: bytes):  # type: ignore[no-untyped-def]
+        """Slow."""
+        env.clock.now += timedelta(seconds=2)
+        return real(wire)
+
+    surface._v1.verify = slow  # type: ignore[method-assign]
+    assert denial(lambda: surface.verify_adjustment(
+        env.v1.to_wire(), caller="consumer", observation=obs)) is PublicDenial.REVOCATION_STALE
+    env.clock.now = T0
+
+    def very_slow(wire: bytes):  # type: ignore[no-untyped-def]
+        """Very slow."""
+        env.clock.now += timedelta(seconds=61)
+        return real(wire)
+
+    surface._v1.verify = very_slow  # type: ignore[method-assign]
+    assert denial(lambda: surface.verify_adjustment(
+        env.v1.to_wire(), caller="consumer")) is PublicDenial.REVOCATION_STALE
+
+
 def test_a_read_that_stalls_past_the_max_age_is_stale(env: Env) -> None:
+    """A read that stalls past the max age is stale."""
     class Slow:
+        """Test double: Slow."""
         def is_revoked(self, grant_id: str) -> bool:
+            """Report revocation state for the test double."""
             env.clock.now += timedelta(seconds=61)
             return False
 
@@ -341,8 +413,11 @@ def test_a_read_that_stalls_past_the_max_age_is_stale(env: Env) -> None:
 
 
 def test_unavailable_store_or_clock_is_unavailable(env: Env) -> None:
+    """Unavailable store or clock is unavailable."""
     class Broken:
+        """Test double: Broken."""
         def is_revoked(self, grant_id: str) -> bool:
+            """Report revocation state for the test double."""
             raise OSError("path /secret/state")
 
     surface = VerifierSurface(store=Broken(), clock=env.clock, caller_check=lambda c: True)  # type: ignore[arg-type]
@@ -361,6 +436,7 @@ def test_unavailable_store_or_clock_is_unavailable(env: Env) -> None:
 
 
 def test_both_versions_verify_then_deny_revoked(env: Env, monkeypatch) -> None:
+    """Both versions verify then deny revoked."""
     effects_enabled(monkeypatch)
     surface = env.surface()
     assert surface.verify_adjustment(env.v1.to_wire(), caller="consumer").grant_id == env.v1.grant_id
@@ -375,6 +451,7 @@ def test_both_versions_verify_then_deny_revoked(env: Env, monkeypatch) -> None:
 
 
 def test_expired_garbage_and_cross_version_wire_are_malformed(env: Env, monkeypatch) -> None:
+    """Expired garbage and cross version wire are malformed."""
     effects_enabled(monkeypatch)
     surface = env.surface()
     assert denial(lambda: surface.verify_adjustment(
@@ -389,16 +466,21 @@ def test_expired_garbage_and_cross_version_wire_are_malformed(env: Env, monkeypa
 
 
 def test_unknown_issuer_key_is_unknown_key(env: Env, monkeypatch) -> None:
+    """Unknown issuer key is unknown key."""
     effects_enabled(monkeypatch)
 
     class NoKeys:
+        """Test double: NoKeys."""
         def key(self, key_id: str) -> None:
+            """Return the key material for the test double."""
             return None
 
         def is_issued(self, *a: object) -> bool:
+            """Report issuance state for the test double."""
             return True
 
         def is_revoked(self, *a: object) -> bool:
+            """Report revocation state for the test double."""
             return False
 
     surface = VerifierSurface(store=NoKeys(), clock=env.clock, caller_check=lambda c: True)  # type: ignore[arg-type]
@@ -409,8 +491,11 @@ def test_unknown_issuer_key_is_unknown_key(env: Env, monkeypatch) -> None:
 
 
 def test_store_failure_is_unavailable_and_redacted(env: Env) -> None:
+    """Store failure is unavailable and redacted."""
     class Failing:
+        """Test double: Failing."""
         def key(self, key_id: str):  # type: ignore[no-untyped-def]
+            """Return the key material for the test double."""
             raise OSError("/home/operator/state/grants.sqlite3")
 
     surface = VerifierSurface(store=Failing(), clock=env.clock, caller_check=lambda c: True)  # type: ignore[arg-type]
@@ -428,14 +513,17 @@ class Spy:
     """A store wrapper that counts every attribute access."""
 
     def __init__(self, inner: object) -> None:
+        """Initialize the test helper."""
         self.inner, self.accessed = inner, 0
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        """Record or refuse attribute access."""
         self.accessed += 1
         return getattr(self.inner, name)
 
 
 def _raises(_: object) -> bool:
+    """Raises."""
     raise RuntimeError("boom")
 
 
@@ -445,6 +533,7 @@ def _raises(_: object) -> bool:
 def test_unauthorized_or_broken_caller_check_denies_before_any_store_access(
     env: Env, checker, monkeypatch
 ) -> None:
+    """Unauthorized or broken caller check denies before any store access."""
     effects_enabled(monkeypatch)
     spy = Spy(env.store)
     surface = VerifierSurface(store=spy, clock=env.clock, caller_check=checker)  # type: ignore[arg-type]
@@ -458,6 +547,7 @@ def test_unauthorized_or_broken_caller_check_denies_before_any_store_access(
 
 
 def test_a_caller_check_is_mandatory(env: Env) -> None:
+    """A caller check is mandatory."""
     with pytest.raises(ValueError):
         VerifierSurface(store=env.store, caller_check=None)  # type: ignore[arg-type]
 
@@ -469,6 +559,7 @@ def test_a_caller_check_is_mandatory(env: Env) -> None:
 def test_effects_scope_without_a_valid_enabling_record_is_denied_before_parse(
     env: Env, supplied: object
 ) -> None:
+    """Effects scope without a valid enabling record is denied before parse."""
     spy = Spy(env.store)
     surface = VerifierSurface(store=spy, clock=env.clock, caller_check=lambda c: True)  # type: ignore[arg-type]
     assert denial(lambda: surface.verify_effect(
@@ -478,11 +569,13 @@ def test_effects_scope_without_a_valid_enabling_record_is_denied_before_parse(
 
 
 def test_digest_bound_surface_rejects_a_mismatching_record(env: Env) -> None:
+    """Digest bound surface rejects a mismatching record."""
     surface = env.surface(expected_binary_digest="sha256:" + "c" * 64)
     assert surface.capabilities(record()).reason == "capability.digest_mismatch"
 
 
 def test_adjustment_verification_does_not_need_a_capability_record(env: Env) -> None:
+    """Adjustment verification does not need a capability record."""
     assert env.surface().verify_adjustment(env.v1.to_wire(), caller="consumer")
 
 
@@ -490,6 +583,7 @@ def test_adjustment_verification_does_not_need_a_capability_record(env: Env) -> 
 
 
 def test_evidence_counts_codes_over_a_window_with_no_identifiers(env: Env) -> None:
+    """Evidence counts codes over a window with no identifiers."""
     got: list[dict] = []
     surface = env.surface(evidence_sink=got.append)
     surface.verify_adjustment(env.v1.to_wire(), caller="consumer")
@@ -512,6 +606,7 @@ def test_evidence_counts_codes_over_a_window_with_no_identifiers(env: Env) -> No
 
 
 def test_evidence_ignores_unknown_scopes() -> None:
+    """Evidence ignores unknown scopes."""
     from phylax.verifier_evidence import EvidenceLog
 
     log = EvidenceLog()
@@ -519,17 +614,37 @@ def test_evidence_ignores_unknown_scopes() -> None:
     assert log.summary(T0 - timedelta(1), T0 + timedelta(1))["total"] == 0
 
 
+def test_evidence_marks_a_window_incomplete_once_events_are_dropped() -> None:
+    """Evicted events are counted and a window they touched is flagged incomplete."""
+    from phylax.verifier_evidence import EvidenceLog
+
+    log = EvidenceLog(max_events=3)
+    lo, hi = T0 - timedelta(1), T0 + timedelta(1)
+    for i in range(3):
+        log.record(T0 + timedelta(seconds=i), "effect", "ok")
+    full = log.summary(lo, hi)
+    assert full["complete"] is True and full["dropped_total"] == 0 and full["total"] == 3
+    log.record(T0 + timedelta(seconds=3), "effect", "deny.revoked_grant")
+    part = log.summary(lo, hi)
+    assert part["complete"] is False and part["dropped_total"] == 1 and part["total"] == 3
+    assert part["retained_from"] == (T0 + timedelta(seconds=1)).isoformat()
+    assert log.summary(T0 + timedelta(seconds=1), hi)["complete"] is True
+
+
 @pytest.mark.parametrize("exc", [RuntimeError("boom with /secret/path"), OSError("disk"), KeyError("k")])
 def test_a_failing_exporter_is_reported_and_changes_nothing(env: Env, monkeypatch, exc) -> None:
+    """A failing exporter is reported and changes nothing."""
     effects_enabled(monkeypatch)
 
     def bad_sink(summary: object) -> None:
+        """Fail like a broken evidence sink."""
         raise exc
 
     good, bad = env.surface(), env.surface(evidence_sink=bad_sink)
     caps_before = bad.capabilities(record())
 
     def snapshot() -> tuple:
+        """Capture the summary handed to the sink."""
         return (
             bad.verify_adjustment(env.v1.to_wire(), caller="consumer"),
             bad.verify_effect(env.v2.to_wire(), caller="consumer", capability_record=None),
@@ -549,7 +664,9 @@ def test_a_failing_exporter_is_reported_and_changes_nothing(env: Env, monkeypatc
 
 
 def test_a_sink_mutating_its_summary_cannot_reach_the_log(env: Env) -> None:
+    """A sink mutating its summary cannot reach the log."""
     def vandal(summary: dict) -> None:
+        """Mutate the summary handed to the sink."""
         summary["counts"].clear()
         summary["total"] = 99
 
@@ -562,9 +679,11 @@ def test_a_sink_mutating_its_summary_cannot_reach_the_log(env: Env) -> None:
 
 
 def test_recording_failure_never_changes_a_result(env: Env, monkeypatch) -> None:
+    """Recording failure never changes a result."""
     surface = env.surface()
 
     def boom(*a: object) -> None:
+        """Fail like a broken recorder."""
         raise RuntimeError
 
     monkeypatch.setattr(surface._evidence, "record", boom)
@@ -574,6 +693,7 @@ def test_recording_failure_never_changes_a_result(env: Env, monkeypatch) -> None
 
 
 def test_no_sink_is_a_successful_export(env: Env) -> None:
+    """No sink is a successful export."""
     now = datetime.now(UTC)
     assert env.surface().export_evidence(now, now).ok
 
@@ -590,6 +710,7 @@ FORBIDDEN = {
 
 @pytest.mark.parametrize("module", ["verifier_surface", "capability_record", "verifier_evidence"])
 def test_new_modules_never_name_the_authority_store_seed_provider_or_issuers(module: str) -> None:
+    """New modules never name the authority store seed provider or issuers."""
     source = (Path(phylax.__file__).parent / f"{module}.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
@@ -599,6 +720,7 @@ def test_new_modules_never_name_the_authority_store_seed_provider_or_issuers(mod
 
 
 def test_the_public_surface_exposes_only_verify_freshness_close_and_evidence(env: Env) -> None:
+    """The public surface exposes only verify freshness close and evidence."""
     public = {n for n in dir(env.surface()) if not n.startswith("_")}
     assert public == {
         "verify_adjustment", "verify_effect", "revocation_freshness", "close",
@@ -607,10 +729,13 @@ def test_the_public_surface_exposes_only_verify_freshness_close_and_evidence(env
 
 
 def _forbid_authority(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Forbid authority."""
     hits: list[str] = []
 
     def trap(name: str):  # type: ignore[no-untyped-def]
+        """Fail if the authority is touched."""
         def inner(*a: object, **k: object) -> None:
+            """Fail if the authority is touched."""
             hits.append(name)
             raise AssertionError(name)
         return inner
@@ -625,6 +750,7 @@ def _forbid_authority(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 def test_using_the_surface_never_constructs_the_authority_store_or_reads_seeds(
     env: Env, monkeypatch
 ) -> None:
+    """Using the surface never constructs the authority store or reads seeds."""
     effects_enabled(monkeypatch)
     wire1, wire2 = env.v1.to_wire(), env.v2.to_wire()
     hits = _forbid_authority(monkeypatch)
@@ -640,6 +766,7 @@ def test_using_the_surface_never_constructs_the_authority_store_or_reads_seeds(
 def test_opening_a_missing_state_dir_creates_nothing_and_touches_no_authority(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """Opening a missing state dir creates nothing and touches no authority."""
     hits = _forbid_authority(monkeypatch)
     state = tmp_path / "state"
     with pytest.raises(CompositionError):
@@ -651,6 +778,7 @@ def test_opening_a_missing_state_dir_creates_nothing_and_touches_no_authority(
 def test_real_read_only_open_serves_both_versions_and_mutates_nothing(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """Real read only open serves both versions and mutates nothing."""
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     env = Env(state)
