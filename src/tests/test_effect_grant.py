@@ -530,6 +530,52 @@ def test_legacy_second_approval_grants_never_verify(tmp_path: Path) -> None:
     assert verifier.verify(_issue(authority).to_wire()).second_approval_ref == ""
 
 
+def _persist_signed(keyring, store, request, *, issued_at, grant_id, wrong_domain=False):  # type: ignore[no-untyped-def]
+    """Persist an issued grant for ``request``, signed correctly or under the wrong domain."""
+    import hashlib
+
+    from phylax.adjustment_grant import P5IssuanceAudit
+    from phylax.effect_grant import EffectGrant, _body
+
+    keyring.ensure_current()
+    expires_at = issued_at + timedelta(seconds=300)
+    if wrong_domain:
+        key_id = keyring.sign_effect_grant_snapshot(lambda k: _body(request, grant_id=grant_id, issued_at=issued_at, expires_at=expires_at, issuer_key_id=k))[1]
+        body = _body(request, grant_id=grant_id, issued_at=issued_at, expires_at=expires_at, issuer_key_id=key_id)
+        _key_id, signature = keyring.sign(body)
+    else:
+        body, key_id, signature = keyring.sign_effect_grant_snapshot(
+            lambda k: _body(request, grant_id=grant_id, issued_at=issued_at, expires_at=expires_at, issuer_key_id=k)
+        )
+    grant = EffectGrant(request, grant_id, issued_at, expires_at, key_id, hashlib.sha256(body).hexdigest(), signature)
+    store.record_issued(grant, P5IssuanceAudit(grant_id, "preview-1", "0" * 64, "1" * 64, 300, NOW))
+    return grant
+
+
+def test_signature_check_precedes_second_approval_refusal(tmp_path: Path) -> None:
+    """A badly signed grant carrying a second approval reports GRANT_SIGNATURE_INVALID."""
+    from phylax.effect_grant import EffectGrantRefusalReason, EffectGrantVerifier
+
+    _authority, keyring, store, _p5 = _build(tmp_path)
+    forged = _persist_signed(keyring, store, _request(second_approval_ref="approval-1"), issued_at=NOW, grant_id="order-a", wrong_domain=True)
+    verifier = EffectGrantVerifier(store=store, clock=lambda: NOW)
+    assert _reason(verifier, forged.to_wire()) is EffectGrantRefusalReason.GRANT_SIGNATURE_INVALID
+
+
+def test_second_approval_refusal_precedes_future_dated_check(tmp_path: Path) -> None:
+    """A validly signed future-dated grant with a second approval reports GRANT_MALFORMED."""
+    from phylax.effect_grant import EffectGrantRefusalReason, EffectGrantVerifier
+
+    _authority, keyring, store, _p5 = _build(tmp_path)
+    future = NOW + timedelta(hours=1)
+    grant = _persist_signed(keyring, store, _request(second_approval_ref="approval-1"), issued_at=future, grant_id="order-b")
+    verifier = EffectGrantVerifier(store=store, clock=lambda: NOW)
+    assert _reason(verifier, grant.to_wire()) is EffectGrantRefusalReason.GRANT_MALFORMED
+    # Control: without the second approval the same grant is future-dated.
+    plain = _persist_signed(keyring, store, _request(), issued_at=future, grant_id="order-c")
+    assert _reason(verifier, plain.to_wire()) is EffectGrantRefusalReason.GRANT_FUTURE_DATED
+
+
 def test_revocation_never_masks_key_or_signature_failures(tmp_path: Path) -> None:
     """A revoked grant under an unusable key or bad signature raises that failure, not revoked facts."""
     import hashlib
