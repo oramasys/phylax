@@ -196,3 +196,42 @@ def test_ledger_store_id_is_bound_into_the_p5_digest(tmp_path: Path, monkeypatch
     assert first.preview_payload()["assignments"][0]["ledger_store_id"] == "ledger-1"  # type: ignore[attr-defined]
     assert first.preview_digest() != second.preview_digest()  # type: ignore[attr-defined]
     assert first.claims() != second.claims()  # type: ignore[attr-defined]
+
+
+def test_rotation_between_approval_and_signing_does_not_strand_the_approval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A key rotated by another authority after consume still yields a valid grant."""
+    from phylax.adjustment_grant import RotatingIssuerKeyring
+    from phylax.effect_grant import EffectGrantVerifier
+
+    seeds = _Seeds({"seed-1": b"e" * 32, "seed-2": b"f" * 32})
+    authority, _keyring, store, p5 = _build(tmp_path, seeds=seeds)
+    other = RotatingIssuerKeyring(key_id="issuer-1", seed_ref="seed-1", seed_provider=seeds, store=store)
+    original_consume = p5.consume
+    consumed: list[object] = []
+
+    def consume_then_rotate(receipt, intent):  # type: ignore[no-untyped-def]
+        """Spend the approval, then let another authority rotate the shared key."""
+        decision = original_consume(receipt, intent)
+        consumed.append(receipt)
+        other.rotate(key_id="issuer-2", seed_ref="seed-2", now=NOW)
+        return decision
+
+    monkeypatch.setattr(p5, "consume", consume_then_rotate)
+    grant = authority.issue(_request(), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+    assert len(consumed) == 1
+    assert grant.issuer_key_id == "issuer-2"
+    assert EffectGrantVerifier(store=store, clock=lambda: NOW).verify(grant.to_wire()).grant_id == grant.grant_id
+
+
+def test_snapshot_signing_pairs_one_key_id_with_its_own_seed(tmp_path: Path) -> None:
+    """The body builder sees the same key id that the returned signature belongs to."""
+    from phylax.adjustment_grant import RotatingIssuerKeyring
+
+    seeds = _Seeds({"seed-1": b"e" * 32, "seed-2": b"f" * 32})
+    _authority, keyring, store, _p5 = _build(tmp_path, seeds=seeds)
+    RotatingIssuerKeyring(key_id="issuer-1", seed_ref="seed-1", seed_provider=seeds, store=store).rotate(
+        key_id="issuer-2", seed_ref="seed-2", now=NOW
+    )
+    seen: list[str] = []
+    body, key_id, _signature = keyring.sign_effect_grant_snapshot(lambda kid: seen.append(kid) or b"body")
+    assert (body, key_id, seen) == (b"body", "issuer-2", ["issuer-2"])

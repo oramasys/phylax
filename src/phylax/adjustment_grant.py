@@ -610,6 +610,20 @@ class RotatingIssuerKeyring:
         _public_key, signature = _sign_message(key.seed, _EFFECT_GRANT_DOMAIN, body)
         return key.key_id, _b64encode(signature)
 
+    def sign_effect_grant_snapshot(self, build_body: Callable[[str], bytes]) -> tuple[bytes, str, str]:
+        """Build and sign one v2 effect-grant body from a single key snapshot.
+
+        The durable active key is refreshed once; its identifier is handed to
+        ``build_body`` and the very same generation's seed signs the result, so a
+        concurrent rotation can never pair one generation's identifier with
+        another generation's signature. Returns ``(body, key_id, signature)``.
+        """
+        self.ensure_current()
+        key = self._active
+        body = build_body(key.key_id)
+        _public_key, signature = _sign_message(key.seed, _EFFECT_GRANT_DOMAIN, body)
+        return body, key.key_id, _b64encode(signature)
+
     def dispatch_active_key_id(self) -> str:
         """Return the current dispatch-signing key after validating its frozen wire grammar.
 

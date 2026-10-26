@@ -296,8 +296,9 @@ class EffectGrantAuthority:
         decision = self._p5.consume(receipt, intent)
         issued_at = _utc_datetime(self._clock(), "authority clock")
         expires_at = issued_at + timedelta(seconds=decision.approved_duration_seconds)
-        body = _body(request, grant_id=grant_id, issued_at=issued_at, expires_at=expires_at, issuer_key_id=self._keyring.active_key_id)
-        key_id, signature = self._keyring.sign_effect_grant(body)
+        body, key_id, signature = self._keyring.sign_effect_grant_snapshot(
+            lambda issuer_key_id: _body(request, grant_id=grant_id, issued_at=issued_at, expires_at=expires_at, issuer_key_id=issuer_key_id)
+        )
         grant = EffectGrant(request, grant_id, issued_at, expires_at, key_id, hashlib.sha256(body).hexdigest(), signature)
         self._store.record_issued(grant, P5IssuanceAudit(grant_id, receipt.preview_id, hashlib.sha256(receipt.approval_token.encode()).hexdigest(), hashlib.sha256(decision.operator_evidence_ref.encode()).hexdigest(), decision.approved_duration_seconds, decision.approved_at))
         return grant
