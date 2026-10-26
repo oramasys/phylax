@@ -1,6 +1,6 @@
 """Verifier-only surface: verify, revocation freshness, close; no issuer or seed path.
 
-One read-only store (``grant_composition._open_grant_verification_store``) backs both the v1
+One read-only store (``grant_composition.open_effect_verification_store``) backs both the v1
 adjustment verifier and the v2 effect verifier. This module references no authority
 store, seed provider, P5 authority or signing key, and constructs none. Denials leave it
 only as the stable public ``deny.*`` vocabulary with a correlation id; internal reasons,
@@ -26,11 +26,10 @@ from .adjustment_grant import (
 from .capability_record import EffectiveCapabilities, parse_capability_record
 from .effect_grant import (
     EffectGrantRefusal,
-    EffectGrantRefusalReason,
     EffectGrantVerifier,
     VerifiedEffectGrant,
 )
-from .grant_composition import GrantVerifierConfig, _open_grant_verification_store
+from .grant_composition import GrantVerifierConfig, open_effect_verification_store
 from .verifier_evidence import EvidenceLog, ExportOutcome, safe_export
 
 REVOCATION_MAX_AGE_SECONDS: Final = 60  # ADR 71
@@ -249,9 +248,9 @@ class VerifierSurface:
         """Verify a v2 effect grant; denied unless a valid record enables ``effects``.
 
         With no valid capability record (or an ``effects`` bit that is false) the call is
-        refused before the grant is even parsed. A grant whose request carries a non-empty
-        ``second_approval_ref`` is refused as malformed, matching the single-approval
-        issuance rule; ``verify_for_admission`` is deliberately not exposed.
+        refused before the grant is even parsed. A grant carrying a non-empty
+        ``second_approval_ref`` is refused as malformed by the base verifier itself, after
+        the signature check; ``verify_for_admission`` is deliberately not exposed.
         """
 
         def action() -> VerifiedEffectGrant:
@@ -263,10 +262,6 @@ class VerifierSurface:
             self._check_observation(observation)
             started = self._now()
             verified = self._v2.verify(wire)
-            if verified.second_approval_ref:
-                # #22 issues only single-approval grants; a second approval cannot be
-                # attested here, so such a grant is never usable through this surface.
-                raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_MALFORMED)
             self._match_observation(observation, verified.grant_id)
             self._recheck_freshness(observation, started)
             return verified
@@ -330,7 +325,7 @@ def open_verifier_surface(
     expected_config_digest: str | None = None,
 ) -> VerifierSurface:
     """Open the verifier-only surface read-only; it creates, migrates and seeds nothing."""
-    store = _open_grant_verification_store(config)
+    store = open_effect_verification_store(config)
     try:
         return VerifierSurface(
             store=store,

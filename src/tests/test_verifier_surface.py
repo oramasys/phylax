@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import dataclasses
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -93,6 +94,7 @@ class Env:
         keyring = RotatingIssuerKeyring(
             key_id="issuer-1", seed_ref="seed-1", seed_provider=Seeds(), store=self.store
         )
+        self.keyring = keyring
         p5 = P5ApprovalAuthority(
             signing_key=b"p5-test-secret", store=InMemoryP5ApprovalStore(), clock=self.clock
         )
@@ -830,21 +832,29 @@ def test_every_v2_store_read_failure_is_unavailable_and_redacted(
 def test_a_grant_carrying_a_second_approval_ref_is_malformed_not_served(
     env: Env, monkeypatch
 ) -> None:
-    """A verified v2 grant with a non-empty second_approval_ref denies as malformed."""
-    import dataclasses
+    """A really signed and issued v2 grant with a second_approval_ref denies as malformed.
+
+    The refusal comes from the base verifier (``EffectGrantVerifier``), not from the surface.
+    """
+    import hashlib
+
+    from phylax.adjustment_grant import P5IssuanceAudit
+    from phylax.effect_grant import EffectGrant, _body
 
     effects_enabled(monkeypatch)
     surface = env.surface()
-    real = surface._v2.verify
-    monkeypatch.setattr(
-        surface._v2, "verify",
-        lambda wire: dataclasses.replace(real(wire), second_approval_ref="approval-2"),
+    request = dataclasses.replace(env.v2.request, second_approval_ref="approval-2")
+    issued_at = env.clock()
+    expires_at = issued_at + timedelta(seconds=300)
+    body, key_id, signature = env.keyring.sign_effect_grant_snapshot(
+        lambda k: _body(request, grant_id="legacy-2", issued_at=issued_at, expires_at=expires_at, issuer_key_id=k)
     )
+    legacy = EffectGrant(request, "legacy-2", issued_at, expires_at, key_id, hashlib.sha256(body).hexdigest(), signature)
+    env.store.record_issued(legacy, P5IssuanceAudit("legacy-2", "preview-2", "0" * 64, "1" * 64, 300, issued_at))
+    assert env.store.is_issued(legacy.grant_id, legacy.payload_digest, legacy.to_wire())
     assert denial(
-        lambda: surface.verify_effect(env.v2.to_wire(), caller="consumer", capability_record=None)
+        lambda: surface.verify_effect(legacy.to_wire(), caller="consumer", capability_record=None)
     ) is PublicDenial.MALFORMED_GRANT
-    monkeypatch.undo()
-    effects_enabled(monkeypatch)
     assert surface.verify_effect(env.v2.to_wire(), caller="consumer", capability_record=None)
 
 
