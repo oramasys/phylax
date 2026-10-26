@@ -1,6 +1,7 @@
 """Effect-grant v2 issuance and verification contract."""
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -257,3 +258,96 @@ def test_from_wire_rejects_non_integer_numeric_spellings(tmp_path: Path, field: 
     assert original in wire
     with pytest.raises(ValueError, match="malformed"):
         EffectGrant.from_wire(wire.replace(original, variant))
+
+
+def test_a_body_signed_under_the_recovery_domain_is_rejected(tmp_path: Path) -> None:
+    """The verifier must require the v2 effect domain, not merely any shared domain."""
+    from phylax.adjustment_grant import _b64decode
+    from phylax.effect_grant import (
+        EffectGrant,
+        EffectGrantRefusal,
+        EffectGrantRefusalReason,
+        EffectGrantVerifier,
+    )
+
+    authority, keyring, store, _p5 = _build(tmp_path)
+    grant = authority.issue(_request(), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+    verifier = EffectGrantVerifier(store=store, clock=lambda: NOW)
+    assert verifier.verify(grant.to_wire()).grant_id == grant.grant_id
+
+    key_id, recovery_signature = keyring.sign(grant.canonical_body())
+    assert key_id == grant.issuer_key_id
+    assert recovery_signature != grant.issuer_signature
+    forged = EffectGrant(
+        grant.request, grant.grant_id, grant.issued_at, grant.expires_at, grant.issuer_key_id,
+        grant.payload_digest, recovery_signature,
+    )
+    assert len(_b64decode(forged.issuer_signature)) == len(_b64decode(grant.issuer_signature))
+    with pytest.raises(EffectGrantRefusal) as refusal:
+        verifier.verify(forged.to_wire())
+    assert refusal.value.reason is EffectGrantRefusalReason.GRANT_SIGNATURE_INVALID
+
+
+class _ReadOnlyStore:
+    """Stand-in for the POSIX-only verification store: reads only, no mutators."""
+
+    def __init__(self, path: Path) -> None:
+        """Open the persisted authority database and expose only read operations."""
+        from phylax.grant_store import SqliteGrantAuthorityStore
+
+        inner = SqliteGrantAuthorityStore(path)
+        self.key, self.is_issued, self.is_revoked = inner.key, inner.is_issued, inner.is_revoked
+
+    def close(self) -> None:
+        """Mirror the verification store's lifecycle method."""
+
+
+def _verify_persisted_issuance(tmp_path: Path, state: Path, seeds: _Seeds) -> None:
+    """Issue durably, then verify and revoke through open_effect_grant_verifier only."""
+    from phylax.effect_grant import EffectGrantRefusal, EffectGrantRefusalReason, PhylaxEffectGrantVerifier
+    from phylax.grant_composition import GrantVerifierConfig, open_effect_grant_verifier
+
+    authority, _keyring, _store, _p5 = _build(state, seeds=seeds)
+    grant = authority.issue(_request(), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+    loads_after_issue = list(seeds.loaded)
+
+    verifier = open_effect_grant_verifier(GrantVerifierConfig(state_dir=state), clock=lambda: NOW)
+    try:
+        assert isinstance(verifier, PhylaxEffectGrantVerifier)
+        assert verifier.verify(grant.to_wire()).grant_id == grant.grant_id
+        assert not hasattr(verifier, "issue") and not hasattr(verifier, "revoke")
+        authority.revoke(grant.grant_id)
+        with pytest.raises(EffectGrantRefusal) as refusal:
+            verifier.verify(grant.to_wire())
+        assert refusal.value.reason is EffectGrantRefusalReason.GRANT_REVOKED
+    finally:
+        verifier.close()
+    assert seeds.loaded == loads_after_issue  # the verifier never touched seed material
+    assert not (tmp_path / "seeds").exists()
+
+
+def test_open_effect_grant_verifier_reads_persisted_issuance_without_seed_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Composition wiring with the POSIX-only store and path checks replaced by stand-ins."""
+    from phylax import grant_composition
+
+    monkeypatch.setattr(grant_composition, "_require_private", lambda path, **_kw: None)
+    monkeypatch.setattr(grant_composition, "SqliteGrantVerificationStore", _ReadOnlyStore)
+    state = tmp_path / "state"
+    state.mkdir()
+    _verify_persisted_issuance(tmp_path, state, _Seeds())
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not hasattr(os, "geteuid"),
+    reason="the real verification store needs POSIX private-file semantics (Linux CI)",
+)
+def test_open_effect_grant_verifier_real_store_without_seed_access(tmp_path: Path) -> None:
+    """End to end on the real read-only SQLite verification store, with no seed available."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    database = state / "grants.sqlite3"
+    database.touch(mode=0o600)
+    database.chmod(0o600)
+    _verify_persisted_issuance(tmp_path, state, _Seeds())
