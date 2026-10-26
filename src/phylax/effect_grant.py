@@ -340,7 +340,10 @@ class EffectGrantLookup:
     def get(self, grant_id: str):
         """Return signed grant facts; unavailable or invalid authority always refuses."""
         from .dispatch_permit_store import GrantFacts
-        wire = self._store.issued_wire(grant_id)
+        try:
+            wire = self._store.issued_wire(grant_id)
+        except (sqlite3.Error, OSError) as error:
+            raise EffectGrantRefusal(EffectGrantRefusalReason.VERIFIER_UNAVAILABLE) from error
         if wire is None:
             return None
         try:
