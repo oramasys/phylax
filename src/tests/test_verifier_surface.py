@@ -108,7 +108,7 @@ class Env:
                 principal="principal-1", run_id="run-1", operation_id="operation-1",
                 request_digest="a" * 64, effect_class="inert.simulation",
                 ledger_store_id="ledger-1", consumer_lease_epoch=3,
-                second_approval_ref="approval-1", issuer_ref="phylax-1",
+                second_approval_ref="", issuer_ref="phylax-1",
                 revocation_ref="phylax://revocations/v1",
             ),
             authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://2",
