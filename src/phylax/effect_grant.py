@@ -214,9 +214,18 @@ class EffectGrantVerifier:
     """Read-only v2 verifier; it exposes no seed, issuance, or generic signing."""
 
     def __init__(self, *, store: GrantVerificationStore, verifier_id: str = "phylax-primary", clock: Callable[[], datetime] | None = None) -> None:
+        """Bind public issuance records and a trusted clock without acquiring signing powers."""
         self._store, self._verifier_id, self._clock = store, verifier_id, clock or (lambda: datetime.now(UTC))
 
     def verify(self, wire: bytes) -> VerifiedEffectGrant:
+        """Verify live consumer authority; expired grants always refuse."""
+        return self._verify(wire, allow_expired=False)
+
+    def verify_for_admission(self, wire: bytes) -> VerifiedEffectGrant:
+        """Authenticate durable grant facts while leaving expiry disposition to the permit store."""
+        return self._verify(wire, allow_expired=True)
+
+    def _verify(self, wire: bytes, *, allow_expired: bool) -> VerifiedEffectGrant:
         """Verify canonical wire, issuer key, signature, issuance, time and revocation.
 
         Malformed wire and validation errors are ``GRANT_MALFORMED``; store, file and
@@ -238,7 +247,7 @@ class EffectGrantVerifier:
                 raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_SIGNATURE_INVALID)
             if grant.issued_at > now + _FUTURE_ISSUANCE_SKEW:
                 raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_FUTURE_DATED)
-            if now >= grant.expires_at:
+            if not allow_expired and now >= grant.expires_at:
                 raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_EXPIRED)
             if not self._store.is_issued(grant.grant_id, grant.payload_digest, wire):
                 raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_MALFORMED)
@@ -282,6 +291,7 @@ class EffectGrantAuthority:
     """P5-backed issuer for v2 effect grants and its matching public verifier."""
 
     def __init__(self, *, keyring: RotatingIssuerKeyring, p5_approval: P5ApprovalAuthority, verifier_id: str = "phylax-primary", clock: Callable[[], datetime] | None = None) -> None:
+        """Compose durable key custody, P5 decisions and a matching public verifier."""
         self._keyring, self._p5, self._store = keyring, p5_approval, keyring.store
         self._clock = clock or (lambda: datetime.now(UTC))
         self._verifier = EffectGrantVerifier(store=self._store, verifier_id=verifier_id, clock=self._clock)
@@ -334,7 +344,7 @@ class EffectGrantLookup:
         if wire is None:
             return None
         try:
-            grant = self._verifier.verify(wire)
+            grant = self._verifier.verify_for_admission(wire)
         except EffectGrantRefusal as error:
             if error.reason is not EffectGrantRefusalReason.GRANT_REVOKED:
                 raise

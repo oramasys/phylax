@@ -103,11 +103,17 @@ class VerifiedGrant:
 class GrantVerificationStore(Protocol):
     """Read-only facts required to validate an issued grant."""
 
-    def key(self, key_id: str) -> IssuerKeyRecord | None: ...
+    def key(self, key_id: str) -> IssuerKeyRecord | None:
+        """Read the exact signed key's public registry record."""
+        ...
 
-    def is_issued(self, grant_id: str, payload_digest: str, wire: bytes) -> bool: ...
+    def is_issued(self, grant_id: str, payload_digest: str, wire: bytes) -> bool:
+        """Require an exact durable issuance match for the complete signed wire."""
+        ...
 
-    def is_revoked(self, grant_id: str) -> bool: ...
+    def is_revoked(self, grant_id: str) -> bool:
+        """Read whether the authority has durably revoked this grant."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
