@@ -22,7 +22,9 @@ def test_effect_grant_is_domain_separated_bound_and_revocable(tmp_path: Path) ->
     from phylax.p5_approval import InMemoryP5ApprovalStore, P5ApprovalAuthority
 
     class Seeds:
+        """Supply a deterministic signing seed for this issuance scenario."""
         def load_seed(self, seed_ref: str) -> bytes:
+            """Return the fixture seed only for its expected reference."""
             assert seed_ref == "seed-1"
             return b"e" * 32
 
@@ -91,6 +93,32 @@ def test_issuer_lookup_uses_verified_durable_facts(tmp_path: Path) -> None:
     assert lookup.get(grant.grant_id).revoked is False
     authority.revoke(grant.grant_id)
     assert lookup.get(grant.grant_id).revoked is True
+
+
+def test_expired_lookup_preserves_permit_refusal_and_authentication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Expiry belongs to permit admission; signature and issuance remain mandatory."""
+    from phylax.effect_grant import EffectGrantLookup, EffectGrantVerifier, EffectGrantRefusal, EffectGrantRefusalReason
+    from phylax.dispatch_permit_store import SqliteDispatchPermitStore, PermitRefused
+    from phylax.dispatch_composition import DispatchIssuerSigner
+    from phylax import dispatch_wire
+    authority, keyring, store, _p5 = _build(tmp_path)
+    grant = authority.issue(_request(), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+    expired_at = grant.expires_at + timedelta(seconds=1)
+    verifier = EffectGrantVerifier(store=store, clock=lambda: expired_at)
+    lookup = EffectGrantLookup(store, verifier)
+    with pytest.raises(EffectGrantRefusal) as strict:
+        verifier.verify(grant.to_wire())
+    assert strict.value.reason is EffectGrantRefusalReason.GRANT_EXPIRED
+    assert lookup.get(grant.grant_id).expires_at == grant.expires_at
+    request = dict(grant_id=grant.grant_id, grant_payload_digest=grant.payload_digest, operation_id="operation-1", request_digest="a" * 64, artifact_digest="b" * 64, reservation_id="res-1", ledger_store_id="ledger-1", configuration_policy_epoch=1, authority_epoch=1, consumer_acked_through=0, attempt_id="attempt-1", requested_at=dispatch_wire.timestamp(expired_at))
+    permits = SqliteDispatchPermitStore(tmp_path / "permits.sqlite")
+    with pytest.raises(PermitRefused) as refused:
+        permits.admit(request, grants=lookup, signer=DispatchIssuerSigner(keyring), now=expired_at)
+    assert refused.value.code == "permit.grant_expired"
+    monkeypatch.setattr(store, "is_issued", lambda *_args: False)
+    with pytest.raises(EffectGrantRefusal) as unissued:
+        lookup.get(grant.grant_id)
+    assert unissued.value.reason is EffectGrantRefusalReason.GRANT_MALFORMED
 
 
 class _Seeds:
