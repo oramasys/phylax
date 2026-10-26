@@ -215,10 +215,18 @@ class EffectGrantVerifier:
         self._store, self._verifier_id, self._clock = store, verifier_id, clock or (lambda: datetime.now(UTC))
 
     def verify(self, wire: bytes) -> VerifiedEffectGrant:
-        """Verify canonical wire, issuer key, signature, issuance, time and revocation."""
+        """Verify canonical wire, issuer key, signature, issuance, time and revocation.
+
+        Malformed wire and validation errors are ``GRANT_MALFORMED``; store, file and
+        invalid-clock failures are ``VERIFIER_UNAVAILABLE`` so a broken verifier is
+        distinguishable from a bad grant.
+        """
         try:
             grant = EffectGrant.from_wire(wire)
-            now = _utc_datetime(self._clock(), "verifier clock")
+            try:
+                now = _utc_datetime(self._clock(), "verifier clock")
+            except (TypeError, ValueError) as error:
+                raise EffectGrantRefusal(EffectGrantRefusalReason.VERIFIER_UNAVAILABLE) from error
             key = self._store.key(grant.issuer_key_id)
             if key is None or key.status == "revoked":
                 raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_KEY_UNKNOWN)
@@ -240,7 +248,9 @@ class EffectGrantVerifier:
             raise
         except NotImplementedError as error:
             raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_SCHEMA_UNSUPPORTED) from error
-        except (sqlite3.Error, OSError, TypeError, ValueError, UnicodeError, RecursionError) as error:
+        except (sqlite3.Error, OSError) as error:
+            raise EffectGrantRefusal(EffectGrantRefusalReason.VERIFIER_UNAVAILABLE) from error
+        except (TypeError, ValueError, UnicodeError, RecursionError) as error:
             raise EffectGrantRefusal(EffectGrantRefusalReason.GRANT_MALFORMED) from error
 
     def close(self) -> None:
