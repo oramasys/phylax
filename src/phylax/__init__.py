@@ -37,6 +37,7 @@ from .grant_composition import (
     open_grant_authority,
     open_grant_verifier,
     open_effect_grant_verifier,
+    open_effect_verification_store,
 )
 from .effect_grant import (
     EffectGrant,
@@ -89,6 +90,7 @@ __all__ = [
     "open_grant_authority",
     "open_grant_verifier",
     "open_effect_grant_verifier",
+    "open_effect_verification_store",
     "EffectGrant",
     "EffectGrantAuthority",
     "EffectGrantRefusal",
