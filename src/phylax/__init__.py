@@ -14,6 +14,21 @@ from .adjustment_grant import (
     RotatingIssuerKeyring,
     VerifiedGrant,
 )
+from .capability_record import (
+    CAPABILITY_RECORD_SCHEMA,
+    EffectiveCapabilities,
+    parse_capability_record,
+)
+from .verifier_evidence import EvidenceLog, ExportOutcome, safe_export
+from .verifier_surface import (
+    PublicDenial,
+    REVOCATION_MAX_AGE_SECONDS,
+    VerifierDenied,
+    VerifierSurface,
+    check_revocation_fresh,
+    open_verifier_surface,
+    public_denial_for,
+)
 from .grant_composition import (
     CompositionError,
     FileSeedProvider,
@@ -22,6 +37,7 @@ from .grant_composition import (
     open_grant_authority,
     open_grant_verifier,
     open_effect_grant_verifier,
+    open_verification_store,
 )
 from .effect_grant import (
     EffectGrant,
@@ -118,4 +134,18 @@ __all__ = [
     "SqliteGrantAuthorityStore",
     "SqliteGrantVerificationStore",
     "VerifiedGrant",
+    "open_verification_store",
+    "CAPABILITY_RECORD_SCHEMA",
+    "EffectiveCapabilities",
+    "parse_capability_record",
+    "EvidenceLog",
+    "ExportOutcome",
+    "safe_export",
+    "PublicDenial",
+    "REVOCATION_MAX_AGE_SECONDS",
+    "VerifierDenied",
+    "VerifierSurface",
+    "check_revocation_fresh",
+    "open_verifier_surface",
+    "public_denial_for",
 ]
