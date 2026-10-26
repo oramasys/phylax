@@ -290,7 +290,7 @@ class EffectGrantAuthority:
             raise ValueError("authenticated principal does not match effect grant principal")
         self._keyring.ensure_current()
         grant_id = token_urlsafe(24)
-        intent = P5ApprovalIntent.from_preview(request.principal, {"objective": "authorize one phylax effect grant", "task_type": "effect-grant", "optimize_for": "safety", "preferred_device": "shared", "assignments": [{"grant_id": grant_id, "principal": request.principal, "run_id": request.run_id, "operation_id": request.operation_id, "request_digest": request.request_digest, "effect_class": request.effect_class, "consumer_lease_epoch": request.consumer_lease_epoch}]}, action=_ACTION)
+        intent = P5ApprovalIntent.from_preview(request.principal, {"objective": "authorize one phylax effect grant", "task_type": "effect-grant", "optimize_for": "safety", "preferred_device": "shared", "assignments": [{"grant_id": grant_id, "principal": request.principal, "run_id": request.run_id, "operation_id": request.operation_id, "request_digest": request.request_digest, "effect_class": request.effect_class, "consumer_lease_epoch": request.consumer_lease_epoch, "ledger_store_id": request.ledger_store_id}]}, action=_ACTION)
         preview = self._p5.issue_preview(intent)
         receipt = self._p5.approve(preview.preview_id, operator_evidence_ref=operator_evidence_ref, approved_duration_seconds=approved_duration_seconds)
         decision = self._p5.consume(receipt, intent)

@@ -173,3 +173,26 @@ def test_malformed_wire_stays_grant_malformed(tmp_path: Path, wire: bytes) -> No
     with pytest.raises(EffectGrantRefusal) as refusal:
         verifier.verify(wire)
     assert refusal.value.reason is EffectGrantRefusalReason.GRANT_MALFORMED
+
+
+def test_ledger_store_id_is_bound_into_the_p5_digest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Requests differing only in ledger target must not share approval claims."""
+    from phylax import effect_grant
+
+    monkeypatch.setattr(effect_grant, "token_urlsafe", lambda _n: "fixed-grant-id")
+    seen: list[object] = []
+    for index, ledger in enumerate(("ledger-1", "ledger-2")):
+        authority, _keyring, _store, p5 = _build(tmp_path / f"s{index}")
+        original = p5.issue_preview
+
+        def spy(intent, _original=original):  # type: ignore[no-untyped-def]
+            """Capture the frozen intent, then delegate."""
+            seen.append(intent)
+            return _original(intent)
+
+        monkeypatch.setattr(p5, "issue_preview", spy)
+        authority.issue(_request(ledger_store_id=ledger), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+    first, second = seen
+    assert first.preview_payload()["assignments"][0]["ledger_store_id"] == "ledger-1"  # type: ignore[attr-defined]
+    assert first.preview_digest() != second.preview_digest()  # type: ignore[attr-defined]
+    assert first.claims() != second.claims()  # type: ignore[attr-defined]
