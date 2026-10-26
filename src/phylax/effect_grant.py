@@ -164,7 +164,7 @@ class EffectGrant:
             "second_approval_ref", "issued_at", "expires_at", "issuer_key_id", "issuer_ref",
             "revocation_ref", "payload_digest", "issuer_signature",
         }
-        if set(payload) != expected or payload["use_limit"] != 1:
+        if set(payload) != expected or type(payload["use_limit"]) is not int or payload["use_limit"] != 1:
             raise ValueError("effect grant wire is malformed")
         try:
             request = EffectGrantRequest(

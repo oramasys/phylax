@@ -235,3 +235,25 @@ def test_snapshot_signing_pairs_one_key_id_with_its_own_seed(tmp_path: Path) -> 
     seen: list[str] = []
     body, key_id, _signature = keyring.sign_effect_grant_snapshot(lambda kid: seen.append(kid) or b"body")
     assert (body, key_id, seen) == (b"body", "issuer-2", ["issuer-2"])
+
+
+@pytest.mark.parametrize(
+    ("field", "original", "variant"),
+    [
+        ("use_limit", b'"use_limit":1', b'"use_limit":true'),
+        ("use_limit", b'"use_limit":1', b'"use_limit":1.0'),
+        ("consumer_lease_epoch", b'"consumer_lease_epoch":3', b'"consumer_lease_epoch":3.0'),
+        ("consumer_lease_epoch", b'"consumer_lease_epoch":3', b'"consumer_lease_epoch":true'),
+    ],
+    ids=["use_limit-true", "use_limit-float", "epoch-float", "epoch-true"],
+)
+def test_from_wire_rejects_non_integer_numeric_spellings(tmp_path: Path, field: str, original: bytes, variant: bytes) -> None:
+    """Values that merely compare equal to an integer must not be silently rewritten."""
+    from phylax.effect_grant import EffectGrant
+
+    authority, _keyring, _store, _p5 = _build(tmp_path)
+    wire = authority.issue(_request(), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1").to_wire()
+    assert EffectGrant.from_wire(wire).to_wire() == wire
+    assert original in wire
+    with pytest.raises(ValueError, match="malformed"):
+        EffectGrant.from_wire(wire.replace(original, variant))
