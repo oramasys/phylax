@@ -88,6 +88,8 @@ class EffectGrantRequest:
         _require_safe_integer(self.consumer_lease_epoch, "consumer_lease_epoch", minimum=1)
         if not isinstance(self.second_approval_ref, str) or len(self.second_approval_ref.encode("utf-8")) > _MAX_TEXT_BYTES:
             raise ValueError("second_approval_ref is invalid")
+        if self.second_approval_ref and any(not 0x21 <= ord(char) <= 0x7e for char in self.second_approval_ref):
+            raise ValueError("second_approval_ref must be a canonical identifier")
 
 
 def _body(request: EffectGrantRequest, *, grant_id: str, issued_at: datetime, expires_at: datetime, issuer_key_id: str) -> bytes:
@@ -288,6 +290,12 @@ class EffectGrantAuthority:
         """Issue one human-approved, single-use effect grant for its exact operation."""
         if authenticated_principal != request.principal:
             raise ValueError("authenticated principal does not match effect grant principal")
+        # This release qualifies only the single-approval inert class. Never
+        # attest a second approval without an authority that verifies its record.
+        if request.second_approval_ref:
+            raise ValueError("second approval verification is unavailable")
+        if request.effect_class != "inert.simulation":
+            raise ValueError("effect class is not qualified")
         self._keyring.ensure_current()
         grant_id = token_urlsafe(24)
         intent = P5ApprovalIntent.from_preview(request.principal, {"objective": "authorize one phylax effect grant", "task_type": "effect-grant", "optimize_for": "safety", "preferred_device": "shared", "assignments": [{"grant_id": grant_id, "principal": request.principal, "run_id": request.run_id, "operation_id": request.operation_id, "request_digest": request.request_digest, "effect_class": request.effect_class, "consumer_lease_epoch": request.consumer_lease_epoch, "ledger_store_id": request.ledger_store_id}]}, action=_ACTION)
@@ -310,3 +318,26 @@ class EffectGrantAuthority:
     def revoke(self, grant_id: str) -> None:
         """Durably revoke one issued effect grant."""
         self._store.revoke(grant_id, revoked_at=_utc_datetime(self._clock(), "authority clock"))
+
+
+class EffectGrantLookup:
+    """Resolve issuer admission facts exclusively from durably issued, verified v2 grants."""
+
+    def __init__(self, store: SqliteGrantAuthorityStore, verifier: EffectGrantVerifier) -> None:
+        """Bind the lookup to the issuer's own durable index and matching verifier."""
+        self._store, self._verifier = store, verifier
+
+    def get(self, grant_id: str):
+        """Return signed grant facts; unavailable or invalid authority always refuses."""
+        from .dispatch_permit_store import GrantFacts
+        wire = self._store.issued_wire(grant_id)
+        if wire is None:
+            return None
+        try:
+            grant = self._verifier.verify(wire)
+        except EffectGrantRefusal as error:
+            if error.reason is not EffectGrantRefusalReason.GRANT_REVOKED:
+                raise
+            parsed = EffectGrant.from_wire(wire)
+            return GrantFacts(parsed.payload_digest, parsed.request.operation_id, parsed.request.request_digest, parsed.request.ledger_store_id, parsed.expires_at, True, False)
+        return GrantFacts(grant.payload_digest, grant.operation_id, grant.request_digest, grant.ledger_store_id, grant.expires_at, False, False)

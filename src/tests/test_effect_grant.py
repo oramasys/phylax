@@ -41,7 +41,7 @@ def test_effect_grant_is_domain_separated_bound_and_revocable(tmp_path: Path) ->
     request = EffectGrantRequest(
         principal="principal-1", run_id="run-1", operation_id="operation-1",
         request_digest="a" * 64, effect_class="inert.simulation", ledger_store_id="ledger-1",
-        consumer_lease_epoch=3, second_approval_ref="approval-1", issuer_ref="phylax-1",
+        consumer_lease_epoch=3, second_approval_ref="", issuer_ref="phylax-1",
         revocation_ref="phylax://revocations/v1",
     )
 
@@ -50,7 +50,7 @@ def test_effect_grant_is_domain_separated_bound_and_revocable(tmp_path: Path) ->
     )
     verified = authority.verify(grant.to_wire())
     assert (verified.grant_id, verified.second_approval_ref, verified.use_limit) == (
-        grant.grant_id, "approval-1", 1
+        grant.grant_id, "", 1
     )
     assert verified.expires_at - verified.issued_at == timedelta(seconds=5_400)
 
@@ -61,6 +61,36 @@ def test_effect_grant_is_domain_separated_bound_and_revocable(tmp_path: Path) ->
 
 
 NOW = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("reference", ["approval-does-not-exist", "contains spaces", "é", "a" * 1025])
+def test_unverified_second_approval_never_creates_issuance(tmp_path: Path, reference: str) -> None:
+    """Unsupported or malformed approval claims refuse before signing or persistence."""
+    authority, _keyring, store, _p5 = _build(tmp_path)
+    with pytest.raises(ValueError):
+        authority.issue(_request(second_approval_ref=reference), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+    with store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM issued_grants").fetchone()[0] == 0
+
+
+def test_unqualified_effect_class_refuses_before_approval(tmp_path: Path) -> None:
+    """A single approval cannot enable arbitrary real-effect classes."""
+    authority, _keyring, _store, _p5 = _build(tmp_path)
+    with pytest.raises(ValueError, match="not qualified"):
+        authority.issue(_request(effect_class="shell.execute"), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+
+
+def test_issuer_lookup_uses_verified_durable_facts(tmp_path: Path) -> None:
+    """Admission facts come from the real signed issuance and expose durable revocation."""
+    from phylax.effect_grant import EffectGrantLookup, EffectGrantVerifier
+    authority, _keyring, store, _p5 = _build(tmp_path)
+    lookup = EffectGrantLookup(store, EffectGrantVerifier(store=store, clock=lambda: NOW))
+    assert lookup.get("missing") is None
+    grant = authority.issue(_request(), authenticated_principal="principal-1", operator_evidence_ref="trusted-ui://1")
+    assert lookup.get(grant.grant_id).payload_digest == grant.payload_digest
+    assert lookup.get(grant.grant_id).revoked is False
+    authority.revoke(grant.grant_id)
+    assert lookup.get(grant.grant_id).revoked is True
 
 
 class _Seeds:
@@ -84,7 +114,7 @@ def _request(**overrides: object):  # type: ignore[no-untyped-def]
     values: dict[str, object] = {
         "principal": "principal-1", "run_id": "run-1", "operation_id": "operation-1",
         "request_digest": "a" * 64, "effect_class": "inert.simulation", "ledger_store_id": "ledger-1",
-        "consumer_lease_epoch": 3, "second_approval_ref": "approval-1", "issuer_ref": "phylax-1",
+        "consumer_lease_epoch": 3, "second_approval_ref": "", "issuer_ref": "phylax-1",
         "revocation_ref": "phylax://revocations/v1",
     }
     values.update(overrides)
