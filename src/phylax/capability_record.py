@@ -2,8 +2,9 @@
 
 Phylax only consumes the record; it never writes one and has no signing path. Every
 failure mode (missing, unreadable, wrong schema, missing or non-boolean bit, unknown
-field, digest mismatch, a true bit without a verified signature) yields every bit
-``False`` plus a stable reason. Bits are independent: none is inferred from another.
+field, digest mismatch, a true bit with an unverifiable digest, a true bit without a
+verified signature) yields every bit ``False`` plus a stable reason. Bits are independent:
+none is inferred from another.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ REASON_SCHEMA: Final = "capability.schema_unsupported"
 REASON_INVALID: Final = "capability.record_invalid"
 REASON_BIT: Final = "capability.bit_invalid"
 REASON_DIGEST: Final = "capability.digest_mismatch"
+REASON_DIGEST_UNVERIFIED: Final = "capability.digest_unverified"
 REASON_UNSIGNED: Final = "capability.unsigned_enablement"
 
 
@@ -94,8 +96,12 @@ def parse_capability_record(
     """Parse and validate a capability record into effective bits; never raises.
 
     ``None`` is a missing record. Digest expectations, when given, must equal the
-    record's ``binds``; a mismatch denies every bit. Because no signing path exists in
-    R0-2, a record with any ``true`` bit is refused with ``capability.unsigned_enablement``
+    record's ``binds``; a mismatch denies every bit. When any bit is ``true`` both
+    expected digests must be supplied: a missing one denies with
+    ``capability.digest_unverified`` (an enablement is never trusted unbound). A supplied
+    digest that differs is reported as a mismatch before any missing one. Because no
+    signing path exists in R0-2, a record with any ``true`` bit is refused with
+    ``capability.unsigned_enablement``
     whatever its ``signature`` says.
     """
     try:
@@ -125,7 +131,7 @@ def _parse(
     else:
         return _deny(REASON_UNREADABLE)
     if not isinstance(record, dict):
-        return _deny(REASON_UNREADABLE)
+        return _deny(REASON_INVALID)
     if record.get("schema") != CAPABILITY_RECORD_SCHEMA:
         return _deny(REASON_SCHEMA)
     if set(record) != _TOP_KEYS:
@@ -142,14 +148,20 @@ def _parse(
         return _deny(REASON_INVALID)
     if not all(isinstance(v, str) and _DIGEST_RE.fullmatch(v) for v in binds.values()):
         return _deny(REASON_INVALID)
-    if expected_binary_digest is not None and binds["binary_digest"] != expected_binary_digest:
+    any_true = any(caps[name] for name in CAPABILITY_BITS)
+    pairs = (
+        (expected_binary_digest, binds["binary_digest"]),
+        (expected_config_digest, binds["config_digest"]),
+    )
+    # Mismatch outranks unverified regardless of which digest is missing.
+    if any(expected is not None and expected != actual for expected, actual in pairs):
         return _deny(REASON_DIGEST)
-    if expected_config_digest is not None and binds["config_digest"] != expected_config_digest:
-        return _deny(REASON_DIGEST)
+    if any_true and any(expected is None for expected, _ in pairs):
+        return _deny(REASON_DIGEST_UNVERIFIED)
     signature = record["signature"]
     if signature is not None and not _is_text(signature):
         return _deny(REASON_INVALID)
-    if any(caps[name] for name in CAPABILITY_BITS):
+    if any_true:
         # No verified operator signature path exists in R0-2: any enablement is refused.
         return _deny(REASON_UNSIGNED)
     return EffectiveCapabilities(valid=True, reason=REASON_OK)

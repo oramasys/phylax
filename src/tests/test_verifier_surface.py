@@ -159,11 +159,12 @@ def test_valid_all_false_record_is_valid_and_denies_everything() -> None:
 @pytest.mark.parametrize("bit", CAPABILITY_BITS)
 def test_any_true_bit_is_refused_unsigned_and_nothing_is_inferred(bit: str) -> None:
     """Any true bit is refused unsigned and nothing is inferred."""
-    caps = parse_capability_record(record(**{bit: True}))
+    bound = {"expected_binary_digest": DIGEST, "expected_config_digest": DIGEST}
+    caps = parse_capability_record(record(**{bit: True}), **bound)
     assert not caps.valid and caps.reason == "capability.unsigned_enablement"
     assert not any(caps.as_dict().values())
     signed = record(**{bit: True}) | {"signature": "sig"}
-    assert parse_capability_record(signed).reason == "capability.unsigned_enablement"
+    assert parse_capability_record(signed, **bound).reason == "capability.unsigned_enablement"
 
 
 def test_serving_true_never_implies_effects() -> None:
@@ -192,7 +193,8 @@ def _with_caps(**changes: object) -> dict:
         (None, "capability.record_missing"),
         (b"\xff\xfe", "capability.record_unreadable"),
         ("{not json", "capability.record_unreadable"),
-        ("[]", "capability.record_unreadable"),
+        ("[]", "capability.record_invalid"),  # parses, but is not an object
+        ("null", "capability.record_invalid"),
         (42, "capability.record_unreadable"),
         (b"{" + b" " * 9000 + b"}", "capability.record_unreadable"),
         ('{"schema": "x", "schema": "x"}', "capability.record_unreadable"),
@@ -229,6 +231,49 @@ def test_digest_mismatch_denies() -> None:
     assert parse_capability_record(record(), expected_config_digest=other).reason == (
         "capability.digest_mismatch"
     )
+
+
+@pytest.mark.parametrize("bit", CAPABILITY_BITS)
+@pytest.mark.parametrize(
+    "supplied",
+    [{}, {"expected_binary_digest": DIGEST}, {"expected_config_digest": DIGEST}],
+)
+def test_true_bit_without_both_expected_digests_is_digest_unverified(
+    bit: str, supplied: dict
+) -> None:
+    """A true bit with a missing expected digest is denied as digest_unverified."""
+    caps = parse_capability_record(record(**{bit: True}), **supplied)
+    assert not caps.valid and caps.reason == "capability.digest_unverified"
+    assert not any(caps.as_dict().values())
+
+
+def test_all_false_record_needs_no_expected_digest() -> None:
+    """An all-false record stays valid without expected digests (no enablement to bind)."""
+    assert parse_capability_record(record()).reason == "capability.ok"
+
+
+def test_digest_mismatch_outranks_digest_unverified() -> None:
+    """A supplied but wrong digest reports mismatch even when the other is missing."""
+    other = "sha256:" + "b" * 64
+    caps = parse_capability_record(record(serving=True), expected_binary_digest=other)
+    assert caps.reason == "capability.digest_mismatch"
+
+
+def test_digest_mismatch_outranks_unverified_in_both_orders() -> None:
+    """Mismatch wins whichever digest is the missing one (binary missing, config wrong)."""
+    other = "sha256:" + "b" * 64
+    caps = parse_capability_record(record(serving=True), expected_config_digest=other)
+    assert caps.reason == "capability.digest_mismatch"
+
+
+def test_reasons_stay_inside_the_closed_set() -> None:
+    """Every capability reason is in the F10 closed set or the internal ok."""
+    from phylax import capability_record as cr
+
+    closed = {"record_missing", "record_unreadable", "schema_unsupported", "record_invalid",
+              "bit_invalid", "digest_mismatch", "digest_unverified", "unsigned_enablement"}
+    names = {v for k, v in vars(cr).items() if k.startswith("REASON_")}
+    assert names == {f"capability.{r}" for r in closed} | {"capability.ok"}
 
 
 def test_a_hostile_mapping_never_raises() -> None:
