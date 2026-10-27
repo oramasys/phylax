@@ -3,7 +3,8 @@
 Phylax only consumes the record; it never writes one and has no signing path. Every
 failure mode (missing, unreadable, wrong schema, missing or non-boolean bit, unknown
 field, digest mismatch, a true bit with an unverifiable digest, a true bit without a
-verified signature) yields every bit ``False`` plus a stable reason. Bits are independent: none is inferred from another.
+verified signature) yields every bit ``False`` plus a stable reason. Bits are independent:
+none is inferred from another.
 """
 
 from __future__ import annotations
@@ -99,7 +100,8 @@ def parse_capability_record(
     expected digests must be supplied: a missing one denies with
     ``capability.digest_unverified`` (an enablement is never trusted unbound). A supplied
     digest that differs is reported as a mismatch before any missing one. Because no
-    signing path exists in R0-2, a record with any ``true`` bit is refused with ``capability.unsigned_enablement``
+    signing path exists in R0-2, a record with any ``true`` bit is refused with
+    ``capability.unsigned_enablement``
     whatever its ``signature`` says.
     """
     try:
