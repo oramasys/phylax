@@ -258,6 +258,13 @@ def test_digest_mismatch_outranks_digest_unverified() -> None:
     assert caps.reason == "capability.digest_mismatch"
 
 
+def test_digest_mismatch_outranks_unverified_in_both_orders() -> None:
+    """Mismatch wins whichever digest is the missing one (binary missing, config wrong)."""
+    other = "sha256:" + "b" * 64
+    caps = parse_capability_record(record(serving=True), expected_config_digest=other)
+    assert caps.reason == "capability.digest_mismatch"
+
+
 def test_reasons_stay_inside_the_closed_set() -> None:
     """Every capability reason is in the F10 closed set or the internal ok."""
     from phylax import capability_record as cr

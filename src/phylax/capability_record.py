@@ -2,8 +2,8 @@
 
 Phylax only consumes the record; it never writes one and has no signing path. Every
 failure mode (missing, unreadable, wrong schema, missing or non-boolean bit, unknown
-field, digest mismatch, a true bit with an unverifiable digest, a true bit without a verified signature) yields every bit
-``False`` plus a stable reason. Bits are independent: none is inferred from another.
+field, digest mismatch, a true bit with an unverifiable digest, a true bit without a
+verified signature) yields every bit ``False`` plus a stable reason. Bits are independent: none is inferred from another.
 """
 
 from __future__ import annotations
@@ -97,8 +97,9 @@ def parse_capability_record(
     ``None`` is a missing record. Digest expectations, when given, must equal the
     record's ``binds``; a mismatch denies every bit. When any bit is ``true`` both
     expected digests must be supplied: a missing one denies with
-    ``capability.digest_unverified`` (an enablement is never trusted unbound). Because no signing path exists in
-    R0-2, a record with any ``true`` bit is refused with ``capability.unsigned_enablement``
+    ``capability.digest_unverified`` (an enablement is never trusted unbound). A supplied
+    digest that differs is reported as a mismatch before any missing one. Because no
+    signing path exists in R0-2, a record with any ``true`` bit is refused with ``capability.unsigned_enablement``
     whatever its ``signature`` says.
     """
     try:
@@ -146,14 +147,15 @@ def _parse(
     if not all(isinstance(v, str) and _DIGEST_RE.fullmatch(v) for v in binds.values()):
         return _deny(REASON_INVALID)
     any_true = any(caps[name] for name in CAPABILITY_BITS)
-    for expected, actual in (
+    pairs = (
         (expected_binary_digest, binds["binary_digest"]),
         (expected_config_digest, binds["config_digest"]),
-    ):
-        if expected is not None and expected != actual:
-            return _deny(REASON_DIGEST)
-        if expected is None and any_true:
-            return _deny(REASON_DIGEST_UNVERIFIED)
+    )
+    # Mismatch outranks unverified regardless of which digest is missing.
+    if any(expected is not None and expected != actual for expected, actual in pairs):
+        return _deny(REASON_DIGEST)
+    if any_true and any(expected is None for expected, _ in pairs):
+        return _deny(REASON_DIGEST_UNVERIFIED)
     signature = record["signature"]
     if signature is not None and not _is_text(signature):
         return _deny(REASON_INVALID)
