@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from .dispatch_composition import DispatchIssuerSigner
 
 _DOMAIN: Final = b"phylax-adjustment-grant-v1\x00"
+_EFFECT_GRANT_DOMAIN: Final = b"phylax-effect-grant-v2\x00"
 _SCHEMA_VERSION: Final = 1
 _FUTURE_ISSUANCE_SKEW: Final = timedelta(seconds=60)
 _UNIT_BASES: Final = frozenset({"steps", "elapsed_ms", "cost_microunits", "effect_attempts"})
@@ -102,11 +103,17 @@ class VerifiedGrant:
 class GrantVerificationStore(Protocol):
     """Read-only facts required to validate an issued grant."""
 
-    def key(self, key_id: str) -> IssuerKeyRecord | None: ...
+    def key(self, key_id: str) -> IssuerKeyRecord | None:
+        """Read the exact signed key's public registry record."""
+        ...
 
-    def is_issued(self, grant_id: str, payload_digest: str, wire: bytes) -> bool: ...
+    def is_issued(self, grant_id: str, payload_digest: str, wire: bytes) -> bool:
+        """Require an exact durable issuance match for the complete signed wire."""
+        ...
 
-    def is_revoked(self, grant_id: str) -> bool: ...
+    def is_revoked(self, grant_id: str) -> bool:
+        """Read whether the authority has durably revoked this grant."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,6 +608,27 @@ class RotatingIssuerKeyring:
         key = self._active
         _public_key, signature = _sign(key.seed, body)
         return key.key_id, _b64encode(signature)
+
+    def sign_effect_grant(self, body: bytes) -> tuple[str, str]:
+        """Sign one v2 effect-grant body under its dedicated protocol domain."""
+        self.ensure_current()
+        key = self._active
+        _public_key, signature = _sign_message(key.seed, _EFFECT_GRANT_DOMAIN, body)
+        return key.key_id, _b64encode(signature)
+
+    def sign_effect_grant_snapshot(self, build_body: Callable[[str], bytes]) -> tuple[bytes, str, str]:
+        """Build and sign one v2 effect-grant body from a single key snapshot.
+
+        The durable active key is refreshed once; its identifier is handed to
+        ``build_body`` and the very same generation's seed signs the result, so a
+        concurrent rotation can never pair one generation's identifier with
+        another generation's signature. Returns ``(body, key_id, signature)``.
+        """
+        self.ensure_current()
+        key = self._active
+        body = build_body(key.key_id)
+        _public_key, signature = _sign_message(key.seed, _EFFECT_GRANT_DOMAIN, body)
+        return body, key.key_id, _b64encode(signature)
 
     def dispatch_active_key_id(self) -> str:
         """Return the current dispatch-signing key after validating its frozen wire grammar.

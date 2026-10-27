@@ -31,6 +31,7 @@ from .adjustment_grant import (
     PhylaxGrantVerifier,
     RotatingIssuerKeyring,
 )
+from .effect_grant import EffectGrantVerifier, PhylaxEffectGrantVerifier
 from .grant_store import SqliteGrantAuthorityStore, SqliteGrantVerificationStore
 from .p5_approval import P5ApprovalAuthority, SqliteP5ApprovalStore
 
@@ -272,6 +273,32 @@ def open_grant_verifier(
     guarantee still assumes a state directory private to one user, which
     ``_require_private`` enforces.
     """
+    store = open_effect_verification_store(config)
+    verifier = PhylaxGrantVerifier(
+        store=store, verifier_id=config.verifier_id, clock=clock
+    )
+    return PhylaxAdjustmentGrantVerifier(verifier)
+
+
+def open_effect_grant_verifier(
+    config: GrantVerifierConfig,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> PhylaxEffectGrantVerifier:
+    """Open only the read-only v2 effect verifier; seeds and P5 stay unreachable."""
+    store = open_effect_verification_store(config)
+    return PhylaxEffectGrantVerifier(
+        EffectGrantVerifier(store=store, verifier_id=config.verifier_id, clock=clock)
+    )
+
+
+def open_effect_verification_store(config: GrantVerifierConfig) -> SqliteGrantVerificationStore:
+    """Validate existing grant state and open its read-only verification store.
+
+    Public, stable opener for callers that build their own verifier surface over the same
+    store (v1 and v2 share it). It reads no seed, creates no state, and applies the same
+    private-owner, mode and sidecar checks as ``open_grant_verifier``.
+    """
     state_dir = Path(config.state_dir)
     _require_private(state_dir, directory=True)
     database = state_dir / "grants.sqlite3"
@@ -284,10 +311,10 @@ def open_grant_verifier(
             continue
         _require_private(sidecar, directory=False)
     try:
-        store = SqliteGrantVerificationStore(database)
+        return SqliteGrantVerificationStore(database)
     except FileNotFoundError as exc:
         raise CompositionError("grants.sqlite3 does not exist") from exc
-    verifier = PhylaxGrantVerifier(
-        store=store, verifier_id=config.verifier_id, clock=clock
-    )
-    return PhylaxAdjustmentGrantVerifier(verifier)
+
+
+_open_grant_verification_store = open_effect_verification_store
+"""Backward-compatible private alias; new callers use ``open_effect_verification_store``."""
