@@ -131,7 +131,7 @@ def _parse(
     else:
         return _deny(REASON_UNREADABLE)
     if not isinstance(record, dict):
-        return _deny(REASON_UNREADABLE)
+        return _deny(REASON_INVALID)
     if record.get("schema") != CAPABILITY_RECORD_SCHEMA:
         return _deny(REASON_SCHEMA)
     if set(record) != _TOP_KEYS:

@@ -193,7 +193,8 @@ def _with_caps(**changes: object) -> dict:
         (None, "capability.record_missing"),
         (b"\xff\xfe", "capability.record_unreadable"),
         ("{not json", "capability.record_unreadable"),
-        ("[]", "capability.record_unreadable"),
+        ("[]", "capability.record_invalid"),  # parses, but is not an object
+        ("null", "capability.record_invalid"),
         (42, "capability.record_unreadable"),
         (b"{" + b" " * 9000 + b"}", "capability.record_unreadable"),
         ('{"schema": "x", "schema": "x"}', "capability.record_unreadable"),
