@@ -279,14 +279,19 @@ def test_grant_lifetime_is_the_human_approved_duration(parts, tmp_path) -> None:
 
 
 @pytest.mark.parametrize("sync_fails", [False, True])
-def test_spent_claim_directory_is_synced_before_comment_readback(parts, monkeypatch, sync_fails) -> None:
+def test_spent_claim_directory_is_synced_before_comment_readback(
+    parts: tuple[EffectGrantAuthority, Path, Path, SqliteGrantAuthorityStore],
+    monkeypatch: pytest.MonkeyPatch,
+    sync_fails: bool,
+) -> None:
     """No evidence readback or issuance precedes the durable single-use directory entry."""
     authority, config, gh, store = parts
     req = request()
     synced = []
     fsync = os.fsync
 
-    def sync(descriptor):
+    def sync(descriptor: int) -> None:
+        """Record directory sync ordering or inject a directory durability failure."""
         if stat.S_ISDIR(os.fstat(descriptor).st_mode):
             if sync_fails:
                 raise OSError("injected directory sync failure")
@@ -297,10 +302,13 @@ def test_spent_claim_directory_is_synced_before_comment_readback(parts, monkeypa
     monkeypatch.setattr(device.os, "fsync", sync)
     runner = Runner([ACCOUNT, comment(effect_approval_body(req, review_expires_at=EXPIRES))])
 
-    def readback(command, **kwargs):
+    def readback(
+        command: list[str], *, env: dict[str, str], capture_output: bool, timeout: float | None
+    ) -> str:
+        """Require durable consumption before returning the remote comment fixture."""
         if runner.calls == 1:
             assert synced, "comment readback preceded durable spent claim"
-        return runner(command, **kwargs)
+        return runner(command, env=env, capture_output=capture_output, timeout=timeout)
 
     verifier = GitHubCliEffectApprovalVerifier(
         config_dir=config, repository="acme/control", approvers={7: "control-plane"},

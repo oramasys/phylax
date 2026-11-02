@@ -285,7 +285,9 @@ def test_parse_assertion_rejects_bad_fields() -> None:
         refused("operator.malformed", parse_assertion, assertion(**overrides))
 
 
-def test_new_registry_observed_before_nonce_commit_refuses_old_call(env, monkeypatch) -> None:
+def test_new_registry_observed_before_nonce_commit_refuses_old_call(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A second verifier's committed revocation fences an already-verified old call."""
     other = OperatorAssertionVerifier(
         state_path=env.verifier.path,
@@ -297,16 +299,19 @@ def test_new_registry_observed_before_nonce_commit_refuses_old_call(env, monkeyp
     )
     commit = env.verifier._commit
 
-    def interleave(*args, **kwargs):
+    def interleave(
+        operator_id: str, nonce: str, expires_at: str, now: datetime, *, registry_version: int
+    ) -> None:
+        """Observe a revoking registry just before the old call consumes its nonce."""
         refused("operator.key_revoked", other.verify_and_consume, assertion(),
                 operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
-        return commit(*args, **kwargs)
+        return commit(operator_id, nonce, expires_at, now, registry_version=registry_version)
 
     monkeypatch.setattr(env.verifier, "_commit", interleave)
     refused("operator.registry_rollback", env.call, assertion())
 
 
-def test_clock_rollback_after_cleanup_and_restart_cannot_replay(env) -> None:
+def test_clock_rollback_after_cleanup_and_restart_cannot_replay(env: Env) -> None:
     """A previously consumed assertion cannot become live again after nonce cleanup."""
     raw = assertion()
     env.call(raw)
@@ -323,7 +328,7 @@ def test_clock_rollback_after_cleanup_and_restart_cannot_replay(env) -> None:
             operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
 
 
-def test_consumption_clock_migrates_existing_nonce_history(env) -> None:
+def test_consumption_clock_migrates_existing_nonce_history(env: Env) -> None:
     """Legacy consumed timestamps seed the durable floor without resetting replay state."""
     env.now = NOW + timedelta(seconds=60)
     env.call(assertion())
@@ -339,21 +344,26 @@ def test_consumption_clock_migrates_existing_nonce_history(env) -> None:
             operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
 
 
-def test_process_exit_during_cleanup_rolls_back_clock_and_nonce_deletion(env) -> None:
+def test_process_exit_during_cleanup_rolls_back_clock_and_nonce_deletion(env: Env) -> None:
     """A process dying before nonce insert cannot commit cleanup or advance its clock."""
     env.call(assertion())
     later = NOW + timedelta(seconds=500)
     raw = assertion(nonce="p" * 23, issued_at=wire.timestamp(later),
                     expires_at=wire.timestamp(later + timedelta(seconds=60)))
-    script = """
+    script = '''
 import os, sqlite3, sys
 from datetime import datetime
 from phylax.operator_assertion import OperatorAssertionVerifier
 
 class CrashVerifier(OperatorAssertionVerifier):
-    def _connect(self):
+    """Exit during nonce insertion with the consuming transaction still open."""
+
+    def _connect(self) -> sqlite3.Connection:
+        """Install the crash boundary on every configured database connection."""
         connection = super()._connect()
-        def crash(statement):
+
+        def crash(statement: str) -> None:
+            """Terminate before inserting a nonce, leaving cleanup uncommitted."""
             if statement.startswith('INSERT INTO consumed_nonces('):
                 os._exit(73)
         connection.set_trace_callback(crash)
@@ -364,7 +374,7 @@ verifier = CrashVerifier(state_path=sys.argv[1], trust_public_key=bytes.fromhex(
     clock=lambda: datetime.fromisoformat(sys.argv[5]))
 verifier.verify_and_consume(bytes.fromhex(sys.argv[6]), operation='abandon',
     attempt_id='attempt-1', grant_id='grant-1')
-"""
+'''
     child = subprocess.run(
         [sys.executable, "-c", script, str(env.verifier.path),
          crypto_sign_seed_keypair(TRUST_SEED)[0].hex(), AUDIENCE,

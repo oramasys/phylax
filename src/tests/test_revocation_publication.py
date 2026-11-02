@@ -67,7 +67,10 @@ class Resolver:
 
 
 @pytest.mark.parametrize("bad_genesis", [False, True])
-def test_state_chain_requires_exact_genesis_boundary(parts, bad_genesis) -> None:
+def test_state_chain_requires_exact_genesis_boundary(
+    parts: tuple[SqliteDispatchPermitStore, RetentionLedger, RetainedEventFeed, Signer],
+    bad_genesis: bool,
+) -> None:
     """A signed summary cannot relabel version 2 as head 1 or invent a genesis digest."""
     store, _ledger, feed, signer = parts
     head = load(store, signer, [("grant", "g1")], [])
@@ -100,7 +103,10 @@ def test_state_chain_requires_exact_genesis_boundary(parts, bad_genesis) -> None
     {"head_version": 0, "head_event_digest": "a" * 64},
     {"head_version": 1, "head_event_digest": wire.GENESIS_EVENT_DIGEST},
 ])
-def test_state_rejects_noninteger_schema_unsafe_head_and_inconsistent_genesis(parts, overrides) -> None:
+def test_state_rejects_noninteger_schema_unsafe_head_and_inconsistent_genesis(
+    parts: tuple[SqliteDispatchPermitStore, RetentionLedger, RetainedEventFeed, Signer],
+    overrides: dict[str, object],
+) -> None:
     """Signature validity cannot relax the closed wire's integer and genesis constraints."""
     _store, _ledger, feed, signer = parts
     document = json.loads(build_state(feed, issuer_id=ISSUER, head_version=0,
