@@ -55,6 +55,7 @@ ASSERTION_REFUSAL_CODES: Final = frozenset({
     "operator.audience_mismatch", "operator.expired", "operator.not_yet_valid",
     "operator.lifetime_too_long", "operator.signature", "operator.replayed",
     "operator.already_used",
+    "operator.clock_rollback",
 })
 
 _OPERATION = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
@@ -81,6 +82,12 @@ CREATE TABLE IF NOT EXISTS consumed_nonces (
     consumed_at TEXT NOT NULL,
     PRIMARY KEY (operator_id, nonce)
 );
+CREATE TABLE IF NOT EXISTS consumption_clock (
+    slot INTEGER PRIMARY KEY CHECK(slot = 1),
+    observed_at TEXT NOT NULL
+);
+INSERT OR IGNORE INTO consumption_clock(slot, observed_at)
+    SELECT 1, MAX(consumed_at) FROM consumed_nonces HAVING MAX(consumed_at) IS NOT NULL;
 CREATE TRIGGER IF NOT EXISTS registry_floor_forward_only BEFORE UPDATE ON registry_floor
 WHEN NEW.registry_version < OLD.registry_version
 BEGIN SELECT RAISE(ABORT, 'registry floor only moves forward'); END;
@@ -340,7 +347,8 @@ class OperatorAssertionVerifier:
         if not _domain_verify(entry.public_key, assertion.signature, ASSERTION_DOMAIN, payload):
             raise OperatorAssertionRefused("operator.signature")
         nonce = str(assertion.body["nonce"])
-        self._commit(entry.operator_id, nonce, str(assertion.body["expires_at"]), now)
+        self._commit(entry.operator_id, nonce, str(assertion.body["expires_at"]), now,
+                     registry_version=registry.version)
         return f"operator:{entry.operator_id}:{nonce}"
 
     @staticmethod
@@ -399,11 +407,25 @@ class OperatorAssertionVerifier:
                     connection.execute("ROLLBACK")
                 raise
 
-    def _commit(self, operator_id: str, nonce: str, expires_at: str, now: datetime) -> None:
-        """Consume the nonce atomically with expired-nonce cleanup, or refuse a replay."""
+    def _commit(
+        self, operator_id: str, nonce: str, expires_at: str, now: datetime, *, registry_version: int
+    ) -> None:
+        """Fence registry/clock rollback and consume atomically with expired-nonce cleanup."""
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                floor = connection.execute("SELECT registry_version FROM registry_floor").fetchone()
+                if floor is None or registry_version < floor["registry_version"]:
+                    raise OperatorAssertionRefused("operator.registry_rollback")
+                observed = connection.execute("SELECT observed_at FROM consumption_clock").fetchone()
+                if observed is not None and now < wire.parse_timestamp(observed["observed_at"]):
+                    raise OperatorAssertionRefused("operator.clock_rollback")
+                # Retain the cleanup clock even after every older nonce has been deleted.
+                connection.execute(
+                    "INSERT INTO consumption_clock(slot, observed_at) VALUES(1, ?)"
+                    " ON CONFLICT(slot) DO UPDATE SET observed_at = excluded.observed_at",
+                    (wire.timestamp(now),),
+                )
                 cutoff = wire.timestamp(
                     now - timedelta(seconds=MAX_ASSERTION_SECONDS + 2 * CLOCK_SKEW_SECONDS)
                 )

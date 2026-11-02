@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import subprocess
+import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -280,3 +283,96 @@ def test_parse_assertion_rejects_bad_fields() -> None:
     for overrides in ({"nonce": "short"}, {"operation": "Bad Op"}, {"grant_id": "bad id"},
                       {"issued_at": "yesterday"}):
         refused("operator.malformed", parse_assertion, assertion(**overrides))
+
+
+def test_new_registry_observed_before_nonce_commit_refuses_old_call(env, monkeypatch) -> None:
+    """A second verifier's committed revocation fences an already-verified old call."""
+    other = OperatorAssertionVerifier(
+        state_path=env.verifier.path,
+        trust_public_key=crypto_sign_seed_keypair(TRUST_SEED)[0], audience=AUDIENCE,
+        registry_source=lambda: registry_bytes(2, [
+            entry("alice", ALICE_SEED, revoked_at=wire.timestamp(NOW)),
+            entry("bob", BOB_SEED),
+        ]), clock=lambda: NOW,
+    )
+    commit = env.verifier._commit
+
+    def interleave(*args, **kwargs):
+        refused("operator.key_revoked", other.verify_and_consume, assertion(),
+                operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
+        return commit(*args, **kwargs)
+
+    monkeypatch.setattr(env.verifier, "_commit", interleave)
+    refused("operator.registry_rollback", env.call, assertion())
+
+
+def test_clock_rollback_after_cleanup_and_restart_cannot_replay(env) -> None:
+    """A previously consumed assertion cannot become live again after nonce cleanup."""
+    raw = assertion()
+    env.call(raw)
+    env.now = NOW + timedelta(seconds=500)
+    env.call(assertion(nonce="q" * 23, issued_at=wire.timestamp(env.now),
+                       expires_at=wire.timestamp(env.now + timedelta(seconds=60))))
+    env.now = NOW
+    restarted = OperatorAssertionVerifier(
+        state_path=env.verifier.path,
+        trust_public_key=crypto_sign_seed_keypair(TRUST_SEED)[0], audience=AUDIENCE,
+        registry_source=lambda: env.registry, clock=lambda: env.now,
+    )
+    refused("operator.clock_rollback", restarted.verify_and_consume, raw,
+            operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
+
+
+def test_consumption_clock_migrates_existing_nonce_history(env) -> None:
+    """Legacy consumed timestamps seed the durable floor without resetting replay state."""
+    env.now = NOW + timedelta(seconds=60)
+    env.call(assertion())
+    with sqlite3.connect(env.verifier.path) as db:
+        db.execute("DROP TABLE consumption_clock")
+    env.now = NOW
+    restarted = OperatorAssertionVerifier(
+        state_path=env.verifier.path,
+        trust_public_key=crypto_sign_seed_keypair(TRUST_SEED)[0], audience=AUDIENCE,
+        registry_source=lambda: env.registry, clock=lambda: env.now,
+    )
+    refused("operator.clock_rollback", restarted.verify_and_consume, assertion(nonce="m" * 23),
+            operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
+
+
+def test_process_exit_during_cleanup_rolls_back_clock_and_nonce_deletion(env) -> None:
+    """A process dying before nonce insert cannot commit cleanup or advance its clock."""
+    env.call(assertion())
+    later = NOW + timedelta(seconds=500)
+    raw = assertion(nonce="p" * 23, issued_at=wire.timestamp(later),
+                    expires_at=wire.timestamp(later + timedelta(seconds=60)))
+    script = """
+import os, sqlite3, sys
+from datetime import datetime
+from phylax.operator_assertion import OperatorAssertionVerifier
+
+class CrashVerifier(OperatorAssertionVerifier):
+    def _connect(self):
+        connection = super()._connect()
+        def crash(statement):
+            if statement.startswith('INSERT INTO consumed_nonces('):
+                os._exit(73)
+        connection.set_trace_callback(crash)
+        return connection
+
+verifier = CrashVerifier(state_path=sys.argv[1], trust_public_key=bytes.fromhex(sys.argv[2]),
+    audience=sys.argv[3], registry_source=lambda: bytes.fromhex(sys.argv[4]),
+    clock=lambda: datetime.fromisoformat(sys.argv[5]))
+verifier.verify_and_consume(bytes.fromhex(sys.argv[6]), operation='abandon',
+    attempt_id='attempt-1', grant_id='grant-1')
+"""
+    child = subprocess.run(
+        [sys.executable, "-c", script, str(env.verifier.path),
+         crypto_sign_seed_keypair(TRUST_SEED)[0].hex(), AUDIENCE,
+         env.registry.hex(), later.isoformat(), raw.hex()],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert child.returncode == 73, child.stderr
+    # Recovery sees the original consumption, not the uncommitted cleanup/clock.
+    refused("operator.replayed", env.call, assertion())
+    env.now = later
+    assert env.call(raw)
