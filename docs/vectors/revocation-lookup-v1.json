@@ -1,0 +1,20 @@
+{
+  "description": "Shared truth table for the combined revocation lookup. The consumer-local oramasys refusal_reason and the Phylax CombinedRevocationLookup must both reproduce every row.",
+  "issuer_id": "issuer-1",
+  "cases": [
+    {"name": "clean", "revoked": [], "cascades": [], "grant": "g1", "approval_ref": "ap1", "expect": null},
+    {"name": "grant revoked", "revoked": [["grant", "g1"]], "cascades": [], "grant": "g1", "approval_ref": "ap1", "expect": "grant_revoked"},
+    {"name": "other grant revoked", "revoked": [["grant", "g2"]], "cascades": [], "grant": "g1", "approval_ref": "ap1", "expect": null},
+    {"name": "approval chain revoked", "revoked": [["approval", "ap1"]], "cascades": [], "grant": "g1", "approval_ref": "ap1", "expect": "approval_revoked"},
+    {"name": "other approval revoked", "revoked": [["approval", "ap9"]], "cascades": [], "grant": "g1", "approval_ref": "ap1", "expect": null},
+    {"name": "single approval ignores approval revocations", "revoked": [["approval", "ap9"]], "cascades": [], "grant": "g1", "approval_ref": "", "expect": null},
+    {"name": "undeclared approval refuses on any approval revocation", "revoked": [["approval", "ap9"]], "cascades": [], "grant": "g1", "approval_ref": null, "expect": "approval_undeclared"},
+    {"name": "undeclared approval with none revoked", "revoked": [], "cascades": [], "grant": "g1", "approval_ref": null, "expect": null},
+    {"name": "issuer revoked wins", "revoked": [["issuer", "issuer-1"], ["grant", "g1"]], "cascades": [], "grant": "g1", "approval_ref": "ap1", "expect": "issuer_revoked"},
+    {"name": "other issuer revocation is not ours", "revoked": [["issuer", "issuer-2"]], "cascades": [], "grant": "g1", "approval_ref": "ap1", "expect": null},
+    {"name": "cascade lists grant", "revoked": [], "cascades": [["ap1", ["g1", "g3"]]], "grant": "g1", "approval_ref": "ap1", "expect": "cascade_listed"},
+    {"name": "cascade lists other grant", "revoked": [], "cascades": [["ap1", ["g3"]]], "grant": "g1", "approval_ref": "ap1", "expect": null},
+    {"name": "grant revoked before cascade", "revoked": [["grant", "g1"]], "cascades": [["ap1", ["g1"]]], "grant": "g1", "approval_ref": "ap1", "expect": "grant_revoked"},
+    {"name": "approval revoked before cascade", "revoked": [["approval", "ap1"]], "cascades": [["ap1", ["g1"]]], "grant": "g1", "approval_ref": "ap1", "expect": "approval_revoked"}
+  ]
+}
