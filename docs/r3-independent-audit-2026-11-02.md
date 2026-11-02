@@ -1,5 +1,28 @@
 # R3 Phylax audit and regression receipt
 
+## Contribution provenance envelope
+
+```json
+{
+  "author": {"agent_id": "codex-reviewer", "work_ref": "ed07957; ef609b5; 43ec8be; 3e43d315203d78bf249b6516ca54d6d3a7549c32"},
+  "actor": {"agent_id": "codex-reviewer", "instance_id": null, "identity_verified": false},
+  "endorsement": {"status": "none", "evidence_refs": []},
+  "takeover": {
+    "previous_author": "Windows contributor; agent identity not independently established",
+    "work_ref": "6d4157302407bd27d823e413519aacc2d6d13e34",
+    "operation": "Preserve PR #30 platform primitives by merge c4893ce; add bounded repairs, tests and publication evidence without rewriting authorship"
+  }
+}
+```
+
+The primary actor integrates and runs the final suites. Same-session audit lane
+Meitner (`01a19c16-dc95-7932-b0ad-1bc866d27c95`) produced the bounded producer
+audit and regression work described below. Its runtime lane ID is an execution
+reference, not independently verified personhood or independent R6 endorsement.
+Git author/committer fields remain the repository attribution; this envelope
+does not rewrite commits or relabel integration as original Windows authorship.
+Unknown primary session ID is explicitly null rather than invented.
+
 Date: 2026-11-02. Bounded parallel same-session audit and regression work, not independent R6
 release review. The auditor wrote fixes; the source plan requires an R6 reviewer who did not write
 the changes. Same-session agreement does not satisfy that gate.
