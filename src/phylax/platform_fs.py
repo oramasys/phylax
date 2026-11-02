@@ -186,9 +186,12 @@ else:
             os.close(descriptor)
 
     def replace_durably(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
-        """Atomically replace ``dst`` with ``src`` then fsync the parent directory."""
+        """Atomically replace ``dst`` and flush every changed parent directory."""
+        source_parent, destination_parent = Path(src).parent, Path(dst).parent
         os.replace(src, dst)
-        fsync_dir(Path(dst).parent)
+        fsync_dir(destination_parent)
+        if source_parent != destination_parent:
+            fsync_dir(source_parent)
 
 
 def exclusive_lock(target: LockTarget, *, blocking: bool = True) -> None:

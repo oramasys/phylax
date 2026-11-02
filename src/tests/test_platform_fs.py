@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -24,23 +25,51 @@ _HOLDER = (
 )
 
 
-def _spawn(path: Path, exclusive: bool) -> subprocess.Popen[str]:
+def _spawn(path: Path, exclusive: bool, *, wait: bool = True, timeout: float = 5) -> subprocess.Popen[str]:
     """Start a child that holds a lock until its stdin yields a line; wait until it holds it."""
     src = str(Path(fs.__file__).resolve().parents[1])
     child = subprocess.Popen(
         [sys.executable, "-c", _HOLDER, src, str(path), "x" if exclusive else "s"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
     )
-    assert child.stdout is not None and child.stdout.readline().strip() == "held"
+    if wait:
+        try:
+            assert _read_line(child).get(timeout=timeout).strip() == "held"
+        except (queue.Empty, AssertionError):
+            _stop(child)
+            raise AssertionError("lock child did not become ready within timeout") from None
     return child
+
+
+def _read_line(child: subprocess.Popen[str]) -> queue.Queue[str]:
+    """Read readiness in a daemon thread so a broken child cannot block pytest."""
+    ready: queue.Queue[str] = queue.Queue()
+    assert child.stdout is not None
+    thread = threading.Thread(target=lambda: ready.put(child.stdout.readline()), daemon=True)
+    thread.start()
+    return ready
+
+
+def _stop(child: subprocess.Popen[str]) -> None:
+    """Reap only this test child and close its handles on every failure path."""
+    if child.poll() is None:
+        child.kill()
+    child.wait(timeout=5)
+    for stream in (child.stdin, child.stdout, child.stderr):
+        if stream is not None:
+            stream.close()
 
 
 def _release(child: subprocess.Popen[str]) -> None:
     """Let the child exit cleanly."""
-    assert child.stdin is not None
-    child.stdin.write("\n")
-    child.stdin.flush()
-    child.wait(timeout=10)
+    try:
+        if child.poll() is None:
+            assert child.stdin is not None
+            child.stdin.write("\n")
+            child.stdin.flush()
+        child.wait(timeout=5)
+    finally:
+        _stop(child)
 
 
 def _try(path: Path, *, exclusive: bool) -> None:
@@ -160,12 +189,17 @@ def test_blocking_lock_waits_for_release(tmp_path: Path) -> None:
     """A blocking acquire returns only after the child releases."""
     lock = tmp_path / "b.lock"
     child = _spawn(lock, True)
-    timer = threading.Timer(0.5, lambda: _release(child))
-    timer.start()
-    start = time.monotonic()
-    with fs.locked(lock):
-        assert time.monotonic() - start >= 0.3
-    timer.join()
+    waiter = _spawn(lock, True, wait=False)
+    ready = _read_line(waiter)
+    try:
+        with pytest.raises(queue.Empty):
+            ready.get(timeout=0.3)
+        assert waiter.poll() is None
+        _release(child)
+        assert ready.get(timeout=5).strip() == "held"
+    finally:
+        _release(waiter)
+        _release(child)
 
 
 def test_fsync_dir_on_real_directory(tmp_path: Path) -> None:
@@ -182,19 +216,26 @@ def test_replace_durably_is_atomic_for_readers(tmp_path: Path) -> None:
     old, new = b"old" * 1000, b"new" * 1000
     dst.write_bytes(old)
     stop = threading.Event()
+    ready = threading.Event()
+    saw_new = threading.Event()
     seen: set[bytes] = set()
 
     def reader() -> None:
         """Poll the destination, tolerating transient Windows sharing errors."""
         while not stop.is_set():
             try:
-                seen.add(dst.read_bytes())
+                data = dst.read_bytes()
+                seen.add(data)
+                ready.set()
+                if data == new:
+                    saw_new.set()
             except PermissionError:
                 pass
 
-    thread = threading.Thread(target=reader)
+    thread = threading.Thread(target=reader, daemon=True)
     thread.start()
     try:
+        assert ready.wait(5), "reader never completed a read"
         for index in range(50):
             tmp = tmp_path / f"t{index}"
             tmp.write_bytes(new if index % 2 == 0 else old)
@@ -206,10 +247,13 @@ def test_replace_durably_is_atomic_for_readers(tmp_path: Path) -> None:
                     time.sleep(0.01)
             else:
                 raise AssertionError("replace kept failing")
+            if index == 0:
+                assert saw_new.wait(5), "reader never observed a completed replacement"
     finally:
         stop.set()
-        thread.join()
-    assert seen <= {old, new}
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert seen == {old, new}
     assert dst.read_bytes() == old
     assert not (tmp_path / "t0").exists()
 
@@ -218,3 +262,34 @@ def test_check_private_is_an_explicit_stub(tmp_path: Path) -> None:
     """The unimplemented ACL check raises instead of passing."""
     with pytest.raises(NotImplementedError):
         fs.check_private(tmp_path, "SECRET")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX parent-directory fsync contract")
+@pytest.mark.parametrize("separate_parents", [False, True])
+def test_replace_flushes_every_changed_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, separate_parents: bool,
+) -> None:
+    """Replacement durably records both directory entries, flushing a shared parent once."""
+    source_parent = tmp_path / "source"
+    source_parent.mkdir()
+    destination_parent = tmp_path / "destination" if separate_parents else source_parent
+    if separate_parents:
+        destination_parent.mkdir()
+    source, destination = source_parent / "new", destination_parent / "state"
+    source.write_bytes(b"complete")
+    flushed: list[Path] = []
+    monkeypatch.setattr(fs, "fsync_dir", lambda path: flushed.append(Path(path)))
+    fs.replace_durably(source, destination)
+    assert set(flushed) == {source_parent, destination_parent}
+    assert len(flushed) == (2 if separate_parents else 1)
+    assert destination.read_bytes() == b"complete"
+    assert not source.exists()
+
+
+def test_lock_child_startup_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A child that never announces readiness is killed instead of hanging CI."""
+    monkeypatch.setitem(_spawn.__globals__, "_HOLDER", "import time; time.sleep(60)")
+    started = time.monotonic()
+    with pytest.raises(AssertionError, match="ready within timeout"):
+        _spawn(tmp_path / "never-ready.lock", True, timeout=0.1)
+    assert time.monotonic() - started < 5
