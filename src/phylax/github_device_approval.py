@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import re
 import subprocess
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Protocol
 
 from .model_launch_approval import ModelLaunchIntent, VerifiedModelApproval
 
@@ -383,6 +383,123 @@ def _created_at(value: object) -> datetime:
     return parsed
 
 
+class CeremonyHost(Protocol):
+    """The configured trust a ceremony verifier carries (isolated CLI config, repo, approvers)."""
+
+    config_dir: Path
+    repository: str
+    approvers: Mapping[int, str]
+    runner: Callable[..., str]
+    gh_executable: Path | None
+    clock: Callable[[], datetime]
+
+
+@dataclass(frozen=True, slots=True)
+class CeremonyEvidence:
+    """What one spent ceremony proves: who, when, and until when."""
+
+    principal: str
+    approved_at: datetime
+    expires_at: datetime
+
+
+def verify_comment_ceremony(
+    host: CeremonyHost,
+    *,
+    evidence_ref: str,
+    operator_principal: str,
+    expected_body: str,
+    review_expires_at: int,
+) -> CeremonyEvidence:
+    """Spend fresh isolated-gh login evidence and prove one exact, unedited approval comment.
+
+    Shared by every approval kind: the caller supplies the principal the account must map to, the
+    exact comment body it expects and the review deadline. This is procedural evidence of a human
+    GitHub-account decision; it is not an independently attested MFA claim.
+    """
+    repository, _issue, comment_id = _comment_reference(evidence_ref)
+    if repository != host.repository:
+        raise ValueError("model approval comment targets another repository")
+    _environment(host.config_dir)
+    now = host.clock()
+    now_timestamp = _utc_timestamp(now)
+    if _spent_marker_path(host.config_dir).exists():
+        raise ValueError("fresh GitHub login marker is already spent")
+    marker = _load_json(_marker_path(host.config_dir))
+    if not isinstance(marker, dict) or marker.get("schema") != 1:
+        raise ValueError("fresh GitHub login marker is invalid")
+    issued_at = _require_fresh_marker(marker.get("issued_at"), now_timestamp)
+    executable = host.gh_executable
+    assert executable is not None
+    verification_failed = False
+    try:
+        account = _active_account(host.config_dir, host.runner, executable)
+        if marker.get("account_id") != account.user_id:
+            raise ValueError("fresh GitHub login marker is expired or invalid")
+        principal = host.approvers.get(account.user_id)
+        if not isinstance(principal, str) or principal != operator_principal:
+            raise ValueError("GitHub account is not authorized for this model approval")
+
+        # Account readback is a network call: read the clock again so a marker that
+        # expired meanwhile is refused before it is spent, and judge the comment then.
+        now = host.clock()
+        now_timestamp = _utc_timestamp(now)
+        _require_fresh_marker(issued_at, now_timestamp)
+        # The fresh-login ceremony is one-use even if API readback fails.
+        _spend_marker(host.config_dir)
+        raw = _invoke(
+            host.runner,
+            [
+                str(executable),
+                "api",
+                "--hostname",
+                _GITHUB_HOST,
+                f"repos/{repository}/issues/comments/{comment_id}",
+            ],
+            env=_environment(host.config_dir),
+            capture_output=True,
+        )
+    except BaseException:
+        verification_failed = True
+        raise
+    finally:
+        # Once the CLI has been used, this ceremony is over whatever the outcome.
+        # Do not let best-effort local credential disposal replace the failure that
+        # caused verification to abort. On a successful readback, disposal remains
+        # mandatory and any failure is reported to the caller. The flag is explicit
+        # because sys.exception() is also set when a caller invokes verify() from
+        # inside its own except block, which would wrongly swallow a success-path failure.
+        try:
+            _discard_cli_credentials(host.config_dir)
+        except BaseException:
+            if not verification_failed:
+                raise
+    comment = _json_object(raw, error="GitHub comment readback is invalid")
+    user = comment.get("user")
+    if (
+        comment.get("id") != comment_id
+        or comment.get("html_url") != evidence_ref
+        or not isinstance(user, dict)
+        or user.get("id") != account.user_id
+        or comment.get("body") != expected_body
+        or comment.get("created_at") != comment.get("updated_at")
+    ):
+        raise ValueError("GitHub comment does not prove the exact human approval")
+    approved_at = _created_at(comment.get("created_at"))
+    approved_timestamp = _utc_timestamp(approved_at)
+    if approved_timestamp < issued_at:
+        raise ValueError("GitHub approval comment predates the fresh login")
+    if approved_timestamp > now_timestamp:
+        raise ValueError("GitHub approval comment is from the future")
+    expires_at = min(
+        approved_at + _FRESH_TTL,
+        datetime.fromtimestamp(review_expires_at, tz=UTC),
+    )
+    if _utc_timestamp(expires_at) <= now_timestamp:
+        raise ValueError("GitHub approval comment is expired")
+    return CeremonyEvidence(principal, approved_at, expires_at)
+
+
 @dataclass(frozen=True, slots=True)
 class GitHubCliModelApprovalVerifier:
     """Verify fresh isolated-gh login plus an exact unedited operator comment."""
@@ -400,92 +517,19 @@ class GitHubCliModelApprovalVerifier:
 
     def verify(self, intent: ModelLaunchIntent, evidence_ref: str) -> VerifiedModelApproval:
         """Spend fresh login evidence and translate an exact comment into P5 facts."""
-        repository, _issue, comment_id = _comment_reference(evidence_ref)
-        if repository != self.repository:
-            raise ValueError("model approval comment targets another repository")
-        _environment(self.config_dir)
-        now = self.clock()
-        now_timestamp = _utc_timestamp(now)
-        if _spent_marker_path(self.config_dir).exists():
-            raise ValueError("fresh GitHub login marker is already spent")
-        marker = _load_json(_marker_path(self.config_dir))
-        if not isinstance(marker, dict) or marker.get("schema") != 1:
-            raise ValueError("fresh GitHub login marker is invalid")
-        issued_at = _require_fresh_marker(marker.get("issued_at"), now_timestamp)
-        executable = self.gh_executable
-        assert executable is not None
-        verification_failed = False
-        try:
-            account = _active_account(self.config_dir, self.runner, executable)
-            if marker.get("account_id") != account.user_id:
-                raise ValueError("fresh GitHub login marker is expired or invalid")
-            principal = self.approvers.get(account.user_id)
-            if not isinstance(principal, str) or principal != intent.operator_principal:
-                raise ValueError("GitHub account is not authorized for this model approval")
-
-            # Account readback is a network call: read the clock again so a marker that
-            # expired meanwhile is refused before it is spent, and judge the comment then.
-            now = self.clock()
-            now_timestamp = _utc_timestamp(now)
-            _require_fresh_marker(issued_at, now_timestamp)
-            # The fresh-login ceremony is one-use even if API readback fails.
-            _spend_marker(self.config_dir)
-            raw = _invoke(
-                self.runner,
-                [
-                    str(executable),
-                    "api",
-                    "--hostname",
-                    _GITHUB_HOST,
-                    f"repos/{repository}/issues/comments/{comment_id}",
-                ],
-                env=_environment(self.config_dir),
-                capture_output=True,
-            )
-        except BaseException:
-            verification_failed = True
-            raise
-        finally:
-            # Once the CLI has been used, this ceremony is over whatever the outcome.
-            # Do not let best-effort local credential disposal replace the failure that
-            # caused verification to abort. On a successful readback, disposal remains
-            # mandatory and any failure is reported to the caller. The flag is explicit
-            # because sys.exception() is also set when a caller invokes verify() from
-            # inside its own except block, which would wrongly swallow a success-path failure.
-            try:
-                _discard_cli_credentials(self.config_dir)
-            except BaseException:
-                if not verification_failed:
-                    raise
-        comment = _json_object(raw, error="GitHub comment readback is invalid")
-        user = comment.get("user")
-        if (
-            comment.get("id") != comment_id
-            or comment.get("html_url") != evidence_ref
-            or not isinstance(user, dict)
-            or user.get("id") != account.user_id
-            or comment.get("body") != approval_body(intent)
-            or comment.get("created_at") != comment.get("updated_at")
-        ):
-            raise ValueError("GitHub comment does not prove the exact human approval")
-        approved_at = _created_at(comment.get("created_at"))
-        approved_timestamp = _utc_timestamp(approved_at)
-        if approved_timestamp < issued_at:
-            raise ValueError("GitHub approval comment predates the fresh login")
-        if approved_timestamp > now_timestamp:
-            raise ValueError("GitHub approval comment is from the future")
-        expires_at = min(
-            approved_at + _FRESH_TTL,
-            datetime.fromtimestamp(intent.preview_payload()["review_expires_at"], tz=UTC),
+        evidence = verify_comment_ceremony(
+            self,
+            evidence_ref=evidence_ref,
+            operator_principal=intent.operator_principal,
+            expected_body=approval_body(intent),
+            review_expires_at=intent.preview_payload()["review_expires_at"],
         )
-        if _utc_timestamp(expires_at) <= now_timestamp:
-            raise ValueError("GitHub approval comment is expired")
         return VerifiedModelApproval(
             approval_id=evidence_ref,
-            operator_principal=principal,
+            operator_principal=evidence.principal,
             task_id=str(intent.preview_payload()["task_id"]),
             request_digest=intent.preview_digest(),
-            approved_at=approved_at,
-            expires_at=expires_at,
+            approved_at=evidence.approved_at,
+            expires_at=evidence.expires_at,
             evidence_ref=evidence_ref,
         )
