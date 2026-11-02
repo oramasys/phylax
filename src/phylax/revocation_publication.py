@@ -217,7 +217,8 @@ def verify_state(
         if set(document) != {"body", "signature", "issuer_key_id"} or set(body) != set(_STATE_FIELDS):
             raise _refuse("publication.malformed")
         wire.validate_key_id(key_id)
-        if body["schema_version"] != wire.SCHEMA_VERSION:
+        schema = body["schema_version"]
+        if isinstance(schema, bool) or not isinstance(schema, int) or schema != wire.SCHEMA_VERSION:
             raise _refuse("publication.malformed")
         generated = wire.parse_timestamp(body["generated_at"])
         grants, approvals = body["revoked_grants"], body["revoked_approvals"]
@@ -230,9 +231,11 @@ def verify_state(
             raise _refuse("publication.malformed")
         cascade_grants = _cascade_grants(body["cascades"])
         head = body["head_version"]
-        if isinstance(head, bool) or not isinstance(head, int) or head < 0:
+        if isinstance(head, bool) or not isinstance(head, int) or not 0 <= head <= wire.MAX_SAFE_INTEGER:
             raise _refuse("publication.malformed")
         if not wire._is_digest(body["head_event_digest"]):
+            raise _refuse("publication.malformed")
+        if (head == 0) != (body["head_event_digest"] == wire.GENESIS_EVENT_DIGEST):
             raise _refuse("publication.malformed")
     except PublicationRefused:
         raise
@@ -319,9 +322,11 @@ def verify_state_against_chain(
     correct head but a dropped revocation is ``publication.head_mismatch``.
     """
     if state.head_version == 0:
-        if events:
+        if events or state.head_event_digest != wire.GENESIS_EVENT_DIGEST:
             raise _refuse("publication.head_mismatch")
     else:
+        if not events or events[0].get("version") != 1:
+            raise _refuse("publication.head_mismatch")
         tip = verify_chain(events, previous_digest=wire.GENESIS_EVENT_DIGEST, resolver=resolver)
         if len(events) != state.head_version or tip != state.head_event_digest:
             raise _refuse("publication.head_mismatch")

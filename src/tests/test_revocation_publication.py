@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -63,6 +64,51 @@ class Resolver:
     def public_key(self, key_id: str) -> bytes | None:
         """Return the key or None."""
         return crypto_sign_seed_keypair(SEED)[0] if key_id == "key-1" else None
+
+
+@pytest.mark.parametrize("bad_genesis", [False, True])
+def test_state_chain_requires_exact_genesis_boundary(parts, bad_genesis) -> None:
+    """A signed summary cannot relabel version 2 as head 1 or invent a genesis digest."""
+    store, _ledger, feed, signer = parts
+    head = load(store, signer, [("grant", "g1")], [])
+    document = json.loads(build_state(feed, issuer_id=ISSUER, head_version=head,
+                                     signer=signer, now=NOW))
+    if bad_genesis:
+        events = []
+        document["body"].update(head_version=0, revoked_grants=[],
+                                head_event_digest=wire.GENESIS_EVENT_DIGEST)
+    else:
+        event = feed.events(1, head)[0]
+        event["version"] = 2
+        event["event_digest"] = wire.event_digest(
+            2, event["kind"], event["body"], event["previous_event_digest"])
+        event["signature"] = wire.sign_event(SEED, event["event_digest"])
+        events = [event]
+        document["body"]["head_event_digest"] = event["event_digest"]
+    document["signature"] = sign_state_body(SEED, document["body"])
+    state = verify_state(wire.canonical_bytes(document), resolver=Resolver(),
+                         issuer_id=ISSUER, now=NOW)
+    if bad_genesis:
+        state = replace(state, head_event_digest="a" * 64)
+    with pytest.raises(PublicationRefused, match="publication.head_mismatch"):
+        verify_state_against_chain(state, events, resolver=Resolver())
+
+
+@pytest.mark.parametrize("overrides", [
+    {"schema_version": True}, {"schema_version": 1.0},
+    {"head_version": wire.MAX_SAFE_INTEGER + 1, "head_event_digest": "a" * 64},
+    {"head_version": 0, "head_event_digest": "a" * 64},
+    {"head_version": 1, "head_event_digest": wire.GENESIS_EVENT_DIGEST},
+])
+def test_state_rejects_noninteger_schema_unsafe_head_and_inconsistent_genesis(parts, overrides) -> None:
+    """Signature validity cannot relax the closed wire's integer and genesis constraints."""
+    _store, _ledger, feed, signer = parts
+    document = json.loads(build_state(feed, issuer_id=ISSUER, head_version=0,
+                                     signer=signer, now=NOW))
+    document["body"].update(overrides)
+    document["signature"] = sign_state_body(SEED, document["body"])
+    with pytest.raises(PublicationRefused, match="publication.malformed"):
+        verify_state(wire.canonical_bytes(document), resolver=Resolver(), issuer_id=ISSUER, now=NOW)
 
 
 @pytest.fixture
