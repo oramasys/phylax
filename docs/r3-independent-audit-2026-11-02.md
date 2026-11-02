@@ -150,3 +150,29 @@ in a full Phylax rerun. This is attributed parent evidence, not a run by this au
 - **Human/operator gates:** GitHub evidence remains procedural, not independently attested MFA.
   D1 inert-only scope, Part 3 ratification, independent exact-head security review, deployment
   isolation, release generation/pins and separate activation remain outside this patch.
+
+## 2026-11-03 integration successor
+
+The original audit above concerns `36f67b9` plus the bounded repairs. The primary
+integrator subsequently preserved Windows' existing PR #30 primitives through
+regular merge `c4893ce441f622a72ed8cc338175e4098680c658`, without rebasing either
+author's work. This PR now carries both the reviewed platform abstraction and
+the R3 authority repairs; no duplicate review branch is needed.
+
+Primary-run integrated verification on macOS, Python 3.12.11:
+
+```sh
+PYTHONPATH=src "$QUALIFICATION_PYTHON" -m pytest src/tests -q --tb=short
+```
+
+Result: **982 passed, 1 platform skip**, **92.62%** coverage, required 80% gate
+passed. Earlier 971-test/93.51% receipts above remain historical. This does not
+relabel macOS as a Windows execution or satisfy independent R6 release review.
+
+The platform abstraction is present, but existing caller migration intentionally
+follows the Windows handoff's requested order: publish the complete R3 candidate,
+obtain the independent review, then port the existing lock/durability sites and
+re-run actual Windows qualification. Unconditional `fcntl` imports in those
+callers are still an open compatibility gate. No no-op locking fallback,
+credential transfer, live issuer, repin, serving activation or real effect has
+been introduced.
