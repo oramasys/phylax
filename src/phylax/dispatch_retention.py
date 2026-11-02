@@ -15,10 +15,11 @@ The contract is ``docs/e1-c2-retention-and-checkpoints.md``.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import sqlite3
-from collections.abc import Mapping, Sequence
-from contextlib import closing
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,7 @@ from .dispatch_permit_store import (
 )
 from .sqlite_wal import enable_wal
 
+_EVENTS_ATTEMPTS = 3
 _EVENT_FIELDS = (
     "version", "kind", "body", "previous_event_digest", "event_digest", "issuer_key_id",
     "signature",
@@ -129,7 +131,13 @@ def checkpoint_from_event(event: Mapping[str, object]) -> Checkpoint:
 
 
 def verify_checkpoint(checkpoint: Checkpoint, resolver: IssuerKeyResolver) -> None:
-    """Verify the issuer signature over the checkpoint digest or raise :class:`RetentionRefused`."""
+    """Verify the issuer signature over the checkpoint digest or raise :class:`RetentionRefused`.
+
+    This authenticates the *digest only*. The signature does not cover ``version``, so a bare
+    checkpoint can never prove which version it belongs to; use
+    :func:`verify_checkpoint_against_event` (or :func:`verify_chain`, which recomputes every digest
+    from the body) whenever the version matters.
+    """
     key = resolver.public_key(checkpoint.issuer_key_id)
     if key is None:
         raise RetentionRefused("retention.unknown_key")
@@ -139,6 +147,27 @@ def verify_checkpoint(checkpoint: Checkpoint, resolver: IssuerKeyResolver) -> No
         raise RetentionRefused("retention.signature_invalid") from error
     if not valid:
         raise RetentionRefused("retention.signature_invalid")
+
+
+def verify_checkpoint_against_event(
+    checkpoint: Checkpoint, event: Mapping[str, object], resolver: IssuerKeyResolver
+) -> None:
+    """Bind ``checkpoint.version`` to the issuer signature by recomputing the digest from ``event``.
+
+    The event digest commits to version, kind, body and the previous digest, so a checkpoint whose
+    version, digest or signature differs from the event it claims to summarise is refused.
+    """
+    _require_event_shape(event)
+    version = int(event["version"])  # type: ignore[call-overload]
+    try:
+        digest = wire.event_digest(
+            version, str(event["kind"]), event["body"], str(event["previous_event_digest"])  # type: ignore[arg-type]
+        )
+    except wire.WireError as error:
+        raise RetentionRefused("retention.malformed_event") from error
+    if checkpoint.version != version or checkpoint.event_digest != digest or digest != event["event_digest"]:
+        raise RetentionRefused("retention.chain_broken")
+    verify_checkpoint(checkpoint, resolver)
 
 
 def _require_event_shape(event: Mapping[str, object]) -> None:
@@ -197,6 +226,24 @@ def _valid_consumer_id(consumer_id: object) -> str:
     except wire.WireError as error:
         raise RetentionRefused("retention.consumer_invalid") from error
     return str(consumer_id)
+
+
+@contextmanager
+def _retention_lock(ledger: RetentionLedger) -> Iterator[None]:
+    """Hold an exclusive advisory lock shared by pruning and retained revocation appends.
+
+    The frozen store takes its own hot write lock inside ``append_revocation``, so a lock cannot be
+    held across the archive lookup and that append from outside it. Serialising on a sibling lock
+    file (taken before any hot lock by both parties, so no lock-order cycle) closes the window in
+    which a prune moves a revocation out of the hot table between the two duplicate checks.
+    """
+    lock_path = ledger.path.with_name(ledger.path.name + ".lock")
+    with open(lock_path, "a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 class RetentionLedger:
@@ -392,7 +439,7 @@ def prune(
     reference = operator.authorize("retention.prune", attempt_id="retention-prune", grant_id=None)
     if not isinstance(reference, str) or not reference.strip():
         raise OperatorRefused("operator is not authorized to prune")
-    with closing(sqlite3.connect(store.path, timeout=5.0, isolation_level=None)) as hot:
+    with _retention_lock(ledger), closing(sqlite3.connect(store.path, timeout=5.0, isolation_level=None)) as hot:
         hot.row_factory = sqlite3.Row
         hot.execute("PRAGMA synchronous = FULL")
         hot.execute("BEGIN IMMEDIATE")
@@ -472,16 +519,19 @@ class RetainedEventFeed:
         """Return events low..high inclusive from both tiers, or refuse if any is unavailable."""
         if low < 1 or high < low:
             raise RetentionRefused("retention.range_unavailable")
-        hot_low = self._hot_low()
-        boundary = (hot_low if hot_low is not None else high + 1)
-        out: list[dict[str, object]] = []
-        if low < boundary:
-            out.extend(self._ledger.archived_events(low, min(high, boundary - 1)))
-        if high >= boundary:
-            out.extend(self._store.events(max(low, boundary), high))
-        if [int(e["version"]) for e in out] != list(range(low, high + 1)):  # type: ignore[call-overload]
-            raise RetentionRefused("retention.range_unavailable")
-        return out
+        for _ in range(_EVENTS_ATTEMPTS):
+            hot_low = self._hot_low()
+            boundary = (hot_low if hot_low is not None else high + 1)
+            out: list[dict[str, object]] = []
+            if low < boundary:
+                out.extend(self._ledger.archived_events(low, min(high, boundary - 1)))
+            if high >= boundary:
+                out.extend(self._store.events(max(low, boundary), high))
+            if [int(e["version"]) for e in out] == list(range(low, high + 1)):  # type: ignore[call-overload]
+                return out
+            if self._hot_low() == hot_low:
+                break  # the boundary did not move, so the range really is unavailable
+        raise RetentionRefused("retention.range_unavailable")
 
     def checkpoint(self, version: int) -> Checkpoint:
         """Return the issuer-signed checkpoint at ``version`` from whichever tier holds it."""
@@ -501,8 +551,14 @@ class RetainedEventFeed:
         hot_low = self._hot_low()
         if span is None or hot_low is None:
             return
-        if hot_low != span[1] + 1:
+        if hot_low > span[1] + 1:
             raise RetentionRefused("retention.archive_gap")
+        if hot_low <= span[1]:
+            # Supported crash state: rows archived but not yet deleted from the hot store. The
+            # archive is already verified from genesis, so the overlap must match it byte for byte.
+            if self._store.events(hot_low, span[1]) != self._ledger.archived_events(hot_low, span[1]):
+                raise RetentionRefused("retention.archive_conflict")
+            return
         anchor = self._store.events(hot_low, hot_low)
         verify_chain(anchor, previous_digest=tail, resolver=resolver)
 
@@ -515,8 +571,12 @@ def append_revocation_once(
 
     The frozen store looks for a duplicate only in the hot table; after a prune the original may
     live in the archive, so this wrapper consults the archive first and keeps idempotence intact.
+    It shares one advisory lock with :func:`prune`, so a prune cannot move the original between the
+    archive check and the append. Callers that bypass this wrapper and call the store directly are
+    outside that guarantee (the store is frozen and cannot take the lock itself).
     """
-    archived = ledger.find_revocation(subject_kind, subject_id)
-    if archived is not None:
-        return archived
-    return store.append_revocation(subject_kind, subject_id, signer=signer)  # type: ignore[arg-type]
+    with _retention_lock(ledger):
+        archived = ledger.find_revocation(subject_kind, subject_id)
+        if archived is not None:
+            return archived
+        return store.append_revocation(subject_kind, subject_id, signer=signer)  # type: ignore[arg-type]

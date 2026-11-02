@@ -43,3 +43,10 @@ the archive from genesis and its link to the hot anchor.
   only cause an earlier move to the archive, never a discard.
 * Moving the archive to a separate durable medium and the seven-year retention owner remain
   operator decisions; this module provides the append-only interface and the continuity proof.
+
+## Review-driven clarifications (2026-11-02)
+
+- **A bare checkpoint authenticates the digest only.** The issuer signature covers the event digest, not the `version` field, so `verify_checkpoint(Checkpoint)` cannot prove a version. `verify_checkpoint_against_event` recomputes the digest from the full event and is the check to use whenever the version matters; `verify_chain` already does this for every event.
+- **Reads are consistent across a concurrent prune.** `RetainedEventFeed.events` re-reads the hot boundary and retries (three attempts) when it moved during the read; it still refuses a range that is genuinely unavailable.
+- **Prune and retained revocation append share one advisory lock** (`<ledger>.lock`, POSIX `flock`), taken before any hot lock, so a prune cannot move a revocation between the archive check and the append. Code that calls the frozen store's `append_revocation` directly is outside this guarantee.
+- **Overlapping tiers are an intact crash state.** `verify_continuity` accepts hot rows that are still present after being archived when they match the archive byte for byte, and refuses them otherwise.

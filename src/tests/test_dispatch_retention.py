@@ -27,6 +27,7 @@ from phylax.dispatch_retention import (
     prune_ceiling,
     verify_chain,
     verify_checkpoint,
+    verify_checkpoint_against_event,
 )
 
 NOW = datetime(2026, 11, 2, 4, 0, 0, tzinfo=UTC)
@@ -381,3 +382,101 @@ def test_archive_verification_from_genesis_detects_gap(ledger, store, signer) ->
         ledger.verify_archive(Resolver())
     assert caught.value.code == "retention.archive_gap"
     assert events
+
+
+def test_bare_checkpoint_does_not_bind_version_but_event_check_does(store, signer) -> None:
+    """A changed version passes the digest-only check yet is refused against the event."""
+    event = fill(store, signer, 2)[1]
+    real = checkpoint_from_event(event)
+    forged = replace(real, version=200)
+    verify_checkpoint(forged, Resolver())  # digest-only: documented as insufficient for the version
+    verify_checkpoint_against_event(real, event, Resolver())
+    for bad in (forged, replace(real, event_digest="0" * 64)):
+        with pytest.raises(RetentionRefused) as caught:
+            verify_checkpoint_against_event(bad, event, Resolver())
+        assert caught.value.code in {"retention.chain_broken", "retention.signature_invalid"}
+
+
+def test_events_retries_when_pruning_moves_the_boundary_mid_read(store, ledger, signer) -> None:
+    """A prune landing between the boundary read and the hot read must not yield a false refusal."""
+    events = setup_two_consumers(store, ledger, signer, acks=(6, 6))
+    feed = RetainedEventFeed(store, ledger)
+    real_low, calls = feed._hot_low, {"n": 0}
+
+    def racing_hot_low():
+        value = real_low()
+        calls["n"] += 1
+        if calls["n"] == 1:  # stale boundary: the prune happens right after it was read
+            prune(store, ledger, Resolver(), operator=Operator(), now=NOW)
+        return value
+
+    feed._hot_low = racing_hot_low  # type: ignore[method-assign]
+    assert feed.events(2, 9) == events[1:9]
+
+
+def test_events_still_refuses_a_range_that_is_really_unavailable(store, ledger, signer) -> None:
+    """The retry does not mask a genuinely missing range."""
+    setup_two_consumers(store, ledger, signer, acks=(6, 6))
+    prune(store, ledger, Resolver(), operator=Operator(), now=NOW)
+    with pytest.raises(RetentionRefused) as caught:
+        RetainedEventFeed(store, ledger).events(8, 30)
+    assert caught.value.code == "retention.range_unavailable"
+
+
+def test_revocation_retry_after_prune_returns_the_original(store, ledger, signer) -> None:
+    """A retry that arrives after the original moved to the archive returns it, not a second event."""
+    events = setup_two_consumers(store, ledger, signer, acks=(6, 6))
+    prune(store, ledger, Resolver(), operator=Operator(), now=NOW)
+    again = append_revocation_once(store, ledger, "grant", "g-0", signer=signer)
+    assert again == events[0] and hot_versions(store)[0] == 6
+
+
+def test_prune_and_revocation_append_serialise_on_one_lock(store, ledger, signer) -> None:
+    """While a prune holds the retention lock a concurrent append waits rather than interleaving."""
+    import threading
+
+    from phylax import dispatch_retention as dr
+
+    order: list[str] = []
+    events = setup_two_consumers(store, ledger, signer, acks=(6, 6))
+    started, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with dr._retention_lock(ledger):
+            started.set()
+            release.wait(5)
+            order.append("holder-done")
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    started.wait(5)
+    appender = threading.Thread(
+        target=lambda: (append_revocation_once(store, ledger, "grant", "g-0", signer=signer), order.append("append-done"))
+    )
+    appender.start()
+    appender.join(0.3)
+    assert appender.is_alive() and order == []  # blocked on the lock
+    release.set()
+    thread.join(5)
+    appender.join(5)
+    assert order == ["holder-done", "append-done"]
+    assert events[0]["version"] == 1
+
+
+def test_continuity_accepts_the_crash_state_with_overlapping_tiers(store, ledger, signer) -> None:
+    """Rows archived but still hot are an intact state, not an archive gap."""
+    events = setup_two_consumers(store, ledger, signer, acks=(5, 5))
+    ledger.append_archive(events[:2], now=NOW)
+    RetainedEventFeed(store, ledger).verify_continuity(Resolver())
+
+
+def test_continuity_refuses_an_overlap_that_differs_from_the_archive(store, ledger, signer) -> None:
+    """Hot rows that disagree with their archived copy are refused, not waved through."""
+    events = setup_two_consumers(store, ledger, signer, acks=(5, 5))
+    ledger.append_archive(events[:2], now=NOW)
+    with closing(sqlite3.connect(store.path)) as db:
+        db.execute("DROP TRIGGER IF EXISTS issuer_events_no_update")
+        db.execute("UPDATE issuer_events SET body = '{\"x\":1}' WHERE version = 2")
+        db.commit()
+    with pytest.raises(RetentionRefused):
+        RetainedEventFeed(store, ledger).verify_continuity(Resolver())
