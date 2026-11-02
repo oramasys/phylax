@@ -176,3 +176,13 @@ re-run actual Windows qualification. Unconditional `fcntl` imports in those
 callers are still an open compatibility gate. No no-op locking fallback,
 credential transfer, live issuer, repin, serving activation or real effect has
 been introduced.
+
+### Pre-publication bot-review closure
+
+Commit `3e43d31` additionally closes the live #30 reviews: POSIX cross-directory
+replacement flushes both changed parents (a shared parent once); lock readiness
+and blocking waits are bounded and their children reaped; the reader test must
+observe both old and newly replaced complete contents. The cross-parent
+regression failed on the pre-fix code. Final primary full-suite run on macOS
+Python 3.12: **985 passed, 1 Windows-only skip, 92.63% coverage**. This supersedes
+the integrated 982-test count above without rewriting that historical receipt.
