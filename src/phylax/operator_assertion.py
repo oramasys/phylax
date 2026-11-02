@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS consumption_clock (
     observed_at TEXT NOT NULL
 );
 INSERT OR IGNORE INTO consumption_clock(slot, observed_at)
-    SELECT 1, MAX(consumed_at) FROM consumed_nonces HAVING MAX(consumed_at) IS NOT NULL;
+    SELECT 1, consumed_at FROM consumed_nonces ORDER BY consumed_at DESC LIMIT 1;
 CREATE TRIGGER IF NOT EXISTS registry_floor_forward_only BEFORE UPDATE ON registry_floor
 WHEN NEW.registry_version < OLD.registry_version
 BEGIN SELECT RAISE(ABORT, 'registry floor only moves forward'); END;
@@ -414,17 +414,20 @@ class OperatorAssertionVerifier:
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                commit_now = self._clock()
+                if commit_now.tzinfo is None or commit_now.utcoffset() is None:
+                    raise ValueError("clock must return an aware datetime")
                 floor = connection.execute("SELECT registry_version FROM registry_floor").fetchone()
                 if floor is None or registry_version < floor["registry_version"]:
                     raise OperatorAssertionRefused("operator.registry_rollback")
                 observed = connection.execute("SELECT observed_at FROM consumption_clock").fetchone()
-                if observed is not None and now < wire.parse_timestamp(observed["observed_at"]):
+                if observed is not None and commit_now < wire.parse_timestamp(observed["observed_at"]):
                     raise OperatorAssertionRefused("operator.clock_rollback")
                 # Retain the cleanup clock even after every older nonce has been deleted.
                 connection.execute(
                     "INSERT INTO consumption_clock(slot, observed_at) VALUES(1, ?)"
                     " ON CONFLICT(slot) DO UPDATE SET observed_at = excluded.observed_at",
-                    (wire.timestamp(now),),
+                    (wire.timestamp(commit_now),),
                 )
                 cutoff = wire.timestamp(
                     now - timedelta(seconds=MAX_ASSERTION_SECONDS + 2 * CLOCK_SKEW_SECONDS)

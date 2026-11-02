@@ -345,6 +345,45 @@ def test_consumption_clock_migrates_existing_nonce_history(env: Env) -> None:
             operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
 
 
+def test_consumption_clock_schema_uses_old_sqlite_compatible_seed_query() -> None:
+    """The durable clock migration avoids HAVING without GROUP BY for older SQLite hosts."""
+    from phylax.operator_assertion import _STATE_SCHEMA
+
+    assert "HAVING" not in _STATE_SCHEMA
+    assert "ORDER BY consumed_at DESC LIMIT 1" in _STATE_SCHEMA
+
+
+def test_overlapping_valid_calls_sample_clock_under_the_write_lock(tmp_path: Path) -> None:
+    """A later writer cannot make an earlier valid request look like clock rollback."""
+    registry = registry_bytes()
+    trust = crypto_sign_seed_keypair(TRUST_SEED)[0]
+    first_ticks = iter((NOW, NOW + timedelta(seconds=2)))
+    second_ticks = iter((NOW + timedelta(seconds=1), NOW + timedelta(seconds=1)))
+    first = OperatorAssertionVerifier(
+        state_path=tmp_path / "operator.db", trust_public_key=trust, audience=AUDIENCE,
+        registry_source=lambda: registry, clock=lambda: next(first_ticks),
+    )
+    second = OperatorAssertionVerifier(
+        state_path=tmp_path / "operator.db", trust_public_key=trust, audience=AUDIENCE,
+        registry_source=lambda: registry, clock=lambda: next(second_ticks),
+    )
+    commit = first._commit
+
+    def commit_after_second(
+        operator_id: str, nonce: str, expires_at: str, now: datetime, *, registry_version: int,
+    ) -> None:
+        """Commit another valid assertion between first-call validation and its write lock."""
+        second.verify_and_consume(
+            assertion(nonce="s" * 23), operation="abandon", attempt_id="attempt-1", grant_id="grant-1",
+        )
+        commit(operator_id, nonce, expires_at, now, registry_version=registry_version)
+
+    first._commit = commit_after_second  # type: ignore[method-assign]
+    assert first.verify_and_consume(
+        assertion(nonce="f" * 23), operation="abandon", attempt_id="attempt-1", grant_id="grant-1",
+    ).endswith("f" * 23)
+
+
 def test_process_exit_during_cleanup_rolls_back_clock_and_nonce_deletion(env: Env) -> None:
     """A process dying before nonce insert cannot commit cleanup or advance its clock."""
     env.call(assertion())
