@@ -6,12 +6,19 @@ POSIX uses only the standard library (``fcntl.flock``, ``os.fsync``).  Windows r
 fallback, no no-op lock, and no best-effort path: every primitive either does what it says or
 raises.
 
-Lock semantics (identical on both platforms)
+Lock semantics (shared by both platforms except where noted)
     * Both platforms exclude a second open file description / handle on the same file, including
       one in the same process.
     * ``blocking=False`` raises ``BlockingIOError`` when the lock is held elsewhere.
     * The lock is released by ``unlock``, by closing the file, or by the kernel when the holder
       process dies (including being killed).
+    * DIFFERENCE, same handle: POSIX ``flock`` converts a lock the handle already holds; Windows
+      does not.  Locking the same handle twice with ``blocking=True`` deadlocks on Windows, and
+      with ``blocking=False`` raises ``BlockingIOError``.  This is deliberately not emulated;
+      call sites must never relock a handle they already hold.
+    * ``unlock`` on a handle holding no lock is a silent no-op on both platforms.
+    * DIFFERENCE, deletion: on Windows a held lock file cannot be deleted or renamed, which is
+      stronger than POSIX unlink-and-recreate.  Do not rely on removing a lock file to break a lock.
     * Convention kept by all callers: lock a sibling lock file, never the data file itself,
       because Windows byte-range locks also block reads and writes of the locked range.
     * Windows locks the whole file range with ``LockFileEx``.  This overlaps byte 0, so it
@@ -102,10 +109,15 @@ if IS_WINDOWS:
                 _handle(target), _ALL_BYTES, _ALL_BYTES, pywintypes.OVERLAPPED()
             )
         except pywintypes.error as error:
+            if error.winerror == winerror.ERROR_NOT_LOCKED:
+                return
             raise OSError(errno.EIO, f"UnlockFileEx failed: {error.strerror}") from error
 
     def fsync_dir(path: str | os.PathLike[str]) -> None:
-        """Flush a directory handle with FlushFileBuffers; raise ``DirectoryFsyncError`` if denied."""
+        """Flush a directory handle with FlushFileBuffers; raise ``DirectoryFsyncError`` on failure.
+
+        Errors carry ENOENT (missing), ENOTDIR (a file path), EACCES (denied) or EIO.
+        """
         try:
             handle = win32file.CreateFile(
                 os.fspath(path),
@@ -117,12 +129,20 @@ if IS_WINDOWS:
                 None,
             )
         except pywintypes.error as error:
+            code = {
+                winerror.ERROR_ACCESS_DENIED: errno.EACCES,
+                winerror.ERROR_FILE_NOT_FOUND: errno.ENOENT,
+                winerror.ERROR_PATH_NOT_FOUND: errno.ENOENT,
+                winerror.ERROR_DIRECTORY: errno.ENOTDIR,
+            }.get(error.winerror, errno.EIO)
             raise DirectoryFsyncError(
-                errno.EACCES if error.winerror == winerror.ERROR_ACCESS_DENIED else errno.EIO,
+                code,
                 f"cannot open directory for flush: {error.strerror}",
                 os.fspath(path),
             ) from error
         try:
+            if not win32file.GetFileInformationByHandle(handle)[0] & win32con.FILE_ATTRIBUTE_DIRECTORY:
+                raise DirectoryFsyncError(errno.ENOTDIR, "not a directory", os.fspath(path))
             win32file.FlushFileBuffers(handle)
         except pywintypes.error as error:
             raise DirectoryFsyncError(

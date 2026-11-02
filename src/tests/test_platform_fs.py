@@ -125,6 +125,37 @@ def test_locked_context_manager_and_descriptor_target(tmp_path: Path) -> None:
         os.close(descriptor)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="POSIX flock converts a same-handle relock")
+def test_same_handle_nonblocking_relock_raises_on_windows(tmp_path: Path) -> None:
+    """Windows does not convert a held lock: a same-handle relock is refused, never granted."""
+    with open(tmp_path / "r.lock", "a+b") as handle:
+        fs.exclusive_lock(handle)
+        with pytest.raises(BlockingIOError):
+            fs.exclusive_lock(handle, blocking=False)
+        fs.unlock(handle)
+
+
+def test_unlock_without_lock_is_a_noop(tmp_path: Path) -> None:
+    """Unlocking a handle that holds nothing does not raise."""
+    with open(tmp_path / "n.lock", "a+b") as handle:
+        fs.unlock(handle)
+
+
+def test_fsync_dir_error_codes(tmp_path: Path) -> None:
+    """A missing directory is ENOENT and a regular file is ENOTDIR (typed on Windows)."""
+    import errno
+    plain = tmp_path / "plain"
+    plain.write_bytes(b"x")
+    with pytest.raises(OSError) as missing:
+        fs.fsync_dir(tmp_path / "nope")
+    assert missing.value.errno == errno.ENOENT
+    with pytest.raises(OSError) as notdir:
+        fs.fsync_dir(plain)
+    assert notdir.value.errno == errno.ENOTDIR
+    if sys.platform == "win32":
+        assert isinstance(missing.value, fs.DirectoryFsyncError)
+
+
 def test_blocking_lock_waits_for_release(tmp_path: Path) -> None:
     """A blocking acquire returns only after the child releases."""
     lock = tmp_path / "b.lock"
