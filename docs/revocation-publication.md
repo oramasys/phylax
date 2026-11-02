@@ -27,6 +27,9 @@ built state against it before replacing `state.json`.
   the base64url (unpadded) 64-byte signature. Canonical bytes only; closed fields; sorted,
   duplicate-free subject lists; cascades validated by the existing wire rule, and each cascade
   `version` a positive safe integer (1..2^53-1).
+  The state schema version must be the integer 1 (not a boolean or float); head versions are
+  integers in 0..2^53-1, with the genesis digest if and only if the head is zero. Chain cross-checks
+  require version 1 at the start, not merely a genesis digest link at an arbitrary version.
 * **Freshness.** A state older than 60 seconds (ADR 71 revocation freshness) or dated more than 5
   seconds ahead is `publication.stale`. `max_age_seconds` may only tighten this: values outside
   1..60 are refused by both `verify_state` and `CombinedRevocationLookup`. A consumer treats every `publication.*` refusal as
@@ -63,3 +66,11 @@ deliberately not made here.
 Which public medium hosts the artifacts, who owns the seven-year retention of the cold archive, and
 the consumer's polling cadence remain operator decisions. A directory medium is provided so the
 contract is testable without choosing one.
+
+The resolver must be scoped by trusted configuration to the expected issuer, including every event
+key in its feed. The current key-id-only resolver API does not enforce that association itself.
+`verify_state` is stateless and does not persist a reader's head, fork or time anchor;
+`CombinedRevocationLookup` also does not enforce that the caller ran the chain cross-check.
+Adapters must supply these protections before treating a clean result as complete/current authority.
+Both this module and retention currently require POSIX `fcntl` at import time; Windows import,
+locking and durable-directory semantics are an outstanding qualification gate.
