@@ -32,7 +32,9 @@ Durability caveats
       Microsoft does not document a directory-durability guarantee comparable to POSIX.  Opening
       a directory for flushing needs write access to it; where Windows denies that, a typed
       ``DirectoryFsyncError`` is raised instead of silently skipping.  ``replace_durably`` on
-      Windows relies on ``MOVEFILE_WRITE_THROUGH``, which returns only after the move is flushed.
+      Windows relies on ``MOVEFILE_WRITE_THROUGH`` (which returns only after the move is flushed)
+      and additionally flushes parent directories via ``fsync_dir`` (once when in the same
+      directory, and both parent directories when replacing across different directories).
 """
 
 from __future__ import annotations
@@ -152,7 +154,15 @@ if IS_WINDOWS:
             handle.Close()
 
     def replace_durably(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
-        """Atomically replace ``dst`` with ``src`` using MoveFileEx with write-through."""
+        """Atomically replace ``dst`` with ``src`` using MoveFileEx with write-through and directory fsync.
+
+        Intra-directory replacements rely on ``MOVEFILE_WRITE_THROUGH`` to ensure moved data is flushed
+        to disk and also flush the destination parent directory via ``fsync_dir``.  When ``src`` and
+        ``dst`` reside in different parent directories, both parent directories are flushed.  Note that
+        NTFS directory buffer flushing via ``FlushFileBuffers`` requires write access to the directory
+        and does not carry POSIX-equivalent durability guarantees, but flushes cached metadata where
+        permitted.
+        """
         try:
             win32file.MoveFileEx(
                 os.fspath(src),
@@ -162,6 +172,7 @@ if IS_WINDOWS:
         except pywintypes.error as error:
             # Same exception family as os.replace so callers need no new handling.
             raise OSError(None, error.strerror, os.fspath(src), error.winerror, os.fspath(dst)) from error
+        _flush_parents_after_replace(src, dst)
 
 else:
     import fcntl
@@ -186,10 +197,27 @@ else:
             os.close(descriptor)
 
     def replace_durably(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
-        """Atomically replace ``dst`` with ``src`` then fsync the parent directory."""
-        os.replace(src, dst)
-        fsync_dir(Path(dst).parent)
+        """Atomically replace ``dst`` with ``src`` then fsync parent directories.
 
+        When ``src`` and ``dst`` share the same parent directory, it is flushed once.
+        When replacing across different parent directories, both parent directories are flushed.
+        """
+        os.replace(src, dst)
+        _flush_parents_after_replace(src, dst)
+
+
+
+def _flush_parents_after_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+    """Flush destination directory, and also source directory when they differ."""
+    src_parent = Path(src).parent
+    dst_parent = Path(dst).parent
+    try:
+        same_dir = src_parent.resolve() == dst_parent.resolve()
+    except (OSError, RuntimeError):
+        same_dir = src_parent == dst_parent
+    fsync_dir(dst_parent)
+    if not same_dir:
+        fsync_dir(src_parent)
 
 def exclusive_lock(target: LockTarget, *, blocking: bool = True) -> None:
     """Take an exclusive lock on a file object or descriptor; BlockingIOError if busy and non-blocking."""

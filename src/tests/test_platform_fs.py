@@ -15,31 +15,61 @@ from phylax import platform_fs as fs
 
 _HOLDER = (
     "import sys\n"
+    "from pathlib import Path\n"
     "sys.path.insert(0, sys.argv[1])\n"
     "from phylax import platform_fs as fs\n"
     "f = open(sys.argv[2], 'a+b')\n"
     "(fs.exclusive_lock if sys.argv[3] == 'x' else fs.shared_lock)(f)\n"
+    "Path(sys.argv[4]).write_text('held')\n"
     "print('held', flush=True)\n"
     "sys.stdin.readline()\n"
 )
 
+_BLOCKER = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from phylax import platform_fs as fs\n"
+    "Path(sys.argv[3]).write_text('attempting')\n"
+    "with fs.locked(sys.argv[2]):\n"
+    "    Path(sys.argv[3]).write_text('acquired')\n"
+)
 
-def _spawn(path: Path, exclusive: bool) -> subprocess.Popen[str]:
-    """Start a child that holds a lock until its stdin yields a line; wait until it holds it."""
+
+def _spawn(path: Path, exclusive: bool, *, timeout: float = 10.0) -> subprocess.Popen[str]:
+    """Start a child that holds a lock until its stdin yields a line; wait with a deadline until it holds it."""
     src = str(Path(fs.__file__).resolve().parents[1])
+    marker = path.parent / f"{path.stem}_{time.monotonic_ns()}.ready"
+    if marker.exists():
+        marker.unlink()
     child = subprocess.Popen(
-        [sys.executable, "-c", _HOLDER, src, str(path), "x" if exclusive else "s"],
+        [sys.executable, "-c", _HOLDER, src, str(path), "x" if exclusive else "s", str(marker)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
     )
-    assert child.stdout is not None and child.stdout.readline().strip() == "held"
-    return child
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if marker.exists():
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            return child
+        if child.poll() is not None:
+            raise RuntimeError(f"child process exited prematurely with code {child.returncode}")
+        time.sleep(0.02)
+    child.kill()
+    child.wait(timeout=5)
+    raise TimeoutError(f"child did not acquire lock within {timeout}s deadline")
 
 
 def _release(child: subprocess.Popen[str]) -> None:
     """Let the child exit cleanly."""
     assert child.stdin is not None
-    child.stdin.write("\n")
-    child.stdin.flush()
+    try:
+        child.stdin.write("\n")
+        child.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
     child.wait(timeout=10)
 
 
@@ -160,12 +190,47 @@ def test_blocking_lock_waits_for_release(tmp_path: Path) -> None:
     """A blocking acquire returns only after the child releases."""
     lock = tmp_path / "b.lock"
     child = _spawn(lock, True)
+    marker = tmp_path / "b.marker"
+    src = str(Path(fs.__file__).resolve().parents[1])
+    blocker = subprocess.Popen(
+        [sys.executable, "-c", _BLOCKER, src, str(lock), str(marker)],
+        text=True,
+    )
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if marker.exists():
+            break
+        if blocker.poll() is not None:
+            pytest.fail(f"blocker exited prematurely with code {blocker.returncode}")
+        time.sleep(0.02)
+    else:
+        blocker.kill()
+        blocker.wait(timeout=5)
+        _release(child)
+        pytest.fail("blocker failed to start lock attempt within deadline")
+
     timer = threading.Timer(0.5, lambda: _release(child))
     timer.start()
     start = time.monotonic()
-    with fs.locked(lock):
-        assert time.monotonic() - start >= 0.3
-    timer.join()
+    try:
+        blocker.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        blocker.kill()
+        blocker.wait(timeout=5)
+        pytest.fail("blocker timed out waiting for lock release")
+    finally:
+        timer.join(timeout=5)
+        if blocker.poll() is None:
+            blocker.kill()
+            blocker.wait(timeout=5)
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+    elapsed = time.monotonic() - start
+    assert blocker.returncode == 0
+    assert elapsed >= 0.3
+    assert marker.read_text().strip() == "acquired"
 
 
 def test_fsync_dir_on_real_directory(tmp_path: Path) -> None:
@@ -182,18 +247,25 @@ def test_replace_durably_is_atomic_for_readers(tmp_path: Path) -> None:
     old, new = b"old" * 1000, b"new" * 1000
     dst.write_bytes(old)
     stop = threading.Event()
+    ready = threading.Event()
     seen: set[bytes] = set()
+    successful_reads = 0
 
     def reader() -> None:
         """Poll the destination, tolerating transient Windows sharing errors."""
+        nonlocal successful_reads
+        ready.set()
         while not stop.is_set():
             try:
-                seen.add(dst.read_bytes())
+                data = dst.read_bytes()
+                seen.add(data)
+                successful_reads += 1
             except PermissionError:
                 pass
 
     thread = threading.Thread(target=reader)
     thread.start()
+    assert ready.wait(timeout=5), "reader thread did not signal ready in time"
     try:
         for index in range(50):
             tmp = tmp_path / f"t{index}"
@@ -208,7 +280,10 @@ def test_replace_durably_is_atomic_for_readers(tmp_path: Path) -> None:
                 raise AssertionError("replace kept failing")
     finally:
         stop.set()
-        thread.join()
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "reader thread did not finish within deadline"
+    assert successful_reads > 0, "no successful reads occurred during replacements"
+    assert successful_reads >= 20, f"expected at least 20 successful reads, got {successful_reads}"
     assert seen <= {old, new}
     assert dst.read_bytes() == old
     assert not (tmp_path / "t0").exists()
@@ -218,3 +293,44 @@ def test_check_private_is_an_explicit_stub(tmp_path: Path) -> None:
     """The unimplemented ACL check raises instead of passing."""
     with pytest.raises(NotImplementedError):
         fs.check_private(tmp_path, "SECRET")
+
+
+
+def test_replace_durably_flushes_parent_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Flushing reaches one parent when equal and both parents when cross-directory."""
+    recorded: list[Path] = []
+
+    def record_fsync_dir(path: str | os.PathLike[str]) -> None:
+        """Record directory flush targets."""
+        recorded.append(Path(path))
+
+    monkeypatch.setattr(fs, "fsync_dir", record_fsync_dir)
+
+    same_dir = tmp_path / "same"
+    same_dir.mkdir()
+    src_same = same_dir / "src.txt"
+    dst_same = same_dir / "dst.txt"
+    src_same.write_bytes(b"content-same")
+    dst_same.write_bytes(b"old-same")
+
+    del recorded[:]
+    fs.replace_durably(src_same, dst_same)
+    assert len(recorded) == 1
+    assert recorded[0].resolve() == same_dir.resolve()
+
+    dir_a = tmp_path / "dir_a"
+    dir_b = tmp_path / "dir_b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    src_cross = dir_a / "src.txt"
+    dst_cross = dir_b / "dst.txt"
+    src_cross.write_bytes(b"content-cross")
+    dst_cross.write_bytes(b"old-cross")
+
+    del recorded[:]
+    fs.replace_durably(src_cross, dst_cross)
+    assert len(recorded) == 2
+    resolved_recorded = {p.resolve() for p in recorded}
+    assert resolved_recorded == {dir_a.resolve(), dir_b.resolve()}
