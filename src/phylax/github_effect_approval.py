@@ -137,4 +137,5 @@ def issue_with_github_approval(
     return authority.issue(
         request, authenticated_principal=authenticated_principal,
         operator_evidence_ref=evidence.evidence_ref,
+        approved_duration_seconds=APPROVED_DURATION_SECONDS,
     )

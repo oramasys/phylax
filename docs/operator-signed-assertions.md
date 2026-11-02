@@ -14,9 +14,11 @@ Code: `src/phylax/operator_assertion.py`; tests: `src/tests/test_operator_assert
   key to exactly one `(operation, attempt_id, grant_id)` for the verifier's `audience`, with a nonce,
   `issued_at` and `expires_at` at most 300 seconds apart (5 s clock-skew allowance).
 * **Verifier.** Holds public keys only; operator seeds never exist on the verifier host.
-  `authority_for(assertion)` returns a one-shot `OperatorAuthority` whose first matching call
-  consumes the nonce and returns `operator:<operator_id>:<nonce>` as the disposition reference, so
-  each recorded decision names a person. Any failure returns `None` and records a closed code.
+  `authority_for(assertion)` returns a one-shot `OperatorAuthority`. Its first `authorize` call is
+  its only call: a later call returns `None` with `operator.already_used`, even after a refusal.
+  If that call passes every check, it consumes the nonce and returns
+  `operator:<operator_id>:<nonce>` as the disposition reference, so each recorded decision names
+  a person. Any failure returns `None` and records a closed code.
 
 ## Guarantees and the checks that enforce them
 

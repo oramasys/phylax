@@ -14,6 +14,7 @@ from phylax.adjustment_grant import RotatingIssuerKeyring
 from phylax.effect_grant import EffectGrantAuthority, EffectGrantRequest
 from phylax.github_device_approval import MODEL_AUTH_MARKER
 from phylax.github_effect_approval import (
+    APPROVED_DURATION_SECONDS,
     ASSURANCE,
     GitHubCliEffectApprovalVerifier,
     effect_approval_body,
@@ -251,3 +252,24 @@ def test_body_requires_a_real_deadline() -> None:
     for bad in (0, -1, True, "5"):
         with pytest.raises(ValueError):
             effect_approval_body(request(), review_expires_at=bad)
+
+
+def test_grant_lifetime_is_the_human_approved_duration(parts, tmp_path) -> None:
+    """The grant lives exactly the duration the comment shows, not the authority's default."""
+    _authority, config, gh, store = parts
+    keyring = RotatingIssuerKeyring(key_id="issuer-1", seed_ref="seed-1", seed_provider=Seeds(), store=store)
+    authority = EffectGrantAuthority(
+        keyring=keyring,
+        p5_approval=P5ApprovalAuthority(
+            signing_key=b"p5", store=InMemoryP5ApprovalStore(), clock=lambda: NOW,
+            default_human_duration_seconds=3_600,
+        ),
+        clock=lambda: NOW,
+    )
+    req = request()
+    verifier, _runner = build_verifier(config, gh, [ACCOUNT, comment(effect_approval_body(req, review_expires_at=EXPIRES))])
+    grant = issue_with_github_approval(
+        authority, verifier, req, authenticated_principal="control-plane",
+        evidence_ref=EVIDENCE, review_expires_at=EXPIRES,
+    )
+    assert (grant.expires_at - grant.issued_at).total_seconds() == APPROVED_DURATION_SECONDS == 5_400

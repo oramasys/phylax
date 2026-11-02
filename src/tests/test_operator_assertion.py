@@ -215,6 +215,19 @@ def test_one_shot_authority_implements_the_port(env) -> None:
     assert bad.refusal == "operator.binding_mismatch"
 
 
+def test_a_refused_first_call_still_ends_the_authority(env) -> None:
+    """A mismatched first call is the only call: a matching retry on the same object is refused."""
+    raw = assertion()
+    authority = env.verifier.authority_for(raw)
+    assert authority.authorize("abort", attempt_id="attempt-1", grant_id="grant-1") is None
+    assert authority.refusal == "operator.binding_mismatch"
+    assert authority.authorize("abandon", attempt_id="attempt-1", grant_id="grant-1") is None
+    assert authority.refusal == "operator.already_used"
+    # The nonce was not consumed by the refusal, so a fresh authority can still use it.
+    assert env.verifier.authority_for(raw).authorize(
+        "abandon", attempt_id="attempt-1", grant_id="grant-1").startswith("operator:alice:")
+
+
 def test_concurrent_replays_consume_exactly_once(env) -> None:
     """Racing threads presenting one assertion: exactly one succeeds."""
     raw = assertion()

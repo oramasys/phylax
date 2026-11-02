@@ -13,15 +13,23 @@ truth table: `docs/vectors/revocation-lookup-v1.json`.
 | `state.json` | issuer-signed summary: head version and digest, issuer-revoked flag, revoked grants and approvals, cascades | replaced |
 
 The state is a *summary*, never the authority: it names the chain head, and a verifier cross-checks
-it with `verify_state_against_chain` against the signed, hash-linked feed. Segments are published
-before the state that names their head.
+it with `verify_state_against_chain` against the signed, hash-linked feed. That check compares the
+head and also replays the chain to require identical issuer flag, revoked grants, revoked approvals
+and cascade-listed grants. Segments are published before the state that names their head;
+`FeedPublisher.publish` verifies the retained chain before writing anything and cross-checks the
+built state against it before replacing `state.json`.
 
 ## Rules
 
-* **Signature and shape.** Ed25519ph under `phylax-revocation-state-v1`; canonical bytes only; closed
-  fields; sorted, duplicate-free subject lists; cascades validated by the existing wire rule.
+* **Signature and shape.** Ed25519ph (libsodium `crypto_sign_ed25519ph`) over the exact byte string
+  `phylax-revocation-state-v1\x00` (domain including its trailing NUL) followed by the canonical
+  JSON bytes of `body`; the envelope is canonical `{body, issuer_key_id, signature}` with `signature`
+  the base64url (unpadded) 64-byte signature. Canonical bytes only; closed fields; sorted,
+  duplicate-free subject lists; cascades validated by the existing wire rule, and each cascade
+  `version` a positive safe integer (1..2^53-1).
 * **Freshness.** A state older than 60 seconds (ADR 71 revocation freshness) or dated more than 5
-  seconds ahead is `publication.stale`. A consumer treats every `publication.*` refusal as
+  seconds ahead is `publication.stale`. `max_age_seconds` may only tighten this: values outside
+  1..60 are refused by both `verify_state` and `CombinedRevocationLookup`. A consumer treats every `publication.*` refusal as
   *revoked/unavailable*, never as "nothing revoked".
 * **Read-back.** `FeedPublisher` reads every artifact back from the medium and compares bytes. A
   medium that drops, corrupts or fails is `publication.unavailable` / `publication.readback_mismatch`.

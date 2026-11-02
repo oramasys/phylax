@@ -394,3 +394,81 @@ def test_lookup_expires_with_its_state(parts, tmp_path: Path) -> None:
     short = CombinedRevocationLookup(state, clock=lambda: NOW + timedelta(seconds=10), max_age_seconds=5)
     with pytest.raises(PublicationRefused):
         short.reason("clean", "")
+
+
+def _resign(raw: bytes, mutate) -> bytes:
+    """Return a correctly signed state whose body was changed by ``mutate``."""
+    document = json.loads(raw)
+    mutate(document["body"])
+    document["signature"] = sign_state_body(SEED, document["body"])
+    return wire.canonical_bytes(document)
+
+
+def test_chain_cross_check_covers_the_summary_sets(parts) -> None:
+    """A correct head with a dropped revocation, or a head-0 state with revocations, is refused."""
+    store, _ledger, feed, signer = parts
+    head = load(store, signer, [("grant", "g1"), ("grant", "g2")], [("a1", ["g3"])])
+    raw = build_state(feed, issuer_id=ISSUER, head_version=head, signer=signer, now=NOW)
+    events = feed.events(1, head)
+    for mutate in (
+        lambda b: b.update(revoked_grants=["g2"]),
+        lambda b: b.update(issuer_revoked=True),
+        lambda b: b.update(revoked_approvals=["a9"]),
+        lambda b: b.update(cascades=[]),
+    ):
+        forged = verify_state(_resign(raw, mutate), resolver=Resolver(), issuer_id=ISSUER, now=NOW)
+        with pytest.raises(PublicationRefused) as caught:
+            verify_state_against_chain(forged, events, resolver=Resolver())
+        assert caught.value.code == "publication.head_mismatch"
+    empty = build_state(feed, issuer_id=ISSUER, head_version=0, signer=signer, now=NOW)
+    forged_empty = verify_state(_resign(empty, lambda b: b.update(revoked_grants=["x"])),
+                                resolver=Resolver(), issuer_id=ISSUER, now=NOW)
+    with pytest.raises(PublicationRefused) as caught:
+        verify_state_against_chain(forged_empty, [], resolver=Resolver())
+    assert caught.value.code == "publication.head_mismatch"
+
+
+@pytest.mark.parametrize("version", [0, -1, True, 1.5, "1", 2**53])
+def test_cascade_version_must_be_a_positive_safe_integer(parts, version) -> None:
+    """A signed state whose cascade version is not a positive safe integer is malformed."""
+    store, _ledger, feed, signer = parts
+    head = load(store, signer, [], [("a1", ["g1"])])
+    raw = build_state(feed, issuer_id=ISSUER, head_version=head, signer=signer, now=NOW)
+    forged = _resign(raw, lambda b: b["cascades"][0].update(version=version))
+    with pytest.raises(PublicationRefused) as caught:
+        verify_state(forged, resolver=Resolver(), issuer_id=ISSUER, now=NOW)
+    assert caught.value.code == "publication.malformed"
+
+
+@pytest.mark.parametrize("age", [0, 61, 3600, True, 30.0])
+def test_freshness_ceiling_cannot_be_loosened(parts, age) -> None:
+    """Neither verify_state nor the lookup accepts an age limit outside 1..60 seconds."""
+    _store, _ledger, feed, signer = parts
+    raw = build_state(feed, issuer_id=ISSUER, head_version=0, signer=signer, now=NOW)
+    with pytest.raises(ValueError):
+        verify_state(raw, resolver=Resolver(), issuer_id=ISSUER, now=NOW, max_age_seconds=age)
+    state = verify_state(raw, resolver=Resolver(), issuer_id=ISSUER, now=NOW)
+    with pytest.raises(ValueError):
+        CombinedRevocationLookup(state, clock=lambda: NOW, max_age_seconds=age)
+
+
+def test_publish_verifies_the_chain_before_writing_anything(parts, tmp_path) -> None:
+    """A corrupted retained event stops publication before any segment or state is written."""
+    store, _ledger, feed, signer = parts
+    head = load(store, signer, [("grant", "g1"), ("grant", "g2")], [])
+
+    class Corrupt:
+        """Feed double returning a tampered first event."""
+
+        def events(self, low, high):
+            """Return the real events with event 1's subject changed."""
+            out = [json.loads(json.dumps(e)) for e in feed.events(low, high)]
+            if out and out[0]["version"] == 1:
+                out[0]["body"]["subject_id"] = "forged"
+            return out
+
+    medium = DirectoryMedium(tmp_path / "public")
+    publisher = FeedPublisher(Corrupt(), medium, Resolver(), issuer_id=ISSUER, signer=signer, clock=lambda: NOW)
+    with pytest.raises(PublicationRefused):
+        publisher.publish(head)
+    assert [p.name for p in (tmp_path / "public").iterdir() if not p.name.startswith(".")] == []

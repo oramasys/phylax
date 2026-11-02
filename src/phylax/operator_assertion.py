@@ -427,7 +427,12 @@ class OperatorAssertionVerifier:
 
 
 class AssertionAuthority:
-    """One-shot ``OperatorAuthority``: the first matching call consumes the assertion."""
+    """One-shot ``OperatorAuthority``: the first ``authorize`` call is its only call.
+
+    Any later call returns None with ``operator.already_used``, even when the first call was refused
+    (for example ``operator.binding_mismatch``); build a new authority to retry. The nonce itself is
+    consumed only when that first call passes every check.
+    """
 
     def __init__(self, verifier: OperatorAssertionVerifier, raw_assertion: bytes) -> None:
         """Hold the assertion bytes; nothing is verified until ``authorize`` is called."""

@@ -112,11 +112,14 @@ def _verify_state_signature(public_key: bytes, body: Mapping[str, object], signa
         return False
 
 
-def build_state(
-    feed: RetainedEventFeed, *, issuer_id: str, head_version: int, signer: StateSigner, now: datetime
-) -> bytes:
-    """Replay events 1..head into closed sets and return the signed state envelope bytes."""
-    events = feed.events(1, head_version) if head_version >= 1 else []
+def _replay(
+    events: Sequence[Mapping[str, object]], *, issuer_id: str
+) -> tuple[bool, set[str], set[str], list[dict[str, object]]]:
+    """Replay signed events into the issuer flag, revoked sets and cascade list.
+
+    ``build_state`` and ``verify_state_against_chain`` share this, so a summary is always judged by
+    the same rule that produced it.
+    """
     grants: set[str] = set()
     approvals: set[str] = set()
     issuer_revoked = False
@@ -124,7 +127,7 @@ def build_state(
     for event in events:
         body = event["body"]
         if event["kind"] == "revocation":
-            kind, subject = body["subject_kind"], body["subject_id"]
+            kind, subject = body["subject_kind"], body["subject_id"]  # type: ignore[index]
             if kind == "grant":
                 grants.add(subject)
             elif kind == "approval":
@@ -133,10 +136,19 @@ def build_state(
                 issuer_revoked = True
         elif event["kind"] == "cascade":
             cascades.append({
-                "version": event["version"], "approval_id": body["approval_id"],
-                "issuer_authority_version": body["issuer_authority_version"],
-                "grant_ids": list(body["grant_ids"]),
+                "version": event["version"], "approval_id": body["approval_id"],  # type: ignore[index]
+                "issuer_authority_version": body["issuer_authority_version"],  # type: ignore[index]
+                "grant_ids": list(body["grant_ids"]),  # type: ignore[index]
             })
+    return issuer_revoked, grants, approvals, cascades
+
+
+def build_state(
+    feed: RetainedEventFeed, *, issuer_id: str, head_version: int, signer: StateSigner, now: datetime
+) -> bytes:
+    """Replay events 1..head into closed sets and return the signed state envelope bytes."""
+    events = feed.events(1, head_version) if head_version >= 1 else []
+    issuer_revoked, grants, approvals, cascades = _replay(events, issuer_id=issuer_id)
     head_digest = events[-1]["event_digest"] if events else wire.GENESIS_EVENT_DIGEST
     body = {
         "schema_version": wire.SCHEMA_VERSION, "issuer_id": issuer_id, "head_version": head_version,
@@ -169,6 +181,16 @@ def _refuse(code: str) -> PublicationRefused:
     return PublicationRefused(code)
 
 
+def _require_max_age(max_age_seconds: object) -> int:
+    """Return the age limit, refusing anything looser than the 60 s ceiling (ADR 71)."""
+    if (
+        isinstance(max_age_seconds, bool) or not isinstance(max_age_seconds, int)
+        or not 1 <= max_age_seconds <= DEFAULT_MAX_STATE_AGE_SECONDS
+    ):
+        raise ValueError(f"max_age_seconds must be an integer in 1..{DEFAULT_MAX_STATE_AGE_SECONDS}")
+    return max_age_seconds
+
+
 def _is_fresh(generated: datetime, now: datetime, max_age_seconds: int) -> bool:
     """Return True when ``generated`` is at most ``max_age_seconds`` old and not from the future."""
     return (
@@ -182,6 +204,7 @@ def verify_state(
     max_age_seconds: int = DEFAULT_MAX_STATE_AGE_SECONDS,
 ) -> VerifiedState:
     """Verify signature, closed shape, issuer binding and freshness; refuse anything else."""
+    _require_max_age(max_age_seconds)
     if not isinstance(raw, (bytes, bytearray)):
         raise _refuse("publication.malformed")
     if len(raw) > MAX_STATE_BYTES:
@@ -238,6 +261,9 @@ def _cascade_grants(cascades: object) -> frozenset[str]:
     for cascade in cascades:
         if not isinstance(cascade, dict) or set(cascade) != set(_CASCADE_FIELDS):
             raise _refuse("publication.malformed")
+        version = cascade["version"]
+        if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= wire.MAX_SAFE_INTEGER:
+            raise _refuse("publication.malformed")
         wire.validate_cascade_body({
             "approval_id": cascade["approval_id"], "grant_ids": cascade["grant_ids"],
             "issuer_authority_version": cascade["issuer_authority_version"],
@@ -259,7 +285,7 @@ class CombinedRevocationLookup:
         max_age_seconds: int = DEFAULT_MAX_STATE_AGE_SECONDS,
     ) -> None:
         """Bind a verified state, the clock that judges its age and the age limit."""
-        self._state, self._clock, self._max_age = state, clock, max_age_seconds
+        self._state, self._clock, self._max_age = state, clock, _require_max_age(max_age_seconds)
 
     def reason(self, grant_id: str, approval_ref: str | None) -> str | None:
         """Return the refusal reason or None; raise ``publication.stale`` once the state has expired.
@@ -286,13 +312,25 @@ class CombinedRevocationLookup:
 def verify_state_against_chain(
     state: VerifiedState, events: Sequence[Mapping[str, object]], *, resolver: IssuerKeyResolver
 ) -> None:
-    """Cross-check the state head against a verified signed event chain from genesis."""
+    """Cross-check the state against a verified signed event chain from genesis.
+
+    Both the head (length and tip digest) and the summary itself (issuer flag, revoked grants,
+    revoked approvals and cascade-listed grants) must equal a replay of the chain, so a state with a
+    correct head but a dropped revocation is ``publication.head_mismatch``.
+    """
     if state.head_version == 0:
         if events:
             raise _refuse("publication.head_mismatch")
-        return
-    tip = verify_chain(events, previous_digest=wire.GENESIS_EVENT_DIGEST, resolver=resolver)
-    if len(events) != state.head_version or tip != state.head_event_digest:
+    else:
+        tip = verify_chain(events, previous_digest=wire.GENESIS_EVENT_DIGEST, resolver=resolver)
+        if len(events) != state.head_version or tip != state.head_event_digest:
+            raise _refuse("publication.head_mismatch")
+    issuer_revoked, grants, approvals, cascades = _replay(events, issuer_id=state.issuer_id)
+    cascade_grants = frozenset(g for c in cascades for g in c["grant_ids"])  # type: ignore[attr-defined]
+    if (
+        issuer_revoked != state.issuer_revoked or grants != state.revoked_grants
+        or approvals != state.revoked_approvals or cascade_grants != state.cascade_grants
+    ):
         raise _refuse("publication.head_mismatch")
 
 
@@ -361,6 +399,14 @@ class DirectoryMedium:
             return None
 
 
+def _retention_code(error: RetentionRefused) -> str:
+    """Map a chain-verification refusal onto the closed publication vocabulary."""
+    return {
+        "retention.signature_invalid": "publication.signature",
+        "retention.unknown_key": "publication.unknown_key",
+    }.get(error.code, "publication.malformed")
+
+
 class FeedPublisher:
     """Publishes hash-linked feed segments plus the signed state, verifying every read-back."""
 
@@ -382,7 +428,17 @@ class FeedPublisher:
 
         Segments are written before the state that names their head, so a reader that sees a
         state can always find its segments. Every artifact is read back and compared.
+
+        Nothing is written until the retained chain 1..head verifies (digests, links and issuer
+        signatures), and the built state is cross-checked against that same chain before it may
+        replace ``state.json``.
         """
+        chain = self._feed.events(1, head_version) if head_version >= 1 else []
+        if chain:
+            try:
+                verify_chain(chain, previous_digest=wire.GENESIS_EVENT_DIGEST, resolver=self._resolver)
+            except RetentionRefused as error:
+                raise _refuse(_retention_code(error)) from error
         low = 1
         while low <= head_version:
             high = min(low + SEGMENT_SIZE - 1, head_version)
@@ -397,7 +453,8 @@ class FeedPublisher:
         )
         # Verify first: an unverifiable state (for example one past the size limit) must never
         # replace the last good state.json.
-        verify_state(state, resolver=self._resolver, issuer_id=self._issuer_id, now=now)
+        verified = verify_state(state, resolver=self._resolver, issuer_id=self._issuer_id, now=now)
+        verify_state_against_chain(verified, chain, resolver=self._resolver)
         self._store_and_verify("state.json", state)
         return state
 
@@ -445,9 +502,5 @@ class FeedPublisher:
             try:
                 verify_chain(events, previous_digest=wire.GENESIS_EVENT_DIGEST, resolver=self._resolver)
             except RetentionRefused as error:
-                code = {
-                    "retention.signature_invalid": "publication.signature",
-                    "retention.unknown_key": "publication.unknown_key",
-                }.get(error.code, "publication.malformed")
-                raise _refuse(code) from error
+                raise _refuse(_retention_code(error)) from error
         return events
