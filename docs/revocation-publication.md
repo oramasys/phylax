@@ -25,12 +25,30 @@ before the state that names their head.
   *revoked/unavailable*, never as "nothing revoked".
 * **Read-back.** `FeedPublisher` reads every artifact back from the medium and compares bytes. A
   medium that drops, corrupts or fails is `publication.unavailable` / `publication.readback_mismatch`.
-* **Immutability.** `DirectoryMedium` refuses to rewrite a segment name with different bytes.
-* **Combined lookup.** `CombinedRevocationLookup.reason(grant_id, approval_ref)` checks, in order,
+* **Immutability.** `DirectoryMedium` refuses to rewrite a segment name with different bytes. Writers are
+  serialized across processes by an advisory lock, each write uses its own temporary file, and the
+  directory is synced after the rename before success is reported (POSIX).
+* **Exact segments.** `read_feed` requires every segment to carry exactly the requested event
+  versions, in order; an empty or shortened segment under a correct range label is
+  `publication.malformed`, never an empty feed.
+* **Size limit.** A state past `MAX_STATE_BYTES` (1 MiB) is `publication.state_too_large`.
+  `FeedPublisher.publish` verifies the state before writing it, so an unverifiable state never replaces
+  the last good `state.json`.
+* **Combined lookup.** `CombinedRevocationLookup(state, clock=...)` re-checks the state's age on every
+  call and raises `publication.stale` once it has expired (treat as revoked).
+  `reason(grant_id, approval_ref)` checks, in order,
   issuer, grant, approval chain, cascade, and undeclared-approval, and returns the same reason strings
   as the consumer's `dispatch_revocations.refusal_reason`. The shared vector pins every row; the
   oramasys PR for this decision runs the same file against the consumer function.
 * **Pruning-safe.** The state replays through the stitched retained feed, so archived history counts.
+
+## Known limit: cumulative growth
+
+The state is a full summary of every revoked identifier and cascade, and pruning cannot shrink it, so
+it grows without bound while the verifier caps it at 1 MiB. The publisher now fails closed (the last
+good state stays) instead of replacing it, but a long-lived issuer will eventually hit the cap. The
+fix is a paged or segmented state format, which is a schema change and an operator decision; it is
+deliberately not made here.
 
 ## Not in this PR
 

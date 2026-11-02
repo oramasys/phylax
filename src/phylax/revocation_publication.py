@@ -15,9 +15,12 @@ verifier cross-checks against the signed feed. Contract: ``docs/revocation-publi
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
+import tempfile
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -43,10 +46,12 @@ from .dispatch_retention import (
 STATE_DOMAIN: Final = b"phylax-revocation-state-v1\x00"
 SEGMENT_SIZE: Final = 64
 DEFAULT_MAX_STATE_AGE_SECONDS: Final = 60
+MAX_FUTURE_SKEW_SECONDS: Final = 5
+MAX_STATE_BYTES: Final = wire.MAX_WIRE_BYTES * 16
 PUBLICATION_REFUSAL_CODES: Final = frozenset({
     "publication.malformed", "publication.signature", "publication.stale",
     "publication.head_mismatch", "publication.unavailable", "publication.readback_mismatch",
-    "publication.unknown_key", "publication.issuer_mismatch",
+    "publication.unknown_key", "publication.issuer_mismatch", "publication.state_too_large",
 })
 _STATE_FIELDS = (
     "schema_version", "issuer_id", "head_version", "head_event_digest", "generated_at",
@@ -164,13 +169,23 @@ def _refuse(code: str) -> PublicationRefused:
     return PublicationRefused(code)
 
 
+def _is_fresh(generated: datetime, now: datetime, max_age_seconds: int) -> bool:
+    """Return True when ``generated`` is at most ``max_age_seconds`` old and not from the future."""
+    return (
+        now - generated <= timedelta(seconds=max_age_seconds)
+        and generated - now <= timedelta(seconds=MAX_FUTURE_SKEW_SECONDS)
+    )
+
+
 def verify_state(
     raw: bytes, *, resolver: IssuerKeyResolver, issuer_id: str, now: datetime,
     max_age_seconds: int = DEFAULT_MAX_STATE_AGE_SECONDS,
 ) -> VerifiedState:
     """Verify signature, closed shape, issuer binding and freshness; refuse anything else."""
-    if not isinstance(raw, (bytes, bytearray)) or len(raw) > wire.MAX_WIRE_BYTES * 16:
+    if not isinstance(raw, (bytes, bytearray)):
         raise _refuse("publication.malformed")
+    if len(raw) > MAX_STATE_BYTES:
+        raise _refuse("publication.state_too_large")
     try:
         document = json.loads(bytes(raw).decode("utf-8"))
         if wire.canonical_bytes(document) != bytes(raw):
@@ -207,7 +222,7 @@ def verify_state(
         raise _refuse("publication.unknown_key")
     if not _verify_state_signature(public_key, body, signature):
         raise _refuse("publication.signature")
-    if now - generated > timedelta(seconds=max_age_seconds) or generated - now > timedelta(seconds=5):
+    if not _is_fresh(generated, now, max_age_seconds):
         raise _refuse("publication.stale")
     return VerifiedState(
         issuer_id, head, body["head_event_digest"], generated, body["issuer_revoked"],
@@ -232,19 +247,29 @@ def _cascade_grants(cascades: object) -> frozenset[str]:
 
 
 class CombinedRevocationLookup:
-    """Rule 4 reasons from a verified fresh state; identical ordering to the consumer's lookup."""
+    """Rule 4 reasons from a verified fresh state; identical ordering to the consumer's lookup.
 
-    def __init__(self, state: VerifiedState) -> None:
-        """Bind a verified state."""
-        self._state = state
+    Freshness is re-checked on every ``reason`` call against the injected clock, so a lookup that is
+    kept alive past the state's age limit raises ``publication.stale`` (treat as revoked) instead of
+    answering "nothing revoked" from an expired state.
+    """
+
+    def __init__(
+        self, state: VerifiedState, *, clock: Callable[[], datetime],
+        max_age_seconds: int = DEFAULT_MAX_STATE_AGE_SECONDS,
+    ) -> None:
+        """Bind a verified state, the clock that judges its age and the age limit."""
+        self._state, self._clock, self._max_age = state, clock, max_age_seconds
 
     def reason(self, grant_id: str, approval_ref: str | None) -> str | None:
-        """Return the refusal reason or None.
+        """Return the refusal reason or None; raise ``publication.stale`` once the state has expired.
 
         ``approval_ref`` ``""`` means a single approval (matches no approval revocation); ``None``
         means undeclared, so any approval revocation refuses it.
         """
         state = self._state
+        if not _is_fresh(state.generated_at, self._clock(), self._max_age):
+            raise _refuse("publication.stale")
         if state.issuer_revoked:
             return "issuer_revoked"
         if grant_id in state.revoked_grants:
@@ -280,21 +305,51 @@ class DirectoryMedium:
         self.root.mkdir(parents=True, exist_ok=True)
         self._mutable = mutable
 
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Serialize writers across processes with an advisory lock on a dot-named lock file."""
+        with (self.root / ".publish.lock").open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _sync_directory(self) -> None:
+        """fsync the directory so a completed rename survives a crash (POSIX)."""
+        descriptor = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def put(self, name: str, data: bytes) -> None:
-        """Write atomically (temp file, fsync, rename); refuse to alter an immutable name."""
+        """Write atomically and durably; refuse to alter an immutable name.
+
+        Writers are serialized by a lock so the immutable-name check and the write cannot interleave;
+        each write uses its own temporary file, and the directory is synced after the rename before
+        success is reported (an identical immutable rewrite is synced too).
+        """
         if "/" in name or name.startswith("."):
             raise ValueError("invalid publication name")
         target = self.root / name
-        if target.exists() and name not in self._mutable:
-            if target.read_bytes() == data:
-                return
-            raise FileExistsError(name)
-        temp = self.root / f".{name}.tmp"
-        with temp.open("wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temp.replace(target)
+        with self._locked():
+            if target.exists() and name not in self._mutable:
+                if target.read_bytes() == data:
+                    self._sync_directory()
+                    return
+                raise FileExistsError(name)
+            descriptor, temp_name = tempfile.mkstemp(dir=self.root, prefix=f".{name}.", suffix=".tmp")
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_name, target)
+            except BaseException:
+                Path(temp_name).unlink(missing_ok=True)
+                raise
+            self._sync_directory()
 
     def get(self, name: str) -> bytes | None:
         """Return the stored bytes or None when absent."""
@@ -340,8 +395,10 @@ class FeedPublisher:
         state = build_state(
             self._feed, issuer_id=self._issuer_id, head_version=head_version, signer=self._signer, now=now
         )
-        self._store_and_verify("state.json", state)
+        # Verify first: an unverifiable state (for example one past the size limit) must never
+        # replace the last good state.json.
         verify_state(state, resolver=self._resolver, issuer_id=self._issuer_id, now=now)
+        self._store_and_verify("state.json", state)
         return state
 
     def _store_and_verify(self, name: str, data: bytes) -> None:
@@ -372,7 +429,13 @@ class FeedPublisher:
                 segment = json.loads(raw.decode("utf-8"))
                 if wire.canonical_bytes(segment) != raw or segment["from_version"] != low or segment["through_version"] != high:
                     raise _refuse("publication.malformed")
-                events.extend(segment["events"])
+                segment_events = segment["events"]
+                if not isinstance(segment_events, list):
+                    raise _refuse("publication.malformed")
+                versions = [e.get("version") if isinstance(e, dict) else None for e in segment_events]
+                if versions != list(range(low, high + 1)):
+                    raise _refuse("publication.malformed")
+                events.extend(segment_events)
             except PublicationRefused:
                 raise
             except (ValueError, KeyError, TypeError, wire.WireError) as error:
