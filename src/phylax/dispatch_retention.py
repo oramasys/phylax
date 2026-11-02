@@ -42,7 +42,7 @@ RETENTION_REFUSAL_CODES = frozenset({
     "retention.malformed_event", "retention.chain_broken", "retention.signature_invalid",
     "retention.unknown_key", "retention.archive_conflict", "retention.archive_gap",
     "retention.no_consumers", "retention.readback_mismatch", "retention.anchor_missing",
-    "retention.range_unavailable", "retention.consumer_invalid",
+    "retention.range_unavailable", "retention.consumer_invalid", "retention.archive_changed",
 })
 
 _ARCHIVE_SCHEMA = """
@@ -368,6 +368,14 @@ class RetentionLedger:
             ),
         )
 
+    def archive_tail(self) -> tuple[int, str]:
+        """Return the highest archived ``(version, event_digest)``, or ``(0, genesis)`` when empty."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT version, event_digest FROM archived_events ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+        return (0, wire.GENESIS_EVENT_DIGEST) if row is None else (int(row[0]), str(row[1]))
+
     def verify_archive(self, resolver: IssuerKeyResolver) -> str:
         """Verify the whole archive from genesis; return its tail digest (genesis if empty)."""
         span = self.archived_range()
@@ -439,12 +447,26 @@ def prune(
     reference = operator.authorize("retention.prune", attempt_id="retention-prune", grant_id=None)
     if not isinstance(reference, str) or not reference.strip():
         raise OperatorRefused("operator is not authorized to prune")
-    with _retention_lock(ledger), closing(sqlite3.connect(store.path, timeout=5.0, isolation_level=None)) as hot:
+    with _retention_lock(ledger):
+        # The O(archive) signature walk runs before the hot write lock so hot writers are not
+        # starved while it runs. The tail is snapshotted first and compared again under the lock:
+        # archived rows are immutable, so an unchanged tail proves nothing was appended unchecked.
+        checked_tail = ledger.archive_tail()
+        ledger.verify_archive(resolver)
+        return _prune_hot(store, ledger, resolver, reference, now, checked_tail)
+
+
+def _prune_hot(
+    store: SqliteDispatchPermitStore, ledger: RetentionLedger, resolver: IssuerKeyResolver,
+    reference: str, now: datetime, checked_tail: tuple[int, str],
+) -> PruneResult:
+    """Run the hot-store transaction of a prune; the caller holds the retention lock."""
+    with closing(sqlite3.connect(store.path, timeout=5.0, isolation_level=None)) as hot:
         hot.row_factory = sqlite3.Row
         hot.execute("PRAGMA synchronous = FULL")
         hot.execute("BEGIN IMMEDIATE")
         try:
-            result = _prune_locked(hot, ledger, resolver, reference, now)
+            result = _prune_locked(hot, ledger, resolver, reference, now, checked_tail)
             hot.execute("COMMIT")
         except BaseException:
             if hot.in_transaction:
@@ -455,7 +477,7 @@ def prune(
 
 def _prune_locked(
     hot: sqlite3.Connection, ledger: RetentionLedger, resolver: IssuerKeyResolver,
-    reference: str, now: datetime,
+    reference: str, now: datetime, checked_tail: tuple[int, str],
 ) -> PruneResult:
     """Run the prune steps while the hot write lock is held."""
     ceiling = prune_ceiling(ledger.consumers(), _observed_acks(hot))
@@ -479,7 +501,8 @@ def _prune_locked(
             (low, ceiling),
         )
     ]
-    ledger.verify_archive(resolver)
+    if ledger.archive_tail() != checked_tail:
+        raise RetentionRefused("retention.archive_changed")  # appended after the signature walk
     # A crash after the archive write leaves rows in both tiers; the archive may already hold
     # versions at or above ``low``, which the idempotent append below confirms byte for byte.
     if (archived[1] if archived else 0) < low - 1:

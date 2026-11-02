@@ -480,3 +480,47 @@ def test_continuity_refuses_an_overlap_that_differs_from_the_archive(store, ledg
         db.commit()
     with pytest.raises(RetentionRefused):
         RetainedEventFeed(store, ledger).verify_continuity(Resolver())
+
+
+def test_archive_verification_runs_before_the_hot_write_lock(store, ledger, signer) -> None:
+    """Hot writers are not blocked while the O(archive) signature walk runs."""
+    setup_two_consumers(store, ledger, signer, acks=(5, 5))
+    seen: dict[str, bool] = {}
+
+    class Probe(RetentionLedger):
+        def verify_archive(self, resolver):
+            try:  # a hot writer must be able to take the write lock during the walk
+                with closing(sqlite3.connect(store.path, timeout=0.2, isolation_level=None)) as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("ROLLBACK")
+                seen["free"] = True
+            except sqlite3.OperationalError:
+                seen["free"] = False
+            return super().verify_archive(resolver)
+
+    probe = Probe(ledger.path)
+    prune(store, probe, Resolver(), operator=Operator(), now=NOW)
+    assert seen == {"free": True}
+
+
+def test_rows_appended_to_the_archive_after_the_check_are_refused_not_trusted(store, ledger, signer) -> None:
+    """A row that lands between the signature walk and the lock changes the tail and is refused."""
+    events = setup_two_consumers(store, ledger, signer, acks=(5, 5))
+    ledger.append_archive(events[:2], now=NOW)
+
+    class Racing(RetentionLedger):
+        raced = False
+
+        def verify_archive(self, resolver):
+            tail = super().verify_archive(resolver)
+            if not Racing.raced:
+                Racing.raced = True
+                self.append_archive(events[2:3], now=NOW)  # unchecked row after the walk
+            return tail
+
+    racing = Racing(ledger.path)
+    with pytest.raises(RetentionRefused) as caught:
+        prune(store, racing, Resolver(), operator=Operator(), now=NOW)
+    assert caught.value.code == "retention.archive_changed" and hot_versions(store)[0] == 1
+    result = prune(store, racing, Resolver(), operator=Operator(), now=NOW)  # a rerun re-verifies
+    assert (result.archived_from, result.archived_through) == (1, 4)
