@@ -237,6 +237,7 @@ def test_concurrent_replays_consume_exactly_once(env) -> None:
     results: list[str] = []
 
     def attempt() -> None:
+        """Authorize one abandon attempt and record its outcome."""
         authority = env.verifier.authority_for(raw)
         results.append(authority.authorize("abandon", attempt_id="attempt-1", grant_id="grant-1") or "none")
 

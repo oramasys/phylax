@@ -152,6 +152,7 @@ def test_state_signature_freshness_and_binding(parts) -> None:
     verify_state(raw, resolver=Resolver(), issuer_id=ISSUER, now=NOW + timedelta(seconds=60))
 
     def refused(code: str, data: bytes, **kw) -> None:
+        """Assert publication of ``data`` is refused with ``code``."""
         with pytest.raises(PublicationRefused) as caught:
             verify_state(data, **{"resolver": Resolver(), "issuer_id": ISSUER, "now": NOW, **kw})
         assert caught.value.code == code
@@ -216,16 +217,22 @@ def test_unreadable_medium_is_unavailable_never_empty_success(parts, tmp_path) -
     head = load(store, signer, [("grant", "g1")], [])
 
     class Dropping(DirectoryMedium):
+        """Medium that hides every object on read."""
         def get(self, name: str):
+            """Return the object, altered or hidden as the medium dictates."""
             return None
 
     class Corrupting(DirectoryMedium):
+        """Medium that flips a byte in every object it returns."""
         def get(self, name: str):
+            """Return the object, altered or hidden as the medium dictates."""
             data = super().get(name)
             return None if data is None else data[:-1] + b"X"
 
     class Failing(DirectoryMedium):
+        """Medium whose writes fail with a disk-full error."""
         def put(self, name: str, data: bytes) -> None:
+            """Refuse the write."""
             raise OSError("disk full")
 
     for medium, code in (
@@ -322,6 +329,7 @@ def test_concurrent_writers_never_mix_bytes_and_keep_the_name_immutable(tmp_path
     barrier = threading.Barrier(len(payloads))
 
     def write(data: bytes) -> None:
+        """Publish concurrently after the barrier releases."""
         barrier.wait()
         try:
             medium.put("events-000000000001-000000000001.json", data)
@@ -347,6 +355,7 @@ def test_identical_concurrent_writers_all_succeed(tmp_path: Path) -> None:
     errors: list[BaseException] = []
 
     def write() -> None:
+        """Publish concurrently after the barrier releases."""
         try:
             medium.put("events-000000000001-000000000001.json", b"same")
         except BaseException as error:  # noqa: BLE001 - the test reports any failure
@@ -367,10 +376,12 @@ def test_directory_is_synced_after_the_rename(tmp_path: Path, monkeypatch) -> No
     real_fsync, real_replace = os.fsync, os.replace
 
     def fsync(fd: int) -> None:
+        """Record whether a file or a directory was flushed."""
         events.append("fsync-dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync-file")
         real_fsync(fd)
 
     def replace(source, target) -> None:
+        """Record the replace step."""
         events.append("replace")
         real_replace(source, target)
 
@@ -388,6 +399,7 @@ def test_failed_write_leaves_no_temporary_file(tmp_path: Path, monkeypatch) -> N
     medium = DirectoryMedium(tmp_path / "public")
 
     def boom(source, target) -> None:
+        """Fail the replace step with a disk error."""
         raise OSError("disk gone")
 
     monkeypatch.setattr(os, "replace", boom)
