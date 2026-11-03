@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -65,6 +66,57 @@ class Resolver:
         return crypto_sign_seed_keypair(SEED)[0] if key_id == "key-1" else None
 
 
+@pytest.mark.parametrize("bad_genesis", [False, True])
+def test_state_chain_requires_exact_genesis_boundary(
+    parts: tuple[SqliteDispatchPermitStore, RetentionLedger, RetainedEventFeed, Signer],
+    bad_genesis: bool,
+) -> None:
+    """A signed summary cannot relabel version 2 as head 1 or invent a genesis digest."""
+    store, _ledger, feed, signer = parts
+    head = load(store, signer, [("grant", "g1")], [])
+    document = json.loads(build_state(feed, issuer_id=ISSUER, head_version=head,
+                                     signer=signer, now=NOW))
+    if bad_genesis:
+        events = []
+        document["body"].update(head_version=0, revoked_grants=[],
+                                head_event_digest=wire.GENESIS_EVENT_DIGEST)
+    else:
+        event = feed.events(1, head)[0]
+        event["version"] = 2
+        event["event_digest"] = wire.event_digest(
+            2, event["kind"], event["body"], event["previous_event_digest"])
+        event["signature"] = wire.sign_event(SEED, event["event_digest"])
+        events = [event]
+        document["body"]["head_event_digest"] = event["event_digest"]
+    document["signature"] = sign_state_body(SEED, document["body"])
+    state = verify_state(wire.canonical_bytes(document), resolver=Resolver(),
+                         issuer_id=ISSUER, now=NOW)
+    if bad_genesis:
+        state = replace(state, head_event_digest="a" * 64)
+    with pytest.raises(PublicationRefused, match="publication.head_mismatch"):
+        verify_state_against_chain(state, events, resolver=Resolver())
+
+
+@pytest.mark.parametrize("overrides", [
+    {"schema_version": True}, {"schema_version": 1.0},
+    {"head_version": wire.MAX_SAFE_INTEGER + 1, "head_event_digest": "a" * 64},
+    {"head_version": 0, "head_event_digest": "a" * 64},
+    {"head_version": 1, "head_event_digest": wire.GENESIS_EVENT_DIGEST},
+])
+def test_state_rejects_noninteger_schema_unsafe_head_and_inconsistent_genesis(
+    parts: tuple[SqliteDispatchPermitStore, RetentionLedger, RetainedEventFeed, Signer],
+    overrides: dict[str, object],
+) -> None:
+    """Signature validity cannot relax the closed wire's integer and genesis constraints."""
+    _store, _ledger, feed, signer = parts
+    document = json.loads(build_state(feed, issuer_id=ISSUER, head_version=0,
+                                     signer=signer, now=NOW))
+    document["body"].update(overrides)
+    document["signature"] = sign_state_body(SEED, document["body"])
+    with pytest.raises(PublicationRefused, match="publication.malformed"):
+        verify_state(wire.canonical_bytes(document), resolver=Resolver(), issuer_id=ISSUER, now=NOW)
+
+
 @pytest.fixture
 def parts(tmp_path: Path):
     """Return (store, ledger, feed, signer)."""
@@ -100,6 +152,7 @@ def test_state_signature_freshness_and_binding(parts) -> None:
     verify_state(raw, resolver=Resolver(), issuer_id=ISSUER, now=NOW + timedelta(seconds=60))
 
     def refused(code: str, data: bytes, **kw) -> None:
+        """Assert publication of ``data`` is refused with ``code``."""
         with pytest.raises(PublicationRefused) as caught:
             verify_state(data, **{"resolver": Resolver(), "issuer_id": ISSUER, "now": NOW, **kw})
         assert caught.value.code == code
@@ -164,16 +217,22 @@ def test_unreadable_medium_is_unavailable_never_empty_success(parts, tmp_path) -
     head = load(store, signer, [("grant", "g1")], [])
 
     class Dropping(DirectoryMedium):
+        """Medium that hides every object on read."""
         def get(self, name: str):
+            """Return the object, altered or hidden as the medium dictates."""
             return None
 
     class Corrupting(DirectoryMedium):
+        """Medium that flips a byte in every object it returns."""
         def get(self, name: str):
+            """Return the object, altered or hidden as the medium dictates."""
             data = super().get(name)
             return None if data is None else data[:-1] + b"X"
 
     class Failing(DirectoryMedium):
+        """Medium whose writes fail with a disk-full error."""
         def put(self, name: str, data: bytes) -> None:
+            """Refuse the write."""
             raise OSError("disk full")
 
     for medium, code in (
@@ -270,6 +329,7 @@ def test_concurrent_writers_never_mix_bytes_and_keep_the_name_immutable(tmp_path
     barrier = threading.Barrier(len(payloads))
 
     def write(data: bytes) -> None:
+        """Publish concurrently after the barrier releases."""
         barrier.wait()
         try:
             medium.put("events-000000000001-000000000001.json", data)
@@ -295,6 +355,7 @@ def test_identical_concurrent_writers_all_succeed(tmp_path: Path) -> None:
     errors: list[BaseException] = []
 
     def write() -> None:
+        """Publish concurrently after the barrier releases."""
         try:
             medium.put("events-000000000001-000000000001.json", b"same")
         except BaseException as error:  # noqa: BLE001 - the test reports any failure
@@ -315,10 +376,12 @@ def test_directory_is_synced_after_the_rename(tmp_path: Path, monkeypatch) -> No
     real_fsync, real_replace = os.fsync, os.replace
 
     def fsync(fd: int) -> None:
+        """Record whether a file or a directory was flushed."""
         events.append("fsync-dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync-file")
         real_fsync(fd)
 
     def replace(source, target) -> None:
+        """Record the replace step."""
         events.append("replace")
         real_replace(source, target)
 
@@ -336,6 +399,7 @@ def test_failed_write_leaves_no_temporary_file(tmp_path: Path, monkeypatch) -> N
     medium = DirectoryMedium(tmp_path / "public")
 
     def boom(source, target) -> None:
+        """Fail the replace step with a disk error."""
         raise OSError("disk gone")
 
     monkeypatch.setattr(os, "replace", boom)

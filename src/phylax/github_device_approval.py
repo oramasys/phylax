@@ -266,6 +266,12 @@ def _spend_marker(config_dir: Path) -> None:
         raise ValueError("fresh GitHub login marker could not be spent") from exc
     try:
         _marker_path(config_dir).unlink()
+        # File fsync alone does not persist the exclusive claim's directory entry.
+        directory = os.open(config_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except OSError as exc:
         raise ValueError("fresh GitHub login marker could not be spent") from exc
 

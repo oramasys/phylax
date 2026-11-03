@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import subprocess
+import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -234,6 +237,7 @@ def test_concurrent_replays_consume_exactly_once(env) -> None:
     results: list[str] = []
 
     def attempt() -> None:
+        """Authorize one abandon attempt and record its outcome."""
         authority = env.verifier.authority_for(raw)
         results.append(authority.authorize("abandon", attempt_id="attempt-1", grant_id="grant-1") or "none")
 
@@ -280,3 +284,162 @@ def test_parse_assertion_rejects_bad_fields() -> None:
     for overrides in ({"nonce": "short"}, {"operation": "Bad Op"}, {"grant_id": "bad id"},
                       {"issued_at": "yesterday"}):
         refused("operator.malformed", parse_assertion, assertion(**overrides))
+
+
+def test_new_registry_observed_before_nonce_commit_refuses_old_call(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second verifier's committed revocation fences an already-verified old call."""
+    other = OperatorAssertionVerifier(
+        state_path=env.verifier.path,
+        trust_public_key=crypto_sign_seed_keypair(TRUST_SEED)[0], audience=AUDIENCE,
+        registry_source=lambda: registry_bytes(2, [
+            entry("alice", ALICE_SEED, revoked_at=wire.timestamp(NOW)),
+            entry("bob", BOB_SEED),
+        ]), clock=lambda: NOW,
+    )
+    commit = env.verifier._commit
+
+    def interleave(
+        operator_id: str, nonce: str, expires_at: str, now: datetime, *, registry_version: int
+    ) -> None:
+        """Observe a revoking registry just before the old call consumes its nonce."""
+        refused("operator.key_revoked", other.verify_and_consume, assertion(),
+                operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
+        return commit(operator_id, nonce, expires_at, now, registry_version=registry_version)
+
+    monkeypatch.setattr(env.verifier, "_commit", interleave)
+    refused("operator.registry_rollback", env.call, assertion())
+
+
+def test_clock_rollback_after_cleanup_and_restart_cannot_replay(env: Env) -> None:
+    """A previously consumed assertion cannot become live again after nonce cleanup."""
+    raw = assertion()
+    env.call(raw)
+    env.now = NOW + timedelta(seconds=500)
+    env.call(assertion(nonce="q" * 23, issued_at=wire.timestamp(env.now),
+                       expires_at=wire.timestamp(env.now + timedelta(seconds=60))))
+    env.now = NOW
+    restarted = OperatorAssertionVerifier(
+        state_path=env.verifier.path,
+        trust_public_key=crypto_sign_seed_keypair(TRUST_SEED)[0], audience=AUDIENCE,
+        registry_source=lambda: env.registry, clock=lambda: env.now,
+    )
+    refused("operator.clock_rollback", restarted.verify_and_consume, raw,
+            operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
+
+
+def test_consumption_clock_migrates_existing_nonce_history(env: Env) -> None:
+    """Legacy consumed timestamps seed the durable floor without resetting replay state."""
+    env.now = NOW + timedelta(seconds=60)
+    env.call(assertion())
+    with sqlite3.connect(env.verifier.path) as db:
+        db.execute("DROP TABLE consumption_clock")
+    env.now = NOW
+    restarted = OperatorAssertionVerifier(
+        state_path=env.verifier.path,
+        trust_public_key=crypto_sign_seed_keypair(TRUST_SEED)[0], audience=AUDIENCE,
+        registry_source=lambda: env.registry, clock=lambda: env.now,
+    )
+    refused("operator.clock_rollback", restarted.verify_and_consume, assertion(nonce="m" * 23),
+            operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
+
+
+def test_consumption_clock_schema_uses_old_sqlite_compatible_seed_query() -> None:
+    """The durable clock migration avoids HAVING without GROUP BY for older SQLite hosts."""
+    from phylax.operator_assertion import _STATE_SCHEMA
+
+    assert "HAVING" not in _STATE_SCHEMA
+    assert "ORDER BY consumed_at DESC LIMIT 1" in _STATE_SCHEMA
+
+
+def test_overlapping_valid_calls_sample_clock_under_the_write_lock(tmp_path: Path) -> None:
+    """A later writer cannot make an earlier valid request look like clock rollback."""
+    registry = registry_bytes()
+    trust = crypto_sign_seed_keypair(TRUST_SEED)[0]
+    first_ticks = iter((NOW, NOW + timedelta(seconds=2)))
+    second_ticks = iter((NOW + timedelta(seconds=1), NOW + timedelta(seconds=1)))
+    first = OperatorAssertionVerifier(
+        state_path=tmp_path / "operator.db", trust_public_key=trust, audience=AUDIENCE,
+        registry_source=lambda: registry, clock=lambda: next(first_ticks),
+    )
+    second = OperatorAssertionVerifier(
+        state_path=tmp_path / "operator.db", trust_public_key=trust, audience=AUDIENCE,
+        registry_source=lambda: registry, clock=lambda: next(second_ticks),
+    )
+    commit = first._commit
+
+    def commit_after_second(
+        operator_id: str, nonce: str, expires_at: str, now: datetime, *, registry_version: int,
+    ) -> None:
+        """Commit another valid assertion between first-call validation and its write lock."""
+        second.verify_and_consume(
+            assertion(nonce="s" * 23), operation="abandon", attempt_id="attempt-1", grant_id="grant-1",
+        )
+        commit(operator_id, nonce, expires_at, now, registry_version=registry_version)
+
+    first._commit = commit_after_second  # type: ignore[method-assign]
+    assert first.verify_and_consume(
+        assertion(nonce="f" * 23), operation="abandon", attempt_id="attempt-1", grant_id="grant-1",
+    ).endswith("f" * 23)
+
+
+def test_clock_step_back_between_validation_and_commit_is_refused(tmp_path: Path) -> None:
+    """A backward step during one call cannot clean up or consume a nonce."""
+    ticks = iter((NOW, NOW - timedelta(seconds=1)))
+    verifier = OperatorAssertionVerifier(
+        state_path=tmp_path / "operator.db",
+        trust_public_key=crypto_sign_seed_keypair(TRUST_SEED)[0], audience=AUDIENCE,
+        registry_source=registry_bytes, clock=lambda: next(ticks),
+    )
+
+    refused(
+        "operator.clock_rollback", verifier.verify_and_consume, assertion(),
+        operation="abandon", attempt_id="attempt-1", grant_id="grant-1",
+    )
+    with sqlite3.connect(verifier.path) as database:
+        assert database.execute("SELECT COUNT(*) FROM consumed_nonces").fetchone()[0] == 0
+
+
+def test_process_exit_during_cleanup_rolls_back_clock_and_nonce_deletion(env: Env) -> None:
+    """A process dying before nonce insert cannot commit cleanup or advance its clock."""
+    env.call(assertion())
+    later = NOW + timedelta(seconds=500)
+    raw = assertion(nonce="p" * 23, issued_at=wire.timestamp(later),
+                    expires_at=wire.timestamp(later + timedelta(seconds=60)))
+    script = '''
+import os, sqlite3, sys
+from datetime import datetime
+from phylax.operator_assertion import OperatorAssertionVerifier
+
+class CrashVerifier(OperatorAssertionVerifier):
+    """Exit during nonce insertion with the consuming transaction still open."""
+
+    def _connect(self) -> sqlite3.Connection:
+        """Install the crash boundary on every configured database connection."""
+        connection = super()._connect()
+
+        def crash(statement: str) -> None:
+            """Terminate before inserting a nonce, leaving cleanup uncommitted."""
+            if statement.startswith('INSERT INTO consumed_nonces('):
+                os._exit(73)
+        connection.set_trace_callback(crash)
+        return connection
+
+verifier = CrashVerifier(state_path=sys.argv[1], trust_public_key=bytes.fromhex(sys.argv[2]),
+    audience=sys.argv[3], registry_source=lambda: bytes.fromhex(sys.argv[4]),
+    clock=lambda: datetime.fromisoformat(sys.argv[5]))
+verifier.verify_and_consume(bytes.fromhex(sys.argv[6]), operation='abandon',
+    attempt_id='attempt-1', grant_id='grant-1')
+'''
+    child = subprocess.run(
+        [sys.executable, "-c", script, str(env.verifier.path),
+         crypto_sign_seed_keypair(TRUST_SEED)[0].hex(), AUDIENCE,
+         env.registry.hex(), later.isoformat(), raw.hex()],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert child.returncode == 73, child.stderr
+    # Recovery sees the original consumption, not the uncommitted cleanup/clock.
+    refused("operator.replayed", env.call, assertion())
+    env.now = later
+    assert env.call(raw)

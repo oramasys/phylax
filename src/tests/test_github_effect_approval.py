@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -11,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from phylax.adjustment_grant import RotatingIssuerKeyring
+from phylax import github_device_approval as device
 from phylax.effect_grant import EffectGrantAuthority, EffectGrantRequest
 from phylax.github_device_approval import MODEL_AUTH_MARKER
 from phylax.github_effect_approval import (
@@ -273,3 +276,52 @@ def test_grant_lifetime_is_the_human_approved_duration(parts, tmp_path) -> None:
         evidence_ref=EVIDENCE, review_expires_at=EXPIRES,
     )
     assert (grant.expires_at - grant.issued_at).total_seconds() == APPROVED_DURATION_SECONDS == 5_400
+
+
+@pytest.mark.parametrize("sync_fails", [False, True])
+def test_spent_claim_directory_is_synced_before_comment_readback(
+    parts: tuple[EffectGrantAuthority, Path, Path, SqliteGrantAuthorityStore],
+    monkeypatch: pytest.MonkeyPatch,
+    sync_fails: bool,
+) -> None:
+    """No evidence readback or issuance precedes the durable single-use directory entry."""
+    authority, config, gh, store = parts
+    req = request()
+    synced = []
+    fsync = os.fsync
+
+    def sync(descriptor: int) -> None:
+        """Record directory sync ordering or inject a directory durability failure."""
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            if sync_fails:
+                raise OSError("injected directory sync failure")
+            assert (config / (MODEL_AUTH_MARKER + ".spent")).exists()
+            synced.append(True)
+        fsync(descriptor)
+
+    monkeypatch.setattr(device.os, "fsync", sync)
+    runner = Runner([ACCOUNT, comment(effect_approval_body(req, review_expires_at=EXPIRES))])
+
+    def readback(
+        command: list[str], *, env: dict[str, str], capture_output: bool, timeout: float | None
+    ) -> str:
+        """Require durable consumption before returning the remote comment fixture."""
+        if runner.calls == 1:
+            assert synced, "comment readback preceded durable spent claim"
+        return runner(command, env=env, capture_output=capture_output, timeout=timeout)
+
+    verifier = GitHubCliEffectApprovalVerifier(
+        config_dir=config, repository="acme/control", approvers={7: "control-plane"},
+        runner=readback, gh_executable=gh, clock=lambda: NOW,
+    )
+    if sync_fails:
+        with pytest.raises(ValueError, match="could not be spent"):
+            issue_with_github_approval(authority, verifier, req,
+                                       authenticated_principal="control-plane",
+                                       evidence_ref=EVIDENCE, review_expires_at=EXPIRES)
+        assert issued_count(store) == 0 and runner.calls == 1
+    else:
+        issue_with_github_approval(authority, verifier, req,
+                                   authenticated_principal="control-plane",
+                                   evidence_ref=EVIDENCE, review_expires_at=EXPIRES)
+        assert issued_count(store) == 1 and synced

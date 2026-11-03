@@ -30,9 +30,15 @@ Code: `src/phylax/operator_assertion.py`; tests: `src/tests/test_operator_assert
 | No burn on failure | the nonce is consumed only after every other check passes |
 | Revocation | `revoked_at` refuses immediately, including already-issued assertions |
 | Anti-rollback | the registry-version floor rises on sight of any authority-signed registry (even when the call is refused) and a trigger forbids lowering it |
+| Concurrent registry updates | nonce consumption rechecks the registry floor inside its write transaction; a newer observed registry fences an older in-flight call |
+| Cleanup clock rollback | a durable successful-consumption clock is committed atomically with cleanup and nonce insertion; an earlier clock refuses with `operator.clock_rollback`, including after restart |
 | Freshness | a registry older than 24 h (or from the future beyond skew) is refused |
 | Exact binding | operation, attempt, grant and audience must equal the call; the operation must be in the key's list |
 | Strictness | canonical bytes only, no duplicate keys, closed fields, 64 KiB bound |
 
 Refusal codes are a closed vocabulary (`operator.*`). Operator key custody, the registry authority
 key ceremony and the registry distribution medium remain operator decisions.
+
+The consumption-clock migration seeds its floor from retained legacy `consumed_at` rows. It cannot
+reconstruct already-deleted legacy history or detect restoration of the entire database to an older
+backup. It records successful consumption, not every failed verification or wall-clock observation.
