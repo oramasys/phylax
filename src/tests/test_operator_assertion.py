@@ -301,12 +301,12 @@ def test_new_registry_observed_before_nonce_commit_refuses_old_call(
     commit = env.verifier._commit
 
     def interleave(
-        operator_id: str, nonce: str, expires_at: str, now: datetime, *, registry_version: int
+        operator_id: str, nonce: str, expires_at: str, now: datetime, **facts: object
     ) -> None:
         """Observe a revoking registry just before the old call consumes its nonce."""
         refused("operator.key_revoked", other.verify_and_consume, assertion(),
                 operation="abandon", attempt_id="attempt-1", grant_id="grant-1")
-        return commit(operator_id, nonce, expires_at, now, registry_version=registry_version)
+        return commit(operator_id, nonce, expires_at, now, **facts)
 
     monkeypatch.setattr(env.verifier, "_commit", interleave)
     refused("operator.registry_rollback", env.call, assertion())
@@ -370,13 +370,13 @@ def test_overlapping_valid_calls_sample_clock_under_the_write_lock(tmp_path: Pat
     commit = first._commit
 
     def commit_after_second(
-        operator_id: str, nonce: str, expires_at: str, now: datetime, *, registry_version: int,
+        operator_id: str, nonce: str, expires_at: str, now: datetime, **facts: object,
     ) -> None:
         """Commit another valid assertion between first-call validation and its write lock."""
         second.verify_and_consume(
             assertion(nonce="s" * 23), operation="abandon", attempt_id="attempt-1", grant_id="grant-1",
         )
-        commit(operator_id, nonce, expires_at, now, registry_version=registry_version)
+        commit(operator_id, nonce, expires_at, now, **facts)
 
     first._commit = commit_after_second  # type: ignore[method-assign]
     assert first.verify_and_consume(
@@ -397,6 +397,32 @@ def test_clock_step_back_between_validation_and_commit_is_refused(tmp_path: Path
         "operator.clock_rollback", verifier.verify_and_consume, assertion(),
         operation="abandon", attempt_id="attempt-1", grant_id="grant-1",
     )
+    with sqlite3.connect(verifier.path) as database:
+        assert database.execute("SELECT COUNT(*) FROM consumed_nonces").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [("expiry", "operator.expired"), ("key", "operator.key_inactive"),
+     ("revocation", "operator.key_revoked"), ("registry", "operator.registry_stale")],
+)
+def test_authority_windows_are_rechecked_under_write_lock(tmp_path: Path, case: str, expected: str) -> None:
+    """A slow verification cannot consume an assertion after its authority window closes."""
+    later = NOW + timedelta(seconds=121)
+    overrides = {}
+    if case == "key":
+        overrides["not_after"] = wire.timestamp(NOW + timedelta(seconds=1))
+    if case == "revocation":
+        overrides["revoked_at"] = wire.timestamp(NOW + timedelta(seconds=1))
+    registry = registry_bytes(entries=[entry("alice", ALICE_SEED, **overrides)])
+    ticks = iter((NOW, later if case == "expiry" else NOW + timedelta(seconds=2)))
+    verifier = OperatorAssertionVerifier(
+        state_path=tmp_path / "operator.db", trust_public_key=crypto_sign_seed_keypair(TRUST_SEED)[0],
+        audience=AUDIENCE, registry_source=lambda: registry, clock=lambda: next(ticks),
+        registry_max_age_seconds=1 if case == "registry" else 3600,
+    )
+    refused(expected, verifier.verify_and_consume, assertion(), operation="abandon",
+            attempt_id="attempt-1", grant_id="grant-1")
     with sqlite3.connect(verifier.path) as database:
         assert database.execute("SELECT COUNT(*) FROM consumed_nonces").fetchone()[0] == 0
 
