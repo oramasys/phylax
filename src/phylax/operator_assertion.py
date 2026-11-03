@@ -421,7 +421,9 @@ class OperatorAssertionVerifier:
                 if floor is None or registry_version < floor["registry_version"]:
                     raise OperatorAssertionRefused("operator.registry_rollback")
                 observed = connection.execute("SELECT observed_at FROM consumption_clock").fetchone()
-                if observed is not None and commit_now < wire.parse_timestamp(observed["observed_at"]):
+                if commit_now < now or (
+                    observed is not None and commit_now < wire.parse_timestamp(observed["observed_at"])
+                ):
                     raise OperatorAssertionRefused("operator.clock_rollback")
                 # Retain the cleanup clock even after every older nonce has been deleted.
                 connection.execute(

@@ -384,6 +384,23 @@ def test_overlapping_valid_calls_sample_clock_under_the_write_lock(tmp_path: Pat
     ).endswith("f" * 23)
 
 
+def test_clock_step_back_between_validation_and_commit_is_refused(tmp_path: Path) -> None:
+    """A backward step during one call cannot clean up or consume a nonce."""
+    ticks = iter((NOW, NOW - timedelta(seconds=1)))
+    verifier = OperatorAssertionVerifier(
+        state_path=tmp_path / "operator.db",
+        trust_public_key=crypto_sign_seed_keypair(TRUST_SEED)[0], audience=AUDIENCE,
+        registry_source=registry_bytes, clock=lambda: next(ticks),
+    )
+
+    refused(
+        "operator.clock_rollback", verifier.verify_and_consume, assertion(),
+        operation="abandon", attempt_id="attempt-1", grant_id="grant-1",
+    )
+    with sqlite3.connect(verifier.path) as database:
+        assert database.execute("SELECT COUNT(*) FROM consumed_nonces").fetchone()[0] == 0
+
+
 def test_process_exit_during_cleanup_rolls_back_clock_and_nonce_deletion(env: Env) -> None:
     """A process dying before nonce insert cannot commit cleanup or advance its clock."""
     env.call(assertion())
