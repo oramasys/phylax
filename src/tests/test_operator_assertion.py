@@ -427,6 +427,49 @@ def test_authority_windows_are_rechecked_under_write_lock(tmp_path: Path, case: 
         assert database.execute("SELECT COUNT(*) FROM consumed_nonces").fetchone()[0] == 0
 
 
+def test_commit_samples_the_clock_after_acquiring_the_write_lock(tmp_path: Path) -> None:
+    """Time that passes while _commit waits for the write lock still closes the authority window."""
+    current = [NOW]
+    begins: list[str] = []
+
+    class LockWaitConnection:
+        """Delegate to a real connection, advancing the clock as the commit lock is granted."""
+
+        def __init__(self, real: sqlite3.Connection) -> None:
+            """Wrap the real connection that the verifier opened."""
+            self._real = real
+
+        def __getattr__(self, name: str) -> object:
+            """Forward every other attribute to the real connection."""
+            return getattr(self._real, name)
+
+        def execute(self, statement: str, *args: object) -> sqlite3.Cursor:
+            """Advance the clock on the commit's BEGIN IMMEDIATE (the second), then forward it."""
+            if statement == "BEGIN IMMEDIATE":
+                begins.append(statement)
+                if len(begins) == 2:
+                    current[0] = NOW + timedelta(seconds=121)
+            return self._real.execute(statement, *args)
+
+    class SlowLockVerifier(OperatorAssertionVerifier):
+        """Verifier whose connections simulate a slow write-lock acquisition."""
+
+        def _connect(self) -> sqlite3.Connection:
+            """Return the configured connection behind the lock-wait proxy."""
+            return LockWaitConnection(super()._connect())  # type: ignore[return-value]
+
+    registry = registry_bytes(entries=[entry("alice", ALICE_SEED)])
+    verifier = SlowLockVerifier(
+        state_path=tmp_path / "operator.db", trust_public_key=crypto_sign_seed_keypair(TRUST_SEED)[0],
+        audience=AUDIENCE, registry_source=lambda: registry, clock=lambda: current[0],
+    )
+    refused("operator.expired", verifier.verify_and_consume, assertion(), operation="abandon",
+            attempt_id="attempt-1", grant_id="grant-1")
+    assert len(begins) == 2  # _observe_registry, then _commit
+    with sqlite3.connect(verifier.path) as database:
+        assert database.execute("SELECT COUNT(*) FROM consumed_nonces").fetchone()[0] == 0
+
+
 def test_process_exit_during_cleanup_rolls_back_clock_and_nonce_deletion(env: Env) -> None:
     """A process dying before nonce insert cannot commit cleanup or advance its clock."""
     env.call(assertion())
