@@ -348,7 +348,7 @@ class OperatorAssertionVerifier:
             raise OperatorAssertionRefused("operator.signature")
         nonce = str(assertion.body["nonce"])
         self._commit(entry.operator_id, nonce, str(assertion.body["expires_at"]), now,
-                     registry_version=registry.version)
+                     registry=registry, body=assertion.body)
         return f"operator:{entry.operator_id}:{nonce}"
 
     @staticmethod
@@ -408,7 +408,8 @@ class OperatorAssertionVerifier:
                 raise
 
     def _commit(
-        self, operator_id: str, nonce: str, expires_at: str, now: datetime, *, registry_version: int
+        self, operator_id: str, nonce: str, expires_at: str, now: datetime, *,
+        registry: Registry, body: Mapping[str, object],
     ) -> None:
         """Fence registry/clock rollback and consume atomically with expired-nonce cleanup."""
         with closing(self._connect()) as connection:
@@ -418,13 +419,18 @@ class OperatorAssertionVerifier:
                 if commit_now.tzinfo is None or commit_now.utcoffset() is None:
                     raise ValueError("clock must return an aware datetime")
                 floor = connection.execute("SELECT registry_version FROM registry_floor").fetchone()
-                if floor is None or registry_version < floor["registry_version"]:
+                if floor is None or registry.version < floor["registry_version"]:
                     raise OperatorAssertionRefused("operator.registry_rollback")
                 observed = connection.execute("SELECT observed_at FROM consumption_clock").fetchone()
                 if commit_now < now or (
                     observed is not None and commit_now < wire.parse_timestamp(observed["observed_at"])
                 ):
                     raise OperatorAssertionRefused("operator.clock_rollback")
+                if commit_now - registry.issued_at > self._max_age:
+                    raise OperatorAssertionRefused("operator.registry_stale")
+                self._authorize_entry(registry, body, commit_now)
+                if commit_now >= wire.parse_timestamp(expires_at):
+                    raise OperatorAssertionRefused("operator.expired")
                 # Retain the cleanup clock even after every older nonce has been deleted.
                 connection.execute(
                     "INSERT INTO consumption_clock(slot, observed_at) VALUES(1, ?)"
