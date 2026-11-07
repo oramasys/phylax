@@ -15,7 +15,6 @@ The contract is ``docs/e1-c2-retention-and-checkpoints.md``.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
@@ -26,6 +25,7 @@ from pathlib import Path
 from typing import Protocol
 
 from . import dispatch_wire as wire
+from . import platform_fs
 from .dispatch_permit_store import (
     OperatorAuthority,
     OperatorRefused,
@@ -238,12 +238,8 @@ def _retention_lock(ledger: RetentionLedger) -> Iterator[None]:
     which a prune moves a revocation out of the hot table between the two duplicate checks.
     """
     lock_path = ledger.path.with_name(ledger.path.name + ".lock")
-    with open(lock_path, "a+b") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    with platform_fs.locked(lock_path):
+        yield
 
 
 class RetentionLedger:

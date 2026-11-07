@@ -15,7 +15,6 @@ verifier cross-checks against the signed feed. Contract: ``docs/revocation-publi
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import tempfile
@@ -23,7 +22,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Final, Protocol
 
 from nacl import exceptions as nacl_exceptions
@@ -36,6 +35,7 @@ from nacl.bindings import (
 )
 
 from . import dispatch_wire as wire
+from . import platform_fs
 from .dispatch_retention import (
     IssuerKeyResolver,
     RetainedEventFeed,
@@ -339,6 +339,13 @@ def verify_state_against_chain(
         raise _refuse("publication.head_mismatch")
 
 
+def _valid_publication_name(name: str) -> bool:
+    """Accept a single non-hidden name without Windows aliases, devices, or path syntax."""
+    return bool(name) and not name.startswith(".") and not name.endswith((".", " ")) and not any(
+        char in name for char in "/\\:"
+    ) and not PureWindowsPath(name).drive and not PureWindowsPath(name).is_reserved()
+
+
 class DirectoryMedium:
     """A directory-backed medium with atomic writes and immutable segment names."""
 
@@ -351,20 +358,12 @@ class DirectoryMedium:
     @contextmanager
     def _locked(self) -> Iterator[None]:
         """Serialize writers across processes with an advisory lock on a dot-named lock file."""
-        with (self.root / ".publish.lock").open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        with platform_fs.locked(self.root / ".publish.lock"):
+            yield
 
     def _sync_directory(self) -> None:
-        """fsync the directory so a completed rename survives a crash (POSIX)."""
-        descriptor = os.open(self.root, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        """Flush directory metadata or propagate the platform's durability error."""
+        platform_fs.fsync_dir(self.root)
 
     def put(self, name: str, data: bytes) -> None:
         """Write atomically and durably; refuse to alter an immutable name.
@@ -373,7 +372,7 @@ class DirectoryMedium:
         each write uses its own temporary file, and the directory is synced after the rename before
         success is reported (an identical immutable rewrite is synced too).
         """
-        if "/" in name or name.startswith("."):
+        if not _valid_publication_name(name):
             raise ValueError("invalid publication name")
         target = self.root / name
         with self._locked():
@@ -388,15 +387,14 @@ class DirectoryMedium:
                     handle.write(data)
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.replace(temp_name, target)
+                platform_fs.replace_durably(temp_name, target)
             except BaseException:
                 Path(temp_name).unlink(missing_ok=True)
                 raise
-            self._sync_directory()
 
     def get(self, name: str) -> bytes | None:
         """Return the stored bytes or None when absent."""
-        if "/" in name or name.startswith("."):
+        if not _valid_publication_name(name):
             return None
         try:
             return (self.root / name).read_bytes()
