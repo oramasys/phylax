@@ -16,6 +16,7 @@ verifier cross-checks against the signed feed. Contract: ``docs/revocation-publi
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -52,6 +53,7 @@ PUBLICATION_REFUSAL_CODES: Final = frozenset({
     "publication.malformed", "publication.signature", "publication.stale",
     "publication.head_mismatch", "publication.unavailable", "publication.readback_mismatch",
     "publication.unknown_key", "publication.issuer_mismatch", "publication.state_too_large",
+    "publication.invalid_name",
 })
 _STATE_FIELDS = (
     "schema_version", "issuer_id", "head_version", "head_event_digest", "generated_at",
@@ -65,10 +67,16 @@ class PublicationRefused(Exception):
 
     def __init__(self, code: str) -> None:
         """Record the code, which must belong to the publication vocabulary."""
-        if code not in PUBLICATION_REFUSAL_CODES:
+        normalized = f"publication.{code}" if f"publication.{code}" in PUBLICATION_REFUSAL_CODES else code
+        if normalized not in PUBLICATION_REFUSAL_CODES:
             raise ValueError(f"unknown publication refusal code: {code}")
-        super().__init__(code)
-        self.code = code
+        super().__init__(normalized)
+        self.code = normalized
+
+    @property
+    def short_code(self) -> str:
+        """Return the refusal code without the leading ``publication.`` prefix."""
+        return self.code.removeprefix("publication.")
 
 
 class StateSigner(Protocol):
@@ -339,11 +347,31 @@ def verify_state_against_chain(
         raise _refuse("publication.head_mismatch")
 
 
+_WINDOWS_RESERVED_NAMES: Final = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"{prefix}{digit}" for prefix in ("COM", "LPT") for digit in "123456789¹²³"}
+)
+
+
+def _is_windows_reserved_name(name: str) -> bool:
+    """Return True if ``name`` is a Windows DOS device or reserved filename."""
+    if hasattr(ntpath, "isreserved"):
+        return bool(ntpath.isreserved(name))
+    base = name.partition(".")[0].rstrip(" ").upper()
+    return base in _WINDOWS_RESERVED_NAMES
+
+
 def _valid_publication_name(name: str) -> bool:
     """Accept a single non-hidden name without Windows aliases, devices, or path syntax."""
-    return bool(name) and not name.startswith(".") and not name.endswith((".", " ")) and not any(
-        char in name for char in "/\\:"
-    ) and not PureWindowsPath(name).drive and not PureWindowsPath(name).is_reserved()
+    if (
+        not name
+        or name.startswith(".")
+        or name.endswith((".", " "))
+        or any(char in name for char in "/\\:")
+    ):
+        return False
+    path = PureWindowsPath(name)
+    return not path.drive and not _is_windows_reserved_name(name)
 
 
 class DirectoryMedium:
@@ -468,6 +496,8 @@ class FeedPublisher:
             stored = self._medium.get(name)
         except OSError as error:
             raise _refuse("publication.unavailable") from error
+        except ValueError as error:
+            raise _refuse("publication.invalid_name") from error
         if stored is None:
             raise _refuse("publication.unavailable")
         if stored != data:

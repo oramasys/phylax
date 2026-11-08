@@ -81,3 +81,48 @@ def test_publication_rejects_windows_path_names(tmp_path: Path, name: str) -> No
     with pytest.raises(ValueError):
         medium.put(name, b"data")
     assert medium.get(name) is None
+
+
+def test_publication_store_and_verify_maps_invalid_name(tmp_path: Path) -> None:
+    """FeedPublisher._store_and_verify maps name validation ValueError to publication refusal."""
+    class DummyFeed:
+        pass
+
+    class DummyResolver:
+        pass
+
+    class DummySigner:
+        pass
+
+    medium = revocation_publication.DirectoryMedium(tmp_path)
+    publisher = revocation_publication.FeedPublisher(
+        DummyFeed(), medium, DummyResolver(), issuer_id="dummy",  # type: ignore[arg-type]
+        signer=DummySigner(), clock=lambda: None,  # type: ignore[arg-type]
+    )
+    with pytest.raises(revocation_publication.PublicationRefused) as caught:
+        publisher._store_and_verify("invalid/name", b"payload")
+    assert caught.value.code == "publication.invalid_name"
+    assert caught.value.short_code == "invalid_name"
+
+
+def test_is_windows_reserved_name_parity_and_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_is_windows_reserved_name matches ntpath.isreserved and fallback reproduces exact rules."""
+    reserved_cases = [
+        "NUL", "con", "PRN.txt", "COM1", "lpt1.log", "COM1.txt", "CONIN$", "CONOUT$",
+        "COM¹", "LPT²", "LPT³", "com9.dat", "aux.json",
+    ]
+    unreserved_cases = ["state.json", "events-000000000001-000000000064.json", "safe.txt", "COM0", "LPT0", "COM10"]
+
+    if hasattr(revocation_publication.ntpath, "isreserved"):
+        for name in reserved_cases:
+            assert revocation_publication._is_windows_reserved_name(name) is True
+            assert revocation_publication.ntpath.isreserved(name) is True
+        for name in unreserved_cases:
+            assert revocation_publication._is_windows_reserved_name(name) is False
+            assert revocation_publication.ntpath.isreserved(name) is False
+
+    monkeypatch.delattr(revocation_publication.ntpath, "isreserved", raising=False)
+    for name in reserved_cases:
+        assert revocation_publication._is_windows_reserved_name(name) is True
+    for name in unreserved_cases:
+        assert revocation_publication._is_windows_reserved_name(name) is False
