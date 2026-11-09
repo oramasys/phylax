@@ -15,15 +15,15 @@ verifier cross-checks against the signed feed. Contract: ``docs/revocation-publi
 
 from __future__ import annotations
 
-import fcntl
 import json
+import ntpath
 import os
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Final, Protocol
 
 from nacl import exceptions as nacl_exceptions
@@ -36,6 +36,7 @@ from nacl.bindings import (
 )
 
 from . import dispatch_wire as wire
+from . import platform_fs
 from .dispatch_retention import (
     IssuerKeyResolver,
     RetainedEventFeed,
@@ -52,6 +53,7 @@ PUBLICATION_REFUSAL_CODES: Final = frozenset({
     "publication.malformed", "publication.signature", "publication.stale",
     "publication.head_mismatch", "publication.unavailable", "publication.readback_mismatch",
     "publication.unknown_key", "publication.issuer_mismatch", "publication.state_too_large",
+    "publication.invalid_name",
 })
 _STATE_FIELDS = (
     "schema_version", "issuer_id", "head_version", "head_event_digest", "generated_at",
@@ -65,10 +67,16 @@ class PublicationRefused(Exception):
 
     def __init__(self, code: str) -> None:
         """Record the code, which must belong to the publication vocabulary."""
-        if code not in PUBLICATION_REFUSAL_CODES:
+        normalized = f"publication.{code}" if f"publication.{code}" in PUBLICATION_REFUSAL_CODES else code
+        if normalized not in PUBLICATION_REFUSAL_CODES:
             raise ValueError(f"unknown publication refusal code: {code}")
-        super().__init__(code)
-        self.code = code
+        super().__init__(normalized)
+        self.code = normalized
+
+    @property
+    def short_code(self) -> str:
+        """Return the refusal code without the leading ``publication.`` prefix."""
+        return self.code.removeprefix("publication.")
 
 
 class StateSigner(Protocol):
@@ -339,6 +347,33 @@ def verify_state_against_chain(
         raise _refuse("publication.head_mismatch")
 
 
+_WINDOWS_RESERVED_NAMES: Final = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"{prefix}{digit}" for prefix in ("COM", "LPT") for digit in "123456789¹²³"}
+)
+
+
+def _is_windows_reserved_name(name: str) -> bool:
+    """Return True if ``name`` is a Windows DOS device or reserved filename."""
+    if hasattr(ntpath, "isreserved"):
+        return bool(ntpath.isreserved(name))
+    base = name.partition(".")[0].rstrip(" ").upper()
+    return base in _WINDOWS_RESERVED_NAMES
+
+
+def _valid_publication_name(name: str) -> bool:
+    """Accept a single non-hidden name without Windows aliases, devices, or path syntax."""
+    if (
+        not name
+        or name.startswith(".")
+        or name.endswith((".", " "))
+        or any(char in name for char in "/\\:")
+    ):
+        return False
+    path = PureWindowsPath(name)
+    return not path.drive and not _is_windows_reserved_name(name)
+
+
 class DirectoryMedium:
     """A directory-backed medium with atomic writes and immutable segment names."""
 
@@ -351,20 +386,12 @@ class DirectoryMedium:
     @contextmanager
     def _locked(self) -> Iterator[None]:
         """Serialize writers across processes with an advisory lock on a dot-named lock file."""
-        with (self.root / ".publish.lock").open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        with platform_fs.locked(self.root / ".publish.lock"):
+            yield
 
     def _sync_directory(self) -> None:
-        """fsync the directory so a completed rename survives a crash (POSIX)."""
-        descriptor = os.open(self.root, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        """Flush directory metadata or propagate the platform's durability error."""
+        platform_fs.fsync_dir(self.root)
 
     def put(self, name: str, data: bytes) -> None:
         """Write atomically and durably; refuse to alter an immutable name.
@@ -373,7 +400,7 @@ class DirectoryMedium:
         each write uses its own temporary file, and the directory is synced after the rename before
         success is reported (an identical immutable rewrite is synced too).
         """
-        if "/" in name or name.startswith("."):
+        if not _valid_publication_name(name):
             raise ValueError("invalid publication name")
         target = self.root / name
         with self._locked():
@@ -388,15 +415,14 @@ class DirectoryMedium:
                     handle.write(data)
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.replace(temp_name, target)
+                platform_fs.replace_durably(temp_name, target)
             except BaseException:
                 Path(temp_name).unlink(missing_ok=True)
                 raise
-            self._sync_directory()
 
     def get(self, name: str) -> bytes | None:
         """Return the stored bytes or None when absent."""
-        if "/" in name or name.startswith("."):
+        if not _valid_publication_name(name):
             return None
         try:
             return (self.root / name).read_bytes()
@@ -470,6 +496,8 @@ class FeedPublisher:
             stored = self._medium.get(name)
         except OSError as error:
             raise _refuse("publication.unavailable") from error
+        except ValueError as error:
+            raise _refuse("publication.invalid_name") from error
         if stored is None:
             raise _refuse("publication.unavailable")
         if stored != data:

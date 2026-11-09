@@ -38,7 +38,7 @@ built state against it before replacing `state.json`.
   medium that drops, corrupts or fails is `publication.unavailable` / `publication.readback_mismatch`.
 * **Immutability.** `DirectoryMedium` refuses to rewrite a segment name with different bytes. Writers are
   serialized across processes by an advisory lock, each write uses its own temporary file, and the
-  directory is synced after the rename before success is reported (POSIX).
+  file bytes are flushed before durable replacement, and identical rewrites flush the directory.
 * **Exact segments.** `read_feed` requires every segment to carry exactly the requested event
   versions, in order; an empty or shortened segment under a correct range label is
   `publication.malformed`, never an empty feed.
@@ -72,5 +72,9 @@ key in its feed. The current key-id-only resolver API does not enforce that asso
 `verify_state` is stateless and does not persist a reader's head, fork or time anchor;
 `CombinedRevocationLookup` also does not enforce that the caller ran the chain cross-check.
 Adapters must supply these protections before treating a clean result as complete/current authority.
-Both this module and retention currently require POSIX `fcntl` at import time; Windows import,
-locking and durable-directory semantics are an outstanding qualification gate.
+Publication and retention use the platform filesystem layer for cross-process locking. POSIX
+replacement flushes the parent directory; Windows uses write-through replacement. Identical
+immutable rewrites flush the directory and fail closed if that flush is denied. Windows directory
+flush requires write access and Microsoft does not document a POSIX-equivalent directory durability
+guarantee. Native Windows CI covers these paths, but filesystem, permissions and crash-recovery
+qualification in the deployment environment remains necessary; CI is not a power-loss test.

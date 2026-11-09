@@ -13,6 +13,7 @@ import pytest
 from nacl.bindings import crypto_sign_seed_keypair
 
 from phylax import dispatch_wire as wire
+from phylax import platform_fs
 from phylax import revocation_publication as publication
 from phylax.dispatch_permit_store import SqliteDispatchPermitStore
 from phylax.dispatch_retention import RetainedEventFeed, RetentionLedger
@@ -370,39 +371,46 @@ def test_identical_concurrent_writers_all_succeed(tmp_path: Path) -> None:
     assert [p.name for p in medium.root.iterdir() if p.name.endswith(".tmp")] == []
 
 
-def test_directory_is_synced_after_the_rename(tmp_path: Path, monkeypatch) -> None:
-    """File fsync, then rename, then a directory fsync: only then is success reported."""
+def test_directory_is_synced_after_the_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """File fsync precedes durable replacement; an identical rewrite flushes the directory."""
     events: list[str] = []
-    real_fsync, real_replace = os.fsync, os.replace
+    real_fsync, real_replace, real_dir = os.fsync, platform_fs.replace_durably, platform_fs.fsync_dir
 
     def fsync(fd: int) -> None:
-        """Record whether a file or a directory was flushed."""
-        events.append("fsync-dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync-file")
+        """Record a file flush."""
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            events.append("fsync-file")
         real_fsync(fd)
 
-    def replace(source, target) -> None:
-        """Record the replace step."""
+    def replace(source: str | Path, target: str | Path) -> None:
+        """Record and execute the durable replacement."""
         events.append("replace")
         real_replace(source, target)
 
+    def sync_dir(path: str | Path) -> None:
+        """Record and execute a directory flush."""
+        events.append("fsync-dir")
+        real_dir(path)
+
     monkeypatch.setattr(os, "fsync", fsync)
-    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(platform_fs, "replace_durably", replace)
+    monkeypatch.setattr(platform_fs, "fsync_dir", sync_dir)
     DirectoryMedium(tmp_path / "public").put("events-000000000001-000000000001.json", b"x")
-    assert events == ["fsync-file", "replace", "fsync-dir"]
+    assert events[:2] == ["fsync-file", "replace"]
     events.clear()
     DirectoryMedium(tmp_path / "public").put("events-000000000001-000000000001.json", b"x")  # identical rewrite
     assert events == ["fsync-dir"]
 
 
-def test_failed_write_leaves_no_temporary_file(tmp_path: Path, monkeypatch) -> None:
+def test_failed_write_leaves_no_temporary_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A write that fails after the temporary file exists removes it."""
     medium = DirectoryMedium(tmp_path / "public")
 
-    def boom(source, target) -> None:
+    def boom(source: str | Path, target: str | Path) -> None:
         """Fail the replace step with a disk error."""
         raise OSError("disk gone")
 
-    monkeypatch.setattr(os, "replace", boom)
+    monkeypatch.setattr(platform_fs, "replace_durably", boom)
     with pytest.raises(OSError):
         medium.put("state.json", b"x")
     assert list(medium.root.glob(".*.tmp")) == [] and medium.get("state.json") is None
